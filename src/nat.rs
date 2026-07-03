@@ -35,13 +35,8 @@ const TOOM4_THRESHOLD: usize = 320;
 /// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
 const LEHMER_THRESHOLD: usize = 16;
 
-/// Operands with at least this many limbs use NTT multiplication (above Toom-3),
-/// provided the transform length stays within [`NTT_MAX_LEN`].
+/// Operands with at least this many limbs use NTT multiplication (above Toom-4).
 const NTT_THRESHOLD: usize = 1600;
-
-/// Largest NTT transform length used; beyond this the convolution coefficients
-/// could exceed the modulus, so multiplication falls back to Toom-3.
-const NTT_MAX_LEN: usize = 1 << 28;
 
 // --- Number-theoretic transform over the Goldilocks field 2^64 − 2^32 + 1 ---
 //
@@ -135,20 +130,16 @@ fn ntt(a: &mut [u64], inverse: bool) {
     }
 }
 
-/// Splits `x` into little-endian 16-bit digits (at least one).
-fn to_digits16(x: &Nat) -> Vec<u64> {
+/// Splits `x` into little-endian digits of `bpd` bytes each (at least one).
+fn to_digits(x: &Nat, bpd: usize) -> Vec<u64> {
     let bytes = x.to_bytes_le();
-    let mut d = Vec::with_capacity(bytes.len() / 2 + 1);
-    let mut i = 0;
-    while i < bytes.len() {
-        let lo = bytes[i] as u64;
-        let hi = if i + 1 < bytes.len() {
-            bytes[i + 1] as u64
-        } else {
-            0
-        };
-        d.push(lo | (hi << 8));
-        i += 2;
+    let mut d = Vec::with_capacity(bytes.len() / bpd + 1);
+    for chunk in bytes.chunks(bpd) {
+        let mut digit = 0u64;
+        for (i, &b) in chunk.iter().enumerate() {
+            digit |= (b as u64) << (8 * i);
+        }
+        d.push(digit);
     }
     if d.is_empty() {
         d.push(0);
@@ -156,19 +147,39 @@ fn to_digits16(x: &Nat) -> Vec<u64> {
     d
 }
 
-/// NTT-based multiplication (falls back to Toom-3 if the transform would be too
-/// long for a single Goldilocks prime).
+/// NTT-based multiplication over a single Goldilocks prime.
+///
+/// The digit width adapts to the operand size so the convolution coefficients
+/// (`≈ n · 2^(16·bpd)`) always stay below the prime: 2 bytes/digit for typical
+/// inputs, shrinking to 1 (then falling back to Toom-4 only for astronomically
+/// large operands), so no multi-prime CRT is needed in practice.
 fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
-    let da = to_digits16(a);
-    let db = to_digits16(b);
+    // Rough transform length with 2-byte digits (4 per limb).
+    let approx = (a.limbs.len() + b.limbs.len()) * 4 + 2;
+    let mut est = 1usize;
+    while est < approx {
+        est <<= 1;
+    }
+    // Pick the largest digit width whose coefficients stay below the prime.
+    let bpd = if (est as u128) << 32 < GOLDILOCKS as u128 {
+        2
+    } else {
+        1
+    };
+
+    let da = to_digits(a, bpd);
+    let db = to_digits(b, bpd);
     let need = da.len() + db.len();
     let mut n = 1usize;
     while n < need {
         n <<= 1;
     }
-    if n > NTT_MAX_LEN {
-        return a.mul_toom3(b);
+    // Coefficient bound: n · (2^(8·bpd))². Fall back only if even 1-byte digits
+    // would overflow (operands beyond ~2^51 bits).
+    if (n as u128) << (16 * bpd as u32) >= GOLDILOCKS as u128 {
+        return a.mul_toom4(b);
     }
+
     let mut fa = alloc::vec![0u64; n];
     let mut fb = alloc::vec![0u64; n];
     fa[..da.len()].copy_from_slice(&da);
@@ -179,19 +190,20 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
         *x = gf_mul(*x, *y);
     }
     ntt(&mut fa, true);
-    // Carry-propagate the convolution coefficients in base 2^16.
-    let mut bytes: Vec<u8> = Vec::with_capacity(2 * n + 8);
+
+    // Carry-propagate the coefficients in base 2^(8·bpd).
+    let mut bytes: Vec<u8> = Vec::with_capacity(bpd * n + 8);
     let mut carry: u128 = 0;
     for &coef in &fa {
         carry += coef as u128;
-        bytes.push((carry & 0xFF) as u8);
-        bytes.push(((carry >> 8) & 0xFF) as u8);
-        carry >>= 16;
+        for _ in 0..bpd {
+            bytes.push((carry & 0xFF) as u8);
+            carry >>= 8;
+        }
     }
     while carry != 0 {
         bytes.push((carry & 0xFF) as u8);
-        bytes.push(((carry >> 8) & 0xFF) as u8);
-        carry >>= 16;
+        carry >>= 8;
     }
     Nat::from_bytes_le(&bytes)
 }

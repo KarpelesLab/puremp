@@ -7,6 +7,22 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/KarpelesLab/puremp/compare/v0.1.2...v0.1.3) - 2026-07-03
+
+### Other
+
+- document the extended numeric types (Dyadic/FixedFloat/InfRational)
+- Add InfRational: extended rationals with ±∞ and NaN
+- Add FixedFloat: fixed-precision float wrapper (mpfx-style)
+- Add Dyadic: exact dyadic rationals (n·2^-k)
+- pre-1.0 API review; document deferred HGCD and scratch-buffer work
+- measure and tune multiplication crossover thresholds
+- public Reciprocal (Möller–Granlund division by an invariant)
+- adaptive-width NTT (lift the single-prime size cap)
+- Toom-4 multiplication
+- deterministic Baillie–PSW primality test
+- Barrett reduction for even-modulus modpow
+
 ## [0.1.2](https://github.com/KarpelesLab/puremp/compare/v0.1.1...v0.1.2) - 2026-07-03
 
 ### Other

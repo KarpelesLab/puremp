@@ -100,6 +100,9 @@ pub mod float;
 #[cfg(feature = "float")]
 pub mod fixed_float;
 
+#[cfg(feature = "interval")]
+pub mod interval;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
@@ -139,6 +142,9 @@ pub use poly::Poly;
 pub use fixed_float::FixedFloat;
 #[cfg(feature = "float")]
 pub use float::{Float, RoundingMode};
+
+#[cfg(feature = "interval")]
+pub use interval::Interval;
 
 /// The crate version string (`CARGO_PKG_VERSION`), exposed for the C ABI and CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

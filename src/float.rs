@@ -1001,6 +1001,142 @@ impl Float {
             }
         }
     }
+
+    /// Returns `sinh(self) = (eˣ − e⁻ˣ)/2`, correctly rounded.
+    pub fn sinh(&self, precision: u64, mode: RoundingMode) -> Float {
+        if self.is_nan() {
+            return Float::nan(precision);
+        }
+        if self.is_infinite() {
+            return self.clone().round(precision, mode);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| {
+            let ex = x.exp(w, NEAR);
+            let emx = x.neg().exp(w, NEAR);
+            ex.sub(&emx, w, NEAR).scale_pow2(-1)
+        })
+    }
+
+    /// Returns `cosh(self) = (eˣ + e⁻ˣ)/2`, correctly rounded.
+    pub fn cosh(&self, precision: u64, mode: RoundingMode) -> Float {
+        if self.is_nan() {
+            return Float::nan(precision);
+        }
+        if self.is_infinite() {
+            return Float::infinity(precision);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| {
+            let ex = x.exp(w, NEAR);
+            let emx = x.neg().exp(w, NEAR);
+            ex.add(&emx, w, NEAR).scale_pow2(-1)
+        })
+    }
+
+    /// Returns `tanh(self) = sinh/cosh`, correctly rounded.
+    pub fn tanh(&self, precision: u64, mode: RoundingMode) -> Float {
+        if self.is_nan() {
+            return Float::nan(precision);
+        }
+        if self.is_infinite() {
+            return Float::from_int(&Int::from_i64(self.signum_i()), precision, mode);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| {
+            x.sinh(w, NEAR).div(&x.cosh(w, NEAR), w, NEAR)
+        })
+    }
+
+    /// Returns `asin(self)` (domain `[-1, 1]`; `NaN` outside), correctly rounded.
+    pub fn asin(&self, precision: u64, mode: RoundingMode) -> Float {
+        if !self.is_finite() {
+            return Float::nan(precision);
+        }
+        let x = self.clone();
+        // asin(x) = atan(x / √(1 − x²)); |x| > 1 yields √(negative) = NaN.
+        Float::ziv(precision, mode, move |w| {
+            let one = Float::from_int(&Int::ONE, w, NEAR);
+            let xr = x.round(w, NEAR);
+            let denom = one.sub(&xr.mul(&xr, w, NEAR), w, NEAR).sqrt(w, NEAR);
+            xr.div(&denom, w, NEAR).atan(w, NEAR)
+        })
+    }
+
+    /// Returns `acos(self) = π/2 − asin(self)`, correctly rounded.
+    pub fn acos(&self, precision: u64, mode: RoundingMode) -> Float {
+        if !self.is_finite() {
+            return Float::nan(precision);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| {
+            let half_pi = Float::pi(w, NEAR).scale_pow2(-1);
+            half_pi.sub(&x.asin(w, NEAR), w, NEAR)
+        })
+    }
+
+    /// Returns `atan2(self, x)` — the angle of the point `(x, self)` in
+    /// `(-π, π]` — correctly rounded (finite arguments).
+    pub fn atan2(&self, x: &Float, precision: u64, mode: RoundingMode) -> Float {
+        if self.is_nan() || x.is_nan() {
+            return Float::nan(precision);
+        }
+        let (y, x) = (self.clone(), x.clone());
+        Float::ziv(precision, mode, move |w| {
+            let pi = Float::pi(w, NEAR);
+            if x.is_zero() {
+                // ±π/2 by the sign of y (0 if y is also zero).
+                if y.is_zero() {
+                    return Float::zero(w);
+                }
+                let hp = pi.scale_pow2(-1);
+                return if y.is_sign_negative() { hp.neg() } else { hp };
+            }
+            let base = y.div(&x, w, NEAR).atan(w, NEAR);
+            if !x.is_sign_negative() {
+                base
+            } else if !y.is_sign_negative() {
+                base.add(&pi, w, NEAR)
+            } else {
+                base.sub(&pi, w, NEAR)
+            }
+        })
+    }
+
+    /// Returns `self` raised to the floating exponent `y` via `exp(y·ln self)`.
+    /// Defined for `self > 0`; `self == 0` gives `0` (for `y > 0`), and `self < 0`
+    /// gives `NaN`.
+    pub fn pow(&self, y: &Float, precision: u64, mode: RoundingMode) -> Float {
+        if self.is_nan() || y.is_nan() {
+            return Float::nan(precision);
+        }
+        if y.is_zero() {
+            return Float::from_int(&Int::ONE, precision, mode);
+        }
+        if self.is_zero() {
+            return if y.is_sign_negative() {
+                Float::infinity(precision)
+            } else {
+                Float::zero(precision)
+            };
+        }
+        if self.is_sign_negative() {
+            return Float::nan(precision);
+        }
+        let (base, y) = (self.clone(), y.clone());
+        Float::ziv(precision, mode, move |w| {
+            y.mul(&base.ln(w, NEAR), w, NEAR).exp(w, NEAR)
+        })
+    }
+
+    /// Sign as `i64` (`-1`/`0`/`1`), for internal use.
+    fn signum_i(&self) -> i64 {
+        match self.sign() {
+            Sign::Negative => -1,
+            Sign::Zero => 0,
+            Sign::Positive => 1,
+        }
+    }
 }
 
 /// Returns `Some(rounded)` if `val` can be rounded to `prec` bits unambiguously,

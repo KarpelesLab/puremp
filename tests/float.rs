@@ -1,7 +1,7 @@
 //! Tests for the optional arbitrary-precision `Float` layer.
 #![cfg(feature = "float")]
 
-use puremp::{Float, Int, RoundingMode};
+use puremp::{Float, Int, Rational, RoundingMode};
 
 fn from_i64(v: i64, prec: u64) -> Float {
     Float::from_int(&Int::from_i64(v), prec, RoundingMode::Nearest)
@@ -224,4 +224,35 @@ fn pi_high_precision_digits() {
     assert_eq!(pi.to_decimal_string(15), "3.141592653589793");
     // A longer prefix, correctly rounded to 20 fractional digits.
     assert_eq!(pi.to_decimal_string(20), "3.14159265358979323846");
+}
+
+#[test]
+fn more_transcendentals_match_f64() {
+    let p = 60;
+    let n = RoundingMode::Nearest;
+    let approx = |f: Float| f.to_f64();
+    let x = Rational::new(Int::from_i64(3), Int::from_i64(5));
+    let xf = Float::from_rational(&x, p, n); // 0.6
+
+    assert!((approx(xf.sinh(p, n)) - 0.6f64.sinh()).abs() < 1e-15);
+    assert!((approx(xf.cosh(p, n)) - 0.6f64.cosh()).abs() < 1e-15);
+    assert!((approx(xf.tanh(p, n)) - 0.6f64.tanh()).abs() < 1e-15);
+    assert!((approx(xf.asin(p, n)) - 0.6f64.asin()).abs() < 1e-15);
+    assert!((approx(xf.acos(p, n)) - 0.6f64.acos()).abs() < 1e-15);
+
+    // asin/acos domain: |x|>1 -> NaN.
+    assert!(from_i64(2, p).asin(p, n).is_nan());
+
+    // atan2 across quadrants.
+    let y = from_i64(1, p);
+    let xn = from_i64(-1, p);
+    assert!((approx(y.atan2(&xn, p, n)) - 1.0f64.atan2(-1.0)).abs() < 1e-15);
+    assert!((approx(y.neg().atan2(&xn, p, n)) - (-1.0f64).atan2(-1.0)).abs() < 1e-15);
+    assert!((approx(y.atan2(&Float::zero(p), p, n)) - core::f64::consts::FRAC_PI_2).abs() < 1e-15);
+
+    // pow: 2^10 == 1024, and 2^0.5 == sqrt(2).
+    let two = from_i64(2, p);
+    assert!((approx(two.pow(&from_i64(10, p), p, n)) - 1024.0).abs() < 1e-10);
+    let half = Float::from_rational(&Rational::new(Int::ONE, Int::from_i64(2)), p, n);
+    assert!((approx(two.pow(&half, p, n)) - core::f64::consts::SQRT_2).abs() < 1e-15);
 }

@@ -16,6 +16,8 @@ pub enum Error {
     /// Used by scaffolding entry points so callers get a clean error rather
     /// than a panic while a layer is still under construction.
     Unimplemented,
+    /// A value did not fit the target type of a conversion.
+    Overflow,
 }
 
 impl fmt::Display for Error {
@@ -24,6 +26,7 @@ impl fmt::Display for Error {
             Error::Parse => "invalid numeric literal",
             Error::DivisionByZero => "division by zero",
             Error::Unimplemented => "operation not yet implemented",
+            Error::Overflow => "value out of range for the target type",
         };
         f.write_str(msg)
     }

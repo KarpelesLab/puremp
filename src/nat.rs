@@ -1070,6 +1070,16 @@ impl Nat {
         }
     }
 
+    /// Returns the value as a `u128` if it fits (at most two limbs).
+    pub fn to_u128(&self) -> Option<u128> {
+        match self.limbs.as_slice() {
+            [] => Some(0),
+            &[lo] => Some(lo as u128),
+            &[lo, hi] => Some(((hi as u128) << 64) | lo as u128),
+            _ => None,
+        }
+    }
+
     /// Returns `true` if this value is one.
     #[inline]
     pub fn is_one(&self) -> bool {

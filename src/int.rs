@@ -829,6 +829,26 @@ impl Int {
         }
     }
 
+    /// Returns the value as an `i128` if it fits.
+    pub fn to_i128(&self) -> Option<i128> {
+        let (sign, mag) = self.to_sign_mag();
+        let m = mag.to_u128()?;
+        match sign {
+            Sign::Zero => Some(0),
+            Sign::Positive => (m <= i128::MAX as u128).then_some(m as i128),
+            Sign::Negative => (m <= (i128::MAX as u128) + 1).then(|| (m as i128).wrapping_neg()),
+        }
+    }
+
+    /// Returns the value as a `u128` if it is non-negative and fits.
+    pub fn to_u128(&self) -> Option<u128> {
+        if self.is_negative() {
+            None
+        } else {
+            self.magnitude().to_u128()
+        }
+    }
+
     /// Returns the value as the nearest `f64` (best-effort; may be `±inf` on
     /// overflow).
     pub fn to_f64(&self) -> f64 {
@@ -840,6 +860,32 @@ impl Int {
         if sign == Sign::Negative { -f } else { f }
     }
 }
+
+/// `TryFrom<&Int>`/`TryFrom<Int>` for the primitive integer types, going through
+/// the widest fitting accessor and range-checking the target.
+macro_rules! try_from_int {
+    ($($ty:ty => $via:ident),* $(,)?) => {$(
+        impl TryFrom<&Int> for $ty {
+            type Error = Error;
+            fn try_from(v: &Int) -> Result<$ty> {
+                v.$via()
+                    .and_then(|w| <$ty>::try_from(w).ok())
+                    .ok_or(Error::Overflow)
+            }
+        }
+        impl TryFrom<Int> for $ty {
+            type Error = Error;
+            #[inline]
+            fn try_from(v: Int) -> Result<$ty> {
+                <$ty>::try_from(&v)
+            }
+        }
+    )*};
+}
+
+// Signed targets range-check against i128; unsigned against u128.
+try_from_int!(i8 => to_i128, i16 => to_i128, i32 => to_i128, i64 => to_i128, i128 => to_i128, isize => to_i128);
+try_from_int!(u8 => to_u128, u16 => to_u128, u32 => to_u128, u64 => to_u128, u128 => to_u128, usize => to_u128);
 
 /// Sign-magnitude addition on the slow (heap) path.
 fn add_expanded(sa: Sign, a: &Nat, sb: Sign, b: &Nat) -> Int {

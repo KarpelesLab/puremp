@@ -926,3 +926,27 @@ fn continued_fractions() {
         assert!(a.denominator() <= &Int::from(bound));
     }
 }
+
+#[test]
+fn tryfrom_primitive_conversions() {
+    use core::convert::TryFrom;
+    assert_eq!(i32::try_from(&int("-42")).unwrap(), -42);
+    assert_eq!(u8::try_from(&int("255")).unwrap(), 255u8);
+    assert!(u8::try_from(&int("256")).is_err());
+    assert!(u32::try_from(&int("-1")).is_err()); // negative into unsigned
+    assert_eq!(
+        i128::try_from(int("170141183460469231731687303715884105727")).unwrap(),
+        i128::MAX
+    );
+    assert!(i128::try_from(&int("170141183460469231731687303715884105728")).is_err()); // i128::MAX + 1
+    assert_eq!(
+        u128::try_from(&int("340282366920938463463374607431768211455")).unwrap(),
+        u128::MAX
+    );
+    assert!(i64::try_from(&Int::from(2).pow(200)).is_err());
+    // owned form too
+    assert_eq!(
+        u64::try_from(int("18446744073709551615")).unwrap(),
+        u64::MAX
+    );
+}

@@ -50,3 +50,40 @@ fn field_division_and_gcd() {
     assert_eq!(g, prat(&[-1, 1])); // monic x - 1
     assert!(g.leading().unwrap().is_one());
 }
+
+#[test]
+fn real_root_isolation_and_approximation() {
+    use puremp::{Float, RoundingMode};
+    let n = RoundingMode::Nearest;
+
+    // (x-1)(x-2)(x-3) = x^3 - 6x^2 + 11x - 6 : three real roots
+    let p = prat(&[-6, 11, -6, 1]);
+    assert_eq!(p.real_root_count(), 3);
+    let roots = p.real_roots(53, n);
+    assert_eq!(roots.len(), 3);
+    let vals: Vec<f64> = roots.iter().map(Float::to_f64).collect();
+    assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+
+    // x^2 - 2 : two irrational roots ±√2
+    let p2 = prat(&[-2, 0, 1]);
+    assert_eq!(p2.real_root_count(), 2);
+    let r = p2.real_roots(60, n);
+    assert!((r[0].to_f64() + core::f64::consts::SQRT_2).abs() < 1e-15);
+    assert!((r[1].to_f64() - core::f64::consts::SQRT_2).abs() < 1e-15);
+
+    // x^2 + 1 : no real roots
+    assert_eq!(prat(&[1, 0, 1]).real_root_count(), 0);
+    assert!(prat(&[1, 0, 1]).real_roots(30, n).is_empty());
+
+    // count in a sub-interval: (x-1)(x-2)(x-3), roots in (1.5, 3.5] -> 2
+    assert_eq!(
+        p.count_real_roots_in(
+            &Rational::new(3.into(), 2.into()),
+            &Rational::new(7.into(), 2.into())
+        ),
+        2
+    );
+
+    // repeated root: (x-1)^2 has one distinct real root
+    assert_eq!(prat(&[1, -2, 1]).real_root_count(), 1);
+}

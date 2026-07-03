@@ -51,13 +51,13 @@ fn q_i64(v: i64) -> Q {
 // Polynomial helpers (over ℚ)
 // ===========================================================================
 
+// Real-root isolation primitives are shared with the public `Poly<Rational>`
+// API in `crate::poly`.
+use crate::poly::sturm_count as count_roots;
+
 /// Returns the squarefree part `p / gcd(p, p′)` (monic).
 fn squarefree(p: &P) -> P {
-    if p.degree().unwrap_or(0) < 1 {
-        return p.monic();
-    }
-    let g = p.gcd(&p.derivative());
-    p.div_rem(&g).0.monic()
+    p.squarefree_part()
 }
 
 /// Sign of `p(x)` as `-1`, `0`, or `1`.
@@ -65,42 +65,9 @@ fn eval_sign(p: &P, x: &Q) -> i32 {
     p.eval(x).signum()
 }
 
-/// The Sturm chain of a squarefree polynomial: `p₀ = p`, `p₁ = p′`,
-/// `pᵢ = −(pᵢ₋₂ mod pᵢ₋₁)`.
+/// The Sturm chain of a squarefree polynomial.
 fn sturm_chain(p: &P) -> Vec<P> {
-    let mut chain = alloc::vec![p.clone(), p.derivative()];
-    while !chain.last().unwrap().is_zero() {
-        let n = chain.len();
-        let r = chain[n - 2].rem(&chain[n - 1]);
-        if r.is_zero() {
-            break;
-        }
-        chain.push(r.neg());
-    }
-    chain
-}
-
-/// Number of sign variations of the Sturm chain evaluated at `x`.
-fn sign_variations(chain: &[P], x: &Q) -> usize {
-    let mut last = 0i32;
-    let mut count = 0;
-    for p in chain {
-        let s = eval_sign(p, x);
-        if s != 0 {
-            if last != 0 && s != last {
-                count += 1;
-            }
-            last = s;
-        }
-    }
-    count
-}
-
-/// Number of real roots of the chain's polynomial in the half-open `(a, b]`.
-fn count_roots(chain: &[P], a: &Q, b: &Q) -> usize {
-    let va = sign_variations(chain, a);
-    let vb = sign_variations(chain, b);
-    va.saturating_sub(vb)
+    p.sturm_chain()
 }
 
 // ===========================================================================
@@ -196,6 +163,16 @@ impl Algebraic {
         Algebraic::from_rational(Rational::from_integer(n))
     }
 
+    /// Returns every distinct real root of `poly` as an exact algebraic number,
+    /// in increasing order.
+    pub fn real_roots_of(poly: &Poly<Rational>) -> Vec<Algebraic> {
+        let sf = squarefree(poly);
+        poly.isolate_real_roots()
+            .into_iter()
+            .map(|(lo, hi)| Algebraic::new(sf.clone(), lo, hi))
+            .collect()
+    }
+
     /// Builds the unique real root of `poly` lying in `(lo, hi]`. The caller must
     /// guarantee there is exactly one. `poly` is reduced to its squarefree part.
     pub fn new(poly: P, lo: Q, hi: Q) -> Algebraic {
@@ -204,21 +181,17 @@ impl Algebraic {
     }
 
     /// Collapses to an exact rational representation when the root is rational.
+    ///
+    /// The interval is half-open `(lo, hi]`, so only `hi` can *be* the value; a
+    /// root of the polynomial sitting at the excluded `lo` is a different root.
     fn normalized(self) -> Algebraic {
         if self.lo == self.hi {
             return self;
-        }
-        // A rational root shows up as a sign of zero at an endpoint or as a
-        // degree-1 factor; detect the simplest case cheaply.
-        if eval_sign(&self.poly, &self.lo) == 0 {
-            let r = self.lo.clone();
-            return Algebraic::from_rational(r);
         }
         if eval_sign(&self.poly, &self.hi) == 0 {
             let r = self.hi.clone();
             return Algebraic::from_rational(r);
         }
-        // Ensure a genuine sign change (bisect once toward it if not).
         self
     }
 
@@ -248,14 +221,18 @@ impl Algebraic {
         let mid = self.lo.add(&self.hi).div(&q_i64(2));
         let sm = eval_sign(&self.poly, &mid);
         if sm == 0 {
+            // Inside a proper isolating interval only the (rational) value itself
+            // can be a root, so a rational midpoint hit is exactly the value.
             self.lo = mid.clone();
             self.hi = mid;
             return;
         }
-        if sm == eval_sign(&self.poly, &self.lo) {
-            self.lo = mid;
-        } else {
+        // Anchor on `hi`: hi is never a spurious root (unlike lo, which may be an
+        // excluded root of the shared polynomial).
+        if sm == eval_sign(&self.poly, &self.hi) {
             self.hi = mid;
+        } else {
+            self.lo = mid;
         }
     }
 
@@ -268,17 +245,17 @@ impl Algebraic {
 
     /// Returns `-1`, `0`, or `1` according to the sign of the value.
     pub fn signum(&self) -> i32 {
-        let zero = Rational::ZERO;
-        // Value is zero iff 0 is the isolated root.
-        if eval_sign(&self.poly, &zero) == 0 && self.lo <= zero && zero <= self.hi {
-            return 0;
+        // Zero only occurs as the exact rational 0 (an irrational value is never
+        // zero); otherwise refine until the interval lies on one side of 0.
+        if self.is_rational() {
+            return self.lo.signum();
         }
         let mut a = self.clone();
         loop {
             if a.lo.is_positive() {
                 return 1;
             }
-            if a.hi.is_negative() {
+            if a.hi.is_negative() || a.hi.is_zero() {
                 return -1;
             }
             a.refine();

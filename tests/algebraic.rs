@@ -68,3 +68,18 @@ fn field_arithmetic_via_resultants() {
     let phi = Algebraic::new(poly(&[-1, -1, 1]), Rational::from(1), Rational::from(2));
     assert_eq!(phi.mul(&phi), phi.add(&Algebraic::from_int(Int::ONE)));
 }
+
+#[test]
+fn real_roots_of_polynomial() {
+    // x^3 - 2x  = x(x^2 - 2): roots -√2, 0, √2
+    let roots = Algebraic::real_roots_of(&poly(&[0, -2, 0, 1]));
+    assert_eq!(roots.len(), 3);
+    assert_eq!(roots[0].signum(), -1);
+    assert_eq!(roots[1].signum(), 0);
+    assert_eq!(roots[2].signum(), 1);
+    assert!((roots[2].to_float(50, N).to_f64() - 2.0f64.sqrt()).abs() < 1e-13);
+    // roots come back sorted
+    assert!(roots[0] < roots[1] && roots[1] < roots[2]);
+    // no real roots
+    assert!(Algebraic::real_roots_of(&poly(&[1, 0, 1])).is_empty());
+}

@@ -308,3 +308,184 @@ macro_rules! poly_binop {
 poly_binop!(Add, add, AddAssign, add_assign);
 poly_binop!(Sub, sub, SubAssign, sub_assign);
 poly_binop!(Mul, mul, MulAssign, mul_assign);
+
+// ===========================================================================
+// Real-root isolation over ℚ (Sturm sequences).
+//
+// These operate on `Poly<Rational>` and power both the public root-finding API
+// below and the `Algebraic` number type. `T::default()` is the additive
+// identity, so `Rational::default() == 0`.
+// ===========================================================================
+
+#[cfg(feature = "rational")]
+use crate::rational::Rational;
+
+/// Number of sign variations of a Sturm chain evaluated at `x` (zeros skipped).
+#[cfg(feature = "rational")]
+pub fn sturm_variations(chain: &[Poly<Rational>], x: &Rational) -> usize {
+    let mut last = 0i32;
+    let mut count = 0;
+    for p in chain {
+        let s = p.eval(x).signum();
+        if s != 0 {
+            if last != 0 && s != last {
+                count += 1;
+            }
+            last = s;
+        }
+    }
+    count
+}
+
+/// Number of distinct real roots of the chain's (squarefree) polynomial in the
+/// half-open interval `(lo, hi]`.
+#[cfg(feature = "rational")]
+pub fn sturm_count(chain: &[Poly<Rational>], lo: &Rational, hi: &Rational) -> usize {
+    sturm_variations(chain, lo).saturating_sub(sturm_variations(chain, hi))
+}
+
+#[cfg(feature = "rational")]
+impl Poly<Rational> {
+    /// Returns the squarefree part `self / gcd(self, self′)` (monic).
+    pub fn squarefree_part(&self) -> Poly<Rational> {
+        if self.degree().unwrap_or(0) < 1 {
+            return self.monic();
+        }
+        let g = self.gcd(&self.derivative());
+        self.div_rem(&g).0.monic()
+    }
+
+    /// Returns the Sturm chain `p₀ = self, p₁ = self′, pᵢ = −(pᵢ₋₂ mod pᵢ₋₁)`.
+    /// For a correct real-root count the polynomial should be squarefree (see
+    /// [`squarefree_part`](Poly::squarefree_part)).
+    pub fn sturm_chain(&self) -> alloc::vec::Vec<Poly<Rational>> {
+        let mut chain = alloc::vec![self.clone(), self.derivative()];
+        while !chain.last().unwrap().is_zero() {
+            let n = chain.len();
+            let r = chain[n - 2].rem(&chain[n - 1]);
+            if r.is_zero() {
+                break;
+            }
+            chain.push(r.neg());
+        }
+        chain
+    }
+
+    /// A Cauchy bound: every real root lies in the open interval `(-b, b)`.
+    fn real_root_bound(&self) -> Rational {
+        let lead = match self.leading() {
+            Some(c) => c.abs(),
+            None => return Rational::ONE,
+        };
+        let mut m = Rational::ZERO;
+        let deg = self.degree().unwrap_or(0);
+        for i in 0..deg {
+            let r = Rational::div(&self.coeff(i).abs(), &lead);
+            if r > m {
+                m = r;
+            }
+        }
+        Rational::add(&m, &Rational::ONE)
+    }
+
+    /// Counts the distinct real roots of `self` in `(lo, hi]`.
+    pub fn count_real_roots_in(&self, lo: &Rational, hi: &Rational) -> usize {
+        let sf = self.squarefree_part();
+        if sf.degree().unwrap_or(0) < 1 {
+            return 0;
+        }
+        sturm_count(&sf.sturm_chain(), lo, hi)
+    }
+
+    /// Returns the total number of distinct real roots of `self`.
+    pub fn real_root_count(&self) -> usize {
+        let sf = self.squarefree_part();
+        if sf.degree().unwrap_or(0) < 1 {
+            return 0;
+        }
+        let b = sf.real_root_bound();
+        sturm_count(&sf.sturm_chain(), &Rational::neg(&b), &b)
+    }
+
+    /// Isolates every distinct real root, returning half-open rational intervals
+    /// `(lo, hi]` each containing exactly one root (an exact rational root is
+    /// returned as a degenerate `[r, r]`). Intervals come back in increasing
+    /// order.
+    pub fn isolate_real_roots(&self) -> alloc::vec::Vec<(Rational, Rational)> {
+        let mut out = alloc::vec::Vec::new();
+        let sf = self.squarefree_part();
+        if sf.degree().unwrap_or(0) < 1 {
+            return out;
+        }
+        let chain = sf.sturm_chain();
+        let two = Rational::from_integer(crate::int::Int::from_i64(2));
+        let b = sf.real_root_bound();
+        // Work stack of intervals still to resolve. The counting is half-open
+        // `(lo, hi]`, so a root exactly at a bisection midpoint stays in the
+        // left half and is never double-counted.
+        let neg_b = Rational::neg(&b);
+        let mut stack = alloc::vec![(neg_b, b)];
+        while let Some((lo, hi)) = stack.pop() {
+            let c = sturm_count(&chain, &lo, &hi);
+            if c == 0 {
+                continue;
+            }
+            if c == 1 {
+                out.push((lo, hi));
+                continue;
+            }
+            let mid = Rational::div(&Rational::add(&lo, &hi), &two);
+            stack.push((lo, mid.clone()));
+            stack.push((mid, hi));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
+
+#[cfg(all(feature = "rational", feature = "float"))]
+impl Poly<Rational> {
+    /// Returns every distinct real root as a [`Float`](crate::float::Float),
+    /// each correctly isolated then refined to `precision` bits.
+    pub fn real_roots(
+        &self,
+        precision: u64,
+        mode: crate::float::RoundingMode,
+    ) -> alloc::vec::Vec<crate::float::Float> {
+        use crate::float::Float;
+        let sf = self.squarefree_part();
+        let two = Rational::from_integer(crate::int::Int::from_i64(2));
+        self.isolate_real_roots()
+            .into_iter()
+            .map(|(mut lo, mut hi)| {
+                // Bisect until both ends round to the same float.
+                for _ in 0..(precision + 64) {
+                    if lo == hi {
+                        break;
+                    }
+                    let flo = Float::from_rational(&lo, precision, mode);
+                    let fhi = Float::from_rational(&hi, precision, mode);
+                    if flo == fhi {
+                        return flo;
+                    }
+                    let mid = Rational::div(&Rational::add(&lo, &hi), &two);
+                    let sm = sf.eval(&mid).signum();
+                    if sm == 0 {
+                        lo = mid.clone();
+                        hi = mid;
+                    } else if sm == sf.eval(&hi).signum() {
+                        // Anchor on hi (never a spurious root of the shared poly).
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                Float::from_rational(
+                    &Rational::div(&Rational::add(&lo, &hi), &two),
+                    precision,
+                    mode,
+                )
+            })
+            .collect()
+    }
+}

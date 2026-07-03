@@ -298,3 +298,48 @@ fn shortest_decimal_round_trips() {
     let back: Rational = s.parse().unwrap();
     assert_eq!(Float::from_rational(&back, 120, n), pi);
 }
+
+#[test]
+fn division_and_sqrt_are_correctly_rounded() {
+    let n = RoundingMode::Nearest;
+    // Division at precision p must equal the exact rational a/b rounded to p bits
+    // (from_rational is the correctly-rounded reference).
+    for &(a, b) in &[
+        (1, 3),
+        (2, 7),
+        (355, 113),
+        (22, 7),
+        (1, 1000),
+        (999, 1000),
+        (7, 9),
+        (123, 457),
+    ] {
+        for &p in &[24u64, 53, 113] {
+            let fa = Float::from_int(&Int::from_i64(a), p, n);
+            let fb = Float::from_int(&Int::from_i64(b), p, n);
+            let got = fa.div(&fb, p, n);
+            let want =
+                Float::from_rational(&Rational::new(Int::from_i64(a), Int::from_i64(b)), p, n);
+            assert_eq!(got, want, "{a}/{b} @ {p} correctly rounded");
+        }
+    }
+
+    // sqrt at precision p equals the higher-precision sqrt rounded down to p, and
+    // its square brackets the input (within one ulp).
+    for &v in &[2i64, 3, 5, 7, 10, 1000, 123456789] {
+        let p = 60;
+        let f = Float::from_int(&Int::from_i64(v), p, n);
+        let s = f.sqrt(p, n);
+        let s_hi = Float::from_int(&Int::from_i64(v), p + 80, n).sqrt(p + 80, n);
+        assert_eq!(s, s_hi.round(p, n), "sqrt({v}) @ {p} correctly rounded");
+    }
+
+    // Directed rounding brackets the exact value.
+    let fa = Float::from_int(&Int::from_i64(2), 53, n);
+    let fb = Float::from_int(&Int::from_i64(3), 53, n);
+    let down = fa.div(&fb, 53, RoundingMode::TowardNegative);
+    let up = fa.div(&fb, 53, RoundingMode::TowardPositive);
+    assert!(down < up);
+    let exact = Rational::new(Int::from_i64(2), Int::from_i64(3));
+    assert!(down.to_rational().unwrap() < exact && exact < up.to_rational().unwrap());
+}

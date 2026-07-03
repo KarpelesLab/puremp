@@ -262,7 +262,10 @@ Outside the core contract (§1); behind the `float` feature.
   `sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`, `sinh`/`cosh`/`tanh`, and
   `asinh`/`acosh`/`atanh`.
 - ✅ Shortest round-tripping decimal (`to_shortest_string`) and an exact codec.
-- ▫ Further: formal correct-rounding proofs / hard-to-round test vectors.
+- ✅ Correct-rounding tests: `div`/`sqrt` checked against the exact rational
+  rounded reference and higher-precision recomputation, plus directed-rounding
+  bracketing.
+- ▫ Further: exhaustive hard-to-round vectors and formal proofs (research-grade).
 
 ### M9 — Polish, interop & release
 - ✅ `core::ops` coverage (value/ref/`i64`/assign) for `Int`; value/ref/assign for

@@ -105,6 +105,7 @@ int main(void) {
 | `poly` | ✔ | `Poly<T>` — generic univariate polynomials |
 | `matrix` | ✔ | `Matrix<T>` — dense matrices with exact linear algebra |
 | `interval` | ✔ | `Interval` — outward-rounded interval arithmetic (implies `float`) |
+| `algebraic` | ✔ | `Quadratic` (ℚ(√d)) and general real `Algebraic` numbers |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
 | `num-traits` | | Implements `num-traits` interfaces for `Int`/`Rational`/`Nat` |
 | `ffi` | | The C ABI module (`include/puremp.h`) |

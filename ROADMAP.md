@@ -381,6 +381,10 @@ foundation:
 - **`Matrix<T>`** (`matrix`) — dense matrices; exact Bareiss integer determinant
   and rational determinant/inverse/solve/rank.
 - **`Interval`** (`interval`) — outward-rounded interval arithmetic.
+- **`Quadratic`** (`algebraic`) — exact arithmetic in a quadratic field `ℚ(√d)`.
+- **`Algebraic`** (`algebraic`) — general real algebraic numbers: Sturm-sequence
+  root isolation, exact comparison, and field ops via Faddeev–LeVerrier
+  characteristic polynomials of Kronecker sums/products.
 
 ### Number-theory toolkit (on `Int`/`Rational`/`Nat`)
 

@@ -25,6 +25,8 @@
 //! - [`Matrix`] — dense matrices with exact determinant/inverse/solve
 //!   (`matrix`).
 //! - [`Interval`] — outward-rounded interval arithmetic (`interval`).
+//! - [`Quadratic`] / [`Algebraic`] — exact quadratic irrationals `ℚ(√d)` and
+//!   general real algebraic numbers (`algebraic`).
 //!
 //! `Int`/`Rational` also carry a number-theory toolkit (factorization,
 //! `sqrt_mod`, Jacobi/Legendre, CRT, `random_prime`, combinatorics,

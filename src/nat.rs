@@ -29,6 +29,9 @@ const KARATSUBA_THRESHOLD: usize = 32;
 /// conservatively; a tuned crossover is a later milestone.
 const TOOM3_THRESHOLD: usize = 128;
 
+/// Operands with at least this many limbs use Toom-4 (above Toom-3).
+const TOOM4_THRESHOLD: usize = 320;
+
 /// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
 const LEHMER_THRESHOLD: usize = 16;
 
@@ -459,11 +462,94 @@ impl Nat {
             self.mul_schoolbook(rhs)
         } else if min_len < TOOM3_THRESHOLD {
             self.mul_karatsuba(rhs)
-        } else if min_len < NTT_THRESHOLD {
+        } else if min_len < TOOM4_THRESHOLD {
             self.mul_toom3(rhs)
+        } else if min_len < NTT_THRESHOLD {
+            self.mul_toom4(rhs)
         } else {
             mul_ntt(self, rhs)
         }
+    }
+
+    /// Toom-4 multiplication: seven quarter-size products evaluated at
+    /// {0, 1, −1, 2, −2, 3, ∞} and interpolated. Asymptotically `O(n^1.404)`.
+    fn mul_toom4(&self, rhs: &Nat) -> Nat {
+        use crate::int::Int;
+
+        let n = self.limbs.len().max(rhs.limbs.len());
+        let k = n.div_ceil(4);
+        let bshift = k as u64 * LIMB_BITS as u64;
+        let part = |x: &Nat, i: usize| -> Int {
+            let l = x.limbs.len();
+            let lo = i * k;
+            if lo >= l {
+                Int::ZERO
+            } else {
+                Int::from(Nat::from_limbs(&x.limbs[lo..(lo + k).min(l)]))
+            }
+        };
+        let three = Int::from_i64(3);
+        let nine = Int::from_i64(9);
+        let twenty_seven = Int::from_i64(27);
+
+        // Evaluate a polynomial's four digits at the seven points.
+        let eval = |x: &Nat| -> [Int; 7] {
+            let (d0, d1, d2, d3) = (part(x, 0), part(x, 1), part(x, 2), part(x, 3));
+            let even1 = d0.add(&d2); // d0 + d2
+            let odd1 = d1.add(&d3); // d1 + d3
+            let p1 = even1.add(&odd1); // x(1)
+            let pm1 = even1.sub(&odd1); // x(-1)
+            let even2 = d0.add(&d2.mul_2k(2)); // d0 + 4 d2
+            let odd2 = d1.mul_2k(1).add(&d3.mul_2k(3)); // 2 d1 + 8 d3
+            let p2 = even2.add(&odd2); // x(2)
+            let pm2 = even2.sub(&odd2); // x(-2)
+            let p3 = d0
+                .add(&d1.mul(&three))
+                .add(&d2.mul(&nine))
+                .add(&d3.mul(&twenty_seven)); // x(3)
+            [d0, p1, pm1, p2, pm2, p3, d3]
+        };
+        let ea = eval(self);
+        let eb = eval(rhs);
+        // Pointwise products at 0, 1, −1, 2, −2, 3, ∞.
+        let v: [Int; 7] = core::array::from_fn(|i| ea[i].mul(&eb[i]));
+        let (v0, v1, vm1, v2, vm2, v3, vinf) = (&v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]);
+
+        // Interpolate c0..c6 (all divisions exact).
+        let two = Int::from_i64(2);
+        let c0 = v0.clone();
+        let c6 = vinf.clone();
+        let e1 = v1.add(vm1).div_exact(&two).sub(&c0).sub(&c6); // c2 + c4
+        let o1 = v1.sub(vm1).div_exact(&two); // c1 + c3 + c5
+        let e2 = v2
+            .add(vm2)
+            .div_exact(&two)
+            .sub(&c0)
+            .sub(&c6.mul(&Int::from_i64(64))); // 4c2 + 16c4
+        let o2h = v2.sub(vm2).div_exact(&Int::from_i64(4)); // c1 + 4c3 + 16c5
+        let c4 = e2
+            .sub(&e1.mul(&Int::from_i64(4)))
+            .div_exact(&Int::from_i64(12));
+        let c2 = e1.sub(&c4);
+        let f = o2h.sub(&o1).div_exact(&three); // c3 + 5c5
+        let g = v3
+            .sub(&c0)
+            .sub(&c2.mul(&nine))
+            .sub(&c4.mul(&Int::from_i64(81)))
+            .sub(&c6.mul(&Int::from_i64(729)))
+            .div_exact(&three); // c1 + 9c3 + 81c5
+        let h = g.sub(&o1).div_exact(&Int::from_i64(8)); // c3 + 10c5
+        let c5 = h.sub(&f).div_exact(&Int::from_i64(5));
+        let c3 = f.sub(&c5.mul(&Int::from_i64(5)));
+        let c1 = o1.sub(&c3).sub(&c5);
+
+        let coeffs = [c0, c1, c2, c3, c4, c5, c6];
+        let mut acc = Int::ZERO;
+        for (i, c) in coeffs.iter().enumerate() {
+            acc = acc.add(&c.mul_2k((i as u64 * bshift) as u32));
+        }
+        debug_assert!(!acc.is_negative(), "toom4 produced a negative result");
+        acc.magnitude()
     }
 
     /// Toom-3 multiplication: five half-third-size products, evaluated at the

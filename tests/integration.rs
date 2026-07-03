@@ -577,6 +577,24 @@ fn random_generation() {
 }
 
 #[test]
+fn toom4_matches_reference() {
+    // Operands large enough to cross the Toom-4 threshold (>320 limbs, ~20k
+    // bits): 10^6000 * 10^6100 == 10^12100, plus algebraic laws.
+    let p = Int::from_i64(10).pow(6000);
+    let q = Int::from_i64(10).pow(6100);
+    let prod = p.mul(&q);
+    let mut expected = String::from("1");
+    expected.push_str(&"0".repeat(12100));
+    assert_eq!(prod.to_string(), expected);
+
+    let a = Int::from_i64(7).pow(7000);
+    let b = Int::from_i64(3).pow(7100);
+    let c = Int::from_i64(11).pow(6900);
+    assert_eq!(a.mul(&b), b.mul(&a));
+    assert_eq!(a.mul(&b.add(&c)), a.mul(&b).add(&a.mul(&c)));
+}
+
+#[test]
 fn toom3_matches_reference() {
     // Operands large enough to cross the Toom-3 threshold (>128 limbs, ~8200
     // bits). Check against a value computed a different way: (10^m)·(10^m') is

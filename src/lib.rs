@@ -85,6 +85,9 @@ pub mod dyadic;
 #[cfg(feature = "decimal")]
 pub mod decimal;
 
+#[cfg(feature = "complex")]
+pub mod complex;
+
 #[cfg(feature = "float")]
 pub mod float;
 
@@ -119,6 +122,9 @@ pub use dyadic::Dyadic;
 
 #[cfg(feature = "decimal")]
 pub use decimal::{Decimal, Rounding};
+
+#[cfg(feature = "complex")]
+pub use complex::Complex;
 
 #[cfg(feature = "float")]
 pub use fixed_float::FixedFloat;

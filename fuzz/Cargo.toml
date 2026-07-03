@@ -33,3 +33,13 @@ path = "fuzz_targets/rational_reduce.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decimal_roundtrip"
+path = "fuzz_targets/decimal_roundtrip.rs"
+test = false
+
+[[bin]]
+name = "poly_div_rem"
+path = "fuzz_targets/poly_div_rem.rs"
+test = false

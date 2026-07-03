@@ -799,3 +799,52 @@ fn combinatorics() {
         );
     }
 }
+
+#[test]
+fn jacobi_sqrt_mod_crt() {
+    // Jacobi / Legendre
+    assert_eq!(int("2").jacobi(&int("15")), 1); // (2/15)
+    assert_eq!(int("5").jacobi(&int("21")), 1);
+    assert_eq!(int("3").legendre(&int("7")), -1); // 3 is a non-residue mod 7
+    assert_eq!(int("2").legendre(&int("7")), 1); // 2 ≡ 3² = 9 ≡ 2 (mod 7)
+    assert_eq!(int("7").jacobi(&int("7")), 0);
+
+    // Modular square root r² ≡ a (mod p), with s=1 (7, 13, 1000000007) and
+    // s>1 (17: s=4, 41: s=3) valuations of p-1.
+    for (a, p) in [
+        ("2", "7"),
+        ("10", "13"),
+        ("2", "17"),
+        ("5", "41"),
+        ("123456", "1000000007"),
+    ] {
+        let (a, p) = (int(a), int(p));
+        match a.sqrt_mod(&p) {
+            Some(r) => assert_eq!(
+                r.mul(&r).rem_euclid(&p),
+                a.rem_euclid(&p),
+                "sqrt {a} mod {p}"
+            ),
+            None => assert_eq!(a.legendre(&p), -1),
+        }
+    }
+    assert!(int("3").sqrt_mod(&int("7")).is_none()); // non-residue
+
+    // Large modular square root mod the Mersenne prime 2^127 - 1, for a value
+    // that is a quadratic residue by construction (x²).
+    let p = int("170141183460469231731687303715884105727");
+    let x = int("123456789012345678901234567890");
+    let a = x.mul(&x).rem_euclid(&p);
+    let r = a.sqrt_mod(&p).unwrap();
+    assert_eq!(r.mul(&r).rem_euclid(&p), a);
+
+    // CRT: x ≡ 2 (mod 3), 3 (mod 5), 2 (mod 7) → 23
+    let x = Int::crt(
+        &[int("2"), int("3"), int("2")],
+        &[int("3"), int("5"), int("7")],
+    )
+    .unwrap();
+    assert_eq!(x.to_string(), "23");
+    // Non-coprime moduli → None.
+    assert!(Int::crt(&[int("1"), int("2")], &[int("4"), int("6")]).is_none());
+}

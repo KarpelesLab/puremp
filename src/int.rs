@@ -871,6 +871,63 @@ fn mask_to_width(v: &mut [u64], width: u32) {
     }
 }
 
+/// The Legendre symbol via Euler's criterion `a^((p-1)/2) mod p`, on naturals.
+fn legendre_symbol(a: &Nat, p: &Nat) -> i32 {
+    let a = a.div_rem(p).expect("odd prime modulus").1;
+    if a.is_zero() {
+        return 0;
+    }
+    let exp = p.checked_sub(&Nat::one()).unwrap().shr(1); // (p-1)/2
+    if a.modpow(&exp, p).is_one() { 1 } else { -1 }
+}
+
+/// Tonelli–Shanks modular square root of `a` mod the odd prime `p`.
+fn tonelli_shanks(a: &Nat, p: &Nat) -> Option<Nat> {
+    let one = Nat::one();
+    let a = a.div_rem(p).expect("non-zero modulus").1;
+    if a.is_zero() {
+        return Some(Nat::zero());
+    }
+    if legendre_symbol(&a, p) != 1 {
+        return None; // quadratic non-residue
+    }
+    let modp = |x: Nat| x.div_rem(p).unwrap().1;
+    let p1 = p.checked_sub(&one).unwrap();
+    let s = p1.trailing_zeros();
+    let q = p1.shr(s); // odd
+
+    if s == 1 {
+        // r = a^((p+1)/4)
+        return Some(a.modpow(&p.add(&one).shr(2), p));
+    }
+    // A quadratic non-residue z.
+    let mut z = Nat::from_u64(2);
+    while legendre_symbol(&z, p) != -1 {
+        z = z.add(&one);
+    }
+    let mut m = s;
+    let mut c = z.modpow(&q, p);
+    let mut t = a.modpow(&q, p);
+    let mut r = a.modpow(&q.add(&one).shr(1), p); // a^((q+1)/2)
+    loop {
+        if t.is_one() {
+            return Some(r);
+        }
+        // Least i in (0, m) with t^(2^i) == 1.
+        let mut i = 1u64;
+        let mut t2 = modp(t.square());
+        while !t2.is_one() {
+            t2 = modp(t2.square());
+            i += 1;
+        }
+        let b = c.modpow(&one.shl(m - i - 1), p); // c^(2^(m-i-1))
+        m = i;
+        c = modp(b.square());
+        t = modp(t.mul(&c)); // t·b²
+        r = modp(r.mul(&b));
+    }
+}
+
 /// `(F(n), F(n+1))` by fast doubling.
 fn fib_pair(n: u64) -> (Int, Int) {
     if n == 0 {
@@ -932,6 +989,54 @@ impl Int {
     pub fn lucas(n: u64) -> Int {
         let (f_n, f_n1) = fib_pair(n);
         f_n1.mul_2k(1).sub(&f_n) // L(n) = 2·F(n+1) − F(n)
+    }
+
+    /// Returns the Jacobi symbol `(self / n)` for odd `n > 0` (`-1`, `0`, `1`).
+    pub fn jacobi(&self, n: &Int) -> i32 {
+        assert!(
+            n.is_positive() && n.is_odd(),
+            "jacobi: n must be odd and > 0"
+        );
+        crate::nat::jacobi(self, &n.magnitude())
+    }
+
+    /// Returns the Legendre symbol `(self / p)` for an odd prime `p`. (Same
+    /// computation as [`Int::jacobi`]; correct as a Legendre symbol only when
+    /// `p` is prime.)
+    #[inline]
+    pub fn legendre(&self, p: &Int) -> i32 {
+        self.jacobi(p)
+    }
+
+    /// Returns a modular square root of `self` mod the prime `p`, i.e. some `r`
+    /// with `r² ≡ self (mod p)`, or `None` if `self` is a quadratic non-residue.
+    /// The result lies in `[0, p)`. `p` must be prime.
+    pub fn sqrt_mod(&self, p: &Int) -> Option<Int> {
+        assert!(p.is_positive(), "sqrt_mod: modulus must be positive");
+        let pn = p.magnitude();
+        if pn == Nat::from_u64(2) {
+            return Some(self.rem_euclid(p)); // 0→0, 1→1
+        }
+        tonelli_shanks(&self.rem_euclid(p).magnitude(), &pn).map(Int::from)
+    }
+
+    /// Solves the system `x ≡ residues[i] (mod moduli[i])` by the Chinese
+    /// Remainder Theorem, returning the unique `x` in `[0, ∏ moduli)`, or `None`
+    /// if the moduli are not pairwise coprime. Panics if the slices differ in
+    /// length.
+    pub fn crt(residues: &[Int], moduli: &[Int]) -> Option<Int> {
+        assert_eq!(residues.len(), moduli.len(), "crt: mismatched lengths");
+        let mut x = Int::ZERO;
+        let mut m = Int::ONE;
+        for (r, mi) in residues.iter().zip(moduli) {
+            let mi = mi.abs();
+            let diff = r.sub(&x).rem_euclid(&mi);
+            let inv = m.modinv(&mi)?; // requires gcd(m, mi) == 1
+            let t = diff.mul(&inv).rem_euclid(&mi);
+            x = x.add(&m.mul(&t));
+            m = m.mul(&mi);
+        }
+        Some(x.rem_euclid(&m))
     }
 }
 

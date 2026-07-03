@@ -1579,7 +1579,7 @@ fn miller_rabin_witness(a: &Nat, n: &Nat) -> bool {
 }
 
 /// Jacobi symbol `(d/n)` for odd `n > 0`.
-fn jacobi(d: &crate::int::Int, n: &Nat) -> i32 {
+pub(crate) fn jacobi(d: &crate::int::Int, n: &Nat) -> i32 {
     let mut a = d.rem_euclid(&crate::int::Int::from(n.clone())).magnitude();
     let mut m = n.clone();
     let mut result = 1i32;

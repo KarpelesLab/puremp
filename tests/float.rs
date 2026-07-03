@@ -343,3 +343,27 @@ fn division_and_sqrt_are_correctly_rounded() {
     let exact = Rational::new(Int::from_i64(2), Int::from_i64(3));
     assert!(down.to_rational().unwrap() < exact && exact < up.to_rational().unwrap());
 }
+
+#[test]
+fn display_decimal_and_scientific() {
+    use puremp::{Float, RoundingMode};
+    let n = RoundingMode::Nearest;
+    let f = |x: f64| Float::from_f64(x, 53, n);
+
+    // Display is now decimal (shortest round-tripping)
+    assert_eq!(f(1.5).to_string(), "1.5");
+    assert_eq!(f(-0.25).to_string(), "-0.25");
+    assert_eq!(Float::nan(53).to_string(), "NaN");
+    assert_eq!(Float::infinity(53).to_string(), "inf");
+
+    // {:.N} → N fractional digits, correctly rounded
+    assert_eq!(format!("{:.2}", f(1.0).div(&f(3.0), 53, n)), "0.33");
+    assert_eq!(format!("{:.4}", f(2.0).div(&f(3.0), 53, n)), "0.6667");
+
+    // scientific {:e} / {:E}
+    assert_eq!(format!("{:e}", f(1500.0)), "1.5e3");
+    assert_eq!(format!("{:e}", f(0.00123)), "1.23e-3");
+    assert_eq!(format!("{:E}", f(3.25)), "3.25E0");
+    assert_eq!(format!("{:e}", Float::zero(53)), "0e0");
+    assert_eq!(format!("{:e}", f(-42.0)), "-4.2e1");
+}

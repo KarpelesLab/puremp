@@ -875,23 +875,76 @@ impl FromStr for Float {
     }
 }
 
-impl fmt::Display for Float {
-    /// Formats the exact value as `±significand·2^exponent` (or a special token).
-    /// For decimal output use [`Float::to_decimal_string`].
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.repr {
-            Repr::NaN => f.write_str("NaN"),
-            Repr::Inf(true) => f.write_str("-inf"),
-            Repr::Inf(false) => f.write_str("inf"),
-            Repr::Zero(true) => f.write_str("-0"),
-            Repr::Zero(false) => f.write_str("0"),
-            Repr::Normal { neg, sig, exp } => {
-                if *neg {
-                    f.write_str("-")?;
-                }
-                write!(f, "{sig}·2^{exp}")
-            }
+/// Rewrites a plain decimal string (as produced by the `to_*_string` methods)
+/// into scientific notation `d.dddde±X`. Special tokens pass through.
+fn plain_to_scientific(s: &str, upper: bool) -> String {
+    if matches!(s, "NaN" | "inf" | "-inf") {
+        return String::from(s);
+    }
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let e_char = if upper { 'E' } else { 'e' };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    let combined: String = int_part.chars().chain(frac_part.chars()).collect();
+    let point = int_part.len();
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    match combined.find(|c| c != '0') {
+        None => {
+            // Zero.
+            out.push('0');
+            out.push(e_char);
+            out.push('0');
         }
+        Some(p) => {
+            let exp = point as i64 - 1 - p as i64;
+            let mut sig = &combined[p..];
+            sig = sig.trim_end_matches('0');
+            let bytes = sig.as_bytes();
+            out.push(bytes[0] as char);
+            if bytes.len() > 1 {
+                out.push('.');
+                out.push_str(&sig[1..]);
+            }
+            out.push(e_char);
+            out.push_str(&alloc::format!("{exp}"));
+        }
+    }
+    out
+}
+
+impl fmt::Display for Float {
+    /// Formats the value in decimal. With a precision (`{:.N}`) it prints `N`
+    /// fractional digits (correctly rounded); otherwise it prints the shortest
+    /// decimal that round-trips. Special values print as `NaN`/`inf`/`-inf`/`0`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match f.precision() {
+            Some(p) => self.to_decimal_string(p as u32),
+            None => self.to_shortest_string(),
+        };
+        f.write_str(&s)
+    }
+}
+
+impl fmt::LowerExp for Float {
+    /// Scientific notation, e.g. `1.5e3`. The mantissa is the shortest that
+    /// round-trips; the precision flag is not applied.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&plain_to_scientific(&self.to_shortest_string(), false))
+    }
+}
+
+impl fmt::UpperExp for Float {
+    /// Scientific notation with an uppercase `E`, e.g. `1.5E3`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&plain_to_scientific(&self.to_shortest_string(), true))
     }
 }
 

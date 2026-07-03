@@ -5,11 +5,11 @@
 //! the empty vector). That canonical form makes equality and ordering cheap and
 //! lets the derived [`PartialEq`]/[`Eq`] be correct.
 //!
-//! This is the layer that carries the heavy limb-level algorithms. The scaffold
-//! ships the quadratic-time schoolbook routines and the pieces the higher layers
-//! already need (addition, subtraction, multiplication, shifts, binary GCD,
-//! decimal I/O); sub-quadratic multiplication and division land in later
-//! milestones — see `ROADMAP.md`.
+//! This is the layer that carries the heavy limb-level algorithms: addition,
+//! subtraction, multiplication (schoolbook with a Karatsuba path), division
+//! (single-limb plus Knuth Algorithm D), shifts, binary GCD, roots, and radix
+//! I/O. Further sub-quadratic work (Toom/FFT multiplication, Burnikel–Ziegler
+//! division) is future performance work — see `ROADMAP.md`.
 
 use core::cmp::Ordering;
 use core::fmt;

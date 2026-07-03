@@ -492,3 +492,27 @@ impl core::ops::Neg for &Rational {
         Rational::neg(self)
     }
 }
+
+impl core::iter::Sum for Rational {
+    fn sum<I: Iterator<Item = Rational>>(iter: I) -> Rational {
+        iter.fold(Rational::ZERO, |acc, x| acc.add(&x))
+    }
+}
+
+impl<'a> core::iter::Sum<&'a Rational> for Rational {
+    fn sum<I: Iterator<Item = &'a Rational>>(iter: I) -> Rational {
+        iter.fold(Rational::ZERO, |acc, x| acc.add(x))
+    }
+}
+
+impl core::iter::Product for Rational {
+    fn product<I: Iterator<Item = Rational>>(iter: I) -> Rational {
+        iter.fold(Rational::ONE, |acc, x| acc.mul(&x))
+    }
+}
+
+impl<'a> core::iter::Product<&'a Rational> for Rational {
+    fn product<I: Iterator<Item = &'a Rational>>(iter: I) -> Rational {
+        iter.fold(Rational::ONE, |acc, x| acc.mul(x))
+    }
+}

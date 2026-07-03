@@ -4,10 +4,13 @@ Pure-Rust, MIT-licensed, arbitrary-precision arithmetic — **integers,
 rationals, and MPFR-class floating point** — with no foreign-code dependencies.
 Usable as a Rust crate, a C library, and a command-line calculator.
 
-> **Status: early scaffold.** The integer and rational layers are implemented
-> and tested; the fast algorithms (sub-quadratic multiply/divide, subquadratic
-> GCD) and the floating-point arithmetic layer are on the way. See
-> [`ROADMAP.md`](ROADMAP.md) for the design and milestone plan.
+> **Status: integer/rational core complete.** The full signed-integer and exact
+> rational surface is implemented and tested (small-value inlining, all three
+> division conventions, power-of-two ops, two's-complement bitwise, gcd/lcm/
+> extended-gcd, roots, radix I/O), with Karatsuba multiplication and Knuth
+> Algorithm D division. The optional `Float` layer has correctly-rounded
+> add/sub/mul/div/sqrt. Remaining work is performance tuning and float
+> transcendentals — see [`ROADMAP.md`](ROADMAP.md).
 
 ## Why
 

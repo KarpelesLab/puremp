@@ -7,6 +7,38 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+### Added
+
+- **`Int` full surface (M1–M5):** tagged `Small/Large` inline representation with
+  demotion; `From` for all primitive integers; `ZERO`/`ONE`/`MINUS_ONE`;
+  predicates, `signum`, `abs`; fused `addmul`/`submul`; truncated/Euclidean/
+  floored division (`div_*`/`rem_*`/`div_rem_*`), `div_exact`, `divides`;
+  `gcd`/`lcm`/`extended_gcd`; power-of-two ops (`mul_2k`/`div_2k_trunc`/`mod_2k`/
+  `is_power_of_two`/`next`/`prev_power_of_two`/`trailing_zeros`); width-aware
+  two's-complement `bitand`/`bitor`/`bitxor`/`bitnot`; `sqrt_exact`/
+  `nth_root_exact`; `bit`/`limbs`/`least_significant_limb`/`from_limbs`; bounded
+  conversions (`fits_*`/`to_i64`/`to_u64`/`to_f64`); `from_str_radix`/`write_radix`;
+  `Hash`; value/ref/`i64` operator + `*Assign` overloads.
+- **`Rational` full surface (M6):** `const ZERO`/`ONE`/`MINUS_ONE`;
+  `new`/`checked_new`/`from_integer`/`power_of_two`; `From`/`FromStr` (including
+  decimals like `"1.5"`); predicates + `signum`; `recip`/`abs`/`pow`; fused
+  `addmul`/`submul`; `floor`/`ceil`/`trunc`/`to_integer`; integer division of
+  rationals; bounded conversions; `write_decimal`; `Hash`; operators.
+- **Fast algorithms (M7):** Karatsuba multiplication and Knuth Algorithm D
+  division, replacing the schoolbook/bit-at-a-time cores (same public API),
+  differentially tested.
+- **Float core (M8):** normalized representation and correctly-rounded
+  `add`/`sub`/`mul`/`div`/`sqrt` in all five rounding modes, plus `from_int`/
+  `round`/`to_f64` and value-based ordering.
+- Free `u_gcd`/`u64_gcd`; extensive integer/rational/float integration tests and
+  a Knuth-vs-reference differential unit test.
+
+### Changed
+
+- `Rational::new` now panics on a zero denominator (use `checked_new` for the
+  fallible form); the denominator accessor returns `&Int`.
+- `Int::pow` takes a `u32` exponent (was `u64`).
+
 ## [0.1.0] - 2026-07-03
 
 Initial release: the project scaffold and a working integer/rational core.

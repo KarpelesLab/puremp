@@ -1044,3 +1044,27 @@ impl core::ops::Neg for &Int {
         Int::neg(self)
     }
 }
+
+impl core::iter::Sum for Int {
+    fn sum<I: Iterator<Item = Int>>(iter: I) -> Int {
+        iter.fold(Int::ZERO, |acc, x| acc.add(&x))
+    }
+}
+
+impl<'a> core::iter::Sum<&'a Int> for Int {
+    fn sum<I: Iterator<Item = &'a Int>>(iter: I) -> Int {
+        iter.fold(Int::ZERO, |acc, x| acc.add(x))
+    }
+}
+
+impl core::iter::Product for Int {
+    fn product<I: Iterator<Item = Int>>(iter: I) -> Int {
+        iter.fold(Int::ONE, |acc, x| acc.mul(&x))
+    }
+}
+
+impl<'a> core::iter::Product<&'a Int> for Int {
+    fn product<I: Iterator<Item = &'a Int>>(iter: I) -> Int {
+        iter.fold(Int::ONE, |acc, x| acc.mul(x))
+    }
+}

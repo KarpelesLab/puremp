@@ -521,3 +521,12 @@ fn fused_addmul_submul() {
     big.addmul(&int("18446744073709551616"), &int("18446744073709551616"));
     assert_eq!(big.to_string(), "340282366920938463463374607431768211456");
 }
+
+#[test]
+fn sum_and_product_iterators() {
+    let xs = [int("10"), int("20"), int("30")];
+    let s: Int = xs.iter().sum();
+    assert_eq!(s.to_string(), "60");
+    let p: Int = (1..=10i64).map(Int::from_i64).product();
+    assert_eq!(p.to_string(), "3628800"); // 10!
+}

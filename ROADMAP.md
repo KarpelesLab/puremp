@@ -166,105 +166,98 @@ Bottom-up layers; each builds only on the ones below it.
 - **`ffi`** — opaque-handle C ABI; the only `unsafe`.
 - **`bin/puremp`** — REPL calculator.
 
-## 5. Current status (shipped in 0.1.0)
+## 5. Current status
 
-Correctness-first foundation, not yet tuned and not yet inline-optimized:
+The **integer/rational core contract (§1–§2) is fully implemented and tested**,
+along with sub-quadratic multiplication/division and a correctly-rounded float
+arithmetic core. Remaining work is performance tuning and the optional
+float/interop extensions (§6).
 
 - `limb`: `adc`, `sbb`, `mac`.
-- `Nat`: normalize/compare, `add`, `checked_sub`, schoolbook `mul`, `shl`/`shr`,
-  `bit`/`bit_len`/`trailing_zeros`, binary (Stein) GCD, bit-at-a-time `div_rem`,
-  decimal `FromStr`/`Display`, `LowerHex`. (Limb slice still private.)
-- `Int`: `Sign + Nat` (heap-only, no inlining yet), `add`/`sub`/`mul`, `pow`,
-  **truncated** `div_rem`, ordering, decimal I/O, operator overloads.
-- `Rational`: construction with GCD reduction, `add`/`sub`/`mul`/`div`/`recip`,
-  canonical sign, ordering, `Display`.
-- `Float` *(optional layer)*: representation + `RoundingMode` + exact int
-  conversion (arithmetic pending).
-- C ABI over `Int`; `puremp` REPL.
+- `Nat`: normalize/compare, `add`, `checked_sub`, `mul` (schoolbook + Karatsuba),
+  `div_rem` (single-limb + **Knuth Algorithm D**), `shl`/`shr`, `bit`/`bit_len`/
+  `trailing_zeros`/`low_bits`, binary (Stein) GCD, `pow`, `isqrt`,
+  `nth_root_floor`, `as_limbs`/`from_limbs`/`to_u64`, radix + decimal I/O, `Hash`.
+- `Int`: tagged `Small{neg,mag:u64} | Large{sign,mag}` inline representation with
+  demotion; all primitive-int `From`; `ZERO`/`ONE`/`MINUS_ONE`; predicates,
+  `signum`, `abs`; `add`/`sub`/`mul`/`pow`; fused `addmul`/`submul`; **all three
+  division conventions** + `div_exact`/`divides`; `gcd`/`lcm`/`extended_gcd`;
+  power-of-two ops; two's-complement `bitand`/`bitor`/`bitxor`/`bitnot(width)`;
+  `bit`/`limbs`/`least_significant_limb`/`from_limbs`; bounded conversions;
+  radix + decimal I/O; `Hash`; value/ref/`i64` operator + `*Assign` overloads.
+- `Rational`: `const ZERO`/`ONE`/`MINUS_ONE`; `new`/`checked_new`/`from_integer`/
+  `power_of_two`; `From`/`FromStr` (`"3"`, `"-3/4"`, `"1.5"`); predicates +
+  `signum`; `neg`/`abs`/`recip`/`pow`; arithmetic + fused `addmul`/`submul`;
+  `floor`/`ceil`/`trunc`/`to_integer`; `div_floor`/`div_trunc`/`rem_euclid`;
+  bounded conversions; `write_decimal`; `Hash`; operators.
+- `Float` *(optional)*: normalized representation; correctly-rounded
+  `add`/`sub`/`mul`/`div`/`sqrt` in all five `RoundingMode`s; `from_int`/`round`/
+  `neg`/`abs`/`to_f64`; value-based ordering.
+- Free `u_gcd`/`u64_gcd`; C ABI over `Int`; `puremp` REPL.
 
 ## 6. Milestones
 
-Front-loaded so the mandatory §2 shapes and the full `Int`/`Rational` surface
-land before performance tuning and the optional float layer.
+The contract milestones **M1–M6 are complete**; **M7** (fast algorithms) and
+**M8** (float) are complete for their core, with the extensions below still
+open. ✅ = done, ▫ = remaining.
 
-### M1 — Representation, inlining & core `Int` surface
-- Tagged `Repr::Small(i64) | Large{ sign, mag }` with promote/demote on every
-  op; `i64::MIN`/`MAX` boundary handling (§2.1).
-- `From` for every primitive int (`i8..i128`, `u8..u64`, `usize`); `ZERO`,
-  `ONE`, `MINUS_ONE` consts; `Default = 0`.
-- Predicates: `is_zero`/`is_one`/`is_minus_one`/`is_positive`/`is_negative`/
-  `is_even`/`is_odd`; `signum`; `abs`.
-- Fused `addmul`/`submul` with a 128-bit `Small` path (§2.6).
-- Public limb/bit access: `bit`, `limbs() -> &[u64]`, `least_significant_limb`,
-  `from_limbs(sign, &[u64])` (§2.5).
-- `Hash` (consistent with `Eq`, stable per build); operator overloads in
-  by-value, by-reference, **and by-`i64`** forms; `*Assign` ops.
-- `bit_len`, `log2_floor`.
+### M1 — Representation, inlining & core `Int` surface ✅
+Tagged `Small/Large` inline representation with demotion; all primitive-int
+`From`; consts; predicates/`signum`/`abs`; fused `addmul`/`submul`; public
+`bit`/`limbs`/`least_significant_limb`/`from_limbs`; `Hash`; value/ref/`i64`
+operator + `*Assign` overloads; `bit_len`/`log2_floor`.
 
-### M2 — Division & remainder (all conventions)
-- Truncated, Euclidean, and floored `div_*`/`rem_*`/`div_rem_*` (§2.2), each
-  proven against `a == q·b + r` and the documented range.
-- `div_exact` (precondition `d | self`) and `divides`.
-- Divide-by-zero policy: plain methods panic; the `Nat`/checked layer returns
-  `Option`.
+### M2 — Division & remainder (all conventions) ✅
+Truncated, Euclidean, and floored `div_*`/`rem_*`/`div_rem_*`; `div_exact`;
+`divides`. Plain methods panic on a zero divisor; the `Nat`/checked layer returns
+`Option`.
 
-### M3 — Power-of-two & two's-complement bitwise
-- `mul_2k`, `div_2k_trunc`, `mod_2k`, `is_power_of_two`, `next_power_of_two`,
-  `prev_power_of_two`, `trailing_zeros` on `Int` (§2.3).
-- Width-aware `bitand`/`bitor`/`bitxor`/`bitnot(width)` on two's-complement
-  (§2.4), documented and truth-table tested.
+### M3 — Power-of-two & two's-complement bitwise ✅
+`mul_2k`/`div_2k_trunc`/`mod_2k`/`is_power_of_two`/`next_power_of_two`/
+`prev_power_of_two`/`trailing_zeros`; width-aware two's-complement
+`bitand`/`bitor`/`bitxor`/`bitnot(width)`, truth-table tested.
 
-### M4 — Number theory & roots
-- `gcd` (already), `lcm`, `extended_gcd` (`g == a·x + b·y`).
-- Free helpers `u_gcd(u32, u32) -> u32` and `u64_gcd(u64, u64) -> u64` (binary
-  GCD on machine words).
-- `sqrt_exact -> Option<Int>`, `nth_root_exact(n) -> Option<Int>`.
-- (Extends later toward modular arithmetic / primality for downstream crypto
-  users, but those are beyond the spec's core.)
+### M4 — Number theory & roots ✅
+`gcd`/`lcm`/`extended_gcd`; free `u_gcd`/`u64_gcd`; `sqrt_exact`/`nth_root_exact`.
+- ▫ Later: modular arithmetic (Barrett/Montgomery), modpow, primality — for
+  downstream crypto users, beyond the spec's core.
 
-### M5 — Radix & string I/O, bounded conversions
-- `from_str_radix(s, radix)`, `write_radix(out, radix)`, decimal `FromStr`
-  (already) with `-`; sub-quadratic decimal via `10^(2^k)` chunking.
-- `fits_i64`/`fits_u64`, `to_i64`/`to_u64` (`Option`), `to_f64` (nearest
-  double), `Display` (decimal).
+### M5 — Radix & string I/O, bounded conversions ✅
+`from_str_radix`/`write_radix`; decimal `FromStr`/`Display`; `fits_i64`/
+`fits_u64`/`to_i64`/`to_u64`/`to_f64`.
+- ▫ Later: sub-quadratic decimal via `10^(2^k)` chunking (perf only).
 
-### M6 — `Rational` full surface
-- `new` (panics on `den == 0`) and `checked_new`; `from_integer`; `numerator`/
-  `denominator`; `ZERO`/`ONE`/`MINUS_ONE`; `power_of_two(k: i32)` (negative `k`).
-- `From<i64>`, `From<Int>`, `FromStr` accepting `"3"`, `"-3/4"`, **and `"1.5"`**
-  (decimal).
-- Predicates + `is_integer` + `signum`; `recip`, `abs`, `pow(n: i32)` (negative
-  via `recip`); fused `addmul`/`submul`.
-- Rounding to `Int`: `floor`, `ceil`, `trunc`, `to_integer` (`Some` iff integer).
-- Integer division of rationals: `div_floor`/`div_trunc` (→ `Int`), `rem_euclid`
-  (→ `Rational`).
-- `fits_i64`/`to_i64`, `to_f64`; `Hash`; operator + `*Assign` traits.
-- `write_decimal(out, precision, truncate)` — decimal expansion to `precision`
-  fractional digits, chopping vs. rounding the last digit.
+### M6 — `Rational` full surface ✅
+Constructors/consts/`power_of_two`; `From`/`FromStr` incl. decimals; predicates/
+`signum`; `recip`/`abs`/`pow`; arithmetic + fused ops; `floor`/`ceil`/`trunc`/
+`to_integer`; integer division of rationals; bounded conversions; `write_decimal`;
+`Hash`; operators.
 
 ### M7 — Fast algorithms (behind the same API)
-- Multiplication: Karatsuba → Toom-3/Toom-4 → FFT/NTT, tuned thresholds; squaring
-  fast path.
-- Division: Knuth Algorithm D → Möller–Granlund invariant-divisor → Burnikel–
-  Ziegler recursive division (replacing the bit-at-a-time core).
-- GCD: Lehmer → half-GCD (HGCD).
-- Threshold-tuning bench harness; thresholds captured as documented consts.
+- ✅ Karatsuba multiplication (schoolbook below a 32-limb threshold).
+- ✅ Knuth Algorithm D division (replacing the bit-at-a-time core), differentially
+  tested against a bit-at-a-time reference.
+- ▫ Toom-3/Toom-4 and FFT/NTT multiplication; a squaring fast path.
+- ▫ Möller–Granlund invariant-divisor and Burnikel–Ziegler recursive division.
+- ▫ Subquadratic GCD (Lehmer → half-GCD); a threshold-tuning bench harness.
 
 ### M8 — Optional floating-point layer (separable)
-Explicitly outside the core contract (§1). The existing `Float`/`RoundingMode`
-scaffold grows into correctly-rounded (MPFR-class) `add`/`sub`/`mul`/`div`/`sqrt`
-in all rounding modes, `f32`/`f64` round-trips, decimal I/O, and (stretch)
-transcendentals. Kept behind the `float` feature — enabled by default for
-convenience but fully separable (`--no-default-features` drops it) so the
-integer/rational core never depends on it.
+Outside the core contract (§1); behind the `float` feature.
+- ✅ Normalized representation; correctly-rounded `add`/`sub`/`mul`/`div`/`sqrt`
+  in all five rounding modes; `from_int`/`round`; `to_f64`; value-based ordering.
+- ▫ `f32`/`f64` `from_*` with correct rounding; decimal string I/O.
+- ▫ Special values (signed zeros, ±∞, NaN) and the ternary (inexact) flag.
+- ▫ Transcendentals (`exp`/`log`/`sin`/`cos`/`atan`/…, constants) via Ziv's
+  strategy for correct rounding.
 
 ### M9 — Polish, interop & release
-- Complete `core::ops` coverage (value/ref/`i64`/assign) and `Sum`/`Product`.
-- Optional in-house `serde` support behind a feature (no derive dep); optional
-  `rand`-trait glue.
-- Expand the C ABI over `Rational` (+ optional `Float`); keep `include/puremp.h`
-  in lockstep. Expand the CLI (rationals, radices, number-theory ops).
-- Allocation-reducing scratch buffers; benchmark suite; `1.0` API review and
+- ✅ `core::ops` coverage (value/ref/`i64`/assign) for `Int`; value/ref/assign for
+  `Rational`.
+- ▫ `Sum`/`Product`; optional in-house `serde` (no derive dep); optional `rand`
+  glue.
+- ▫ Expand the C ABI over `Rational`/`Float`; expand the CLI (rationals, radices,
+  number theory).
+- ▫ Allocation-reducing scratch buffers; benchmark suite; `1.0` API review and
   semver commitment.
 
 ## 7. Specification coverage checklist
@@ -276,42 +269,42 @@ Every required feature from the spec, mapped to shipped code or a milestone.
 
 | Feature | Where |
 |---|---|
-| Small-value inlining `Small(i64)/Large`, demotion, fast paths (§2.1) | ▫ M1 |
-| `From<i8..i128,u8..u64,usize>`; `FromStr` decimal; `from_str_radix`; `from_limbs` | ▫ M1 (`FromStr` ✅), M5 (radix) |
-| `ZERO`/`ONE`/`MINUS_ONE`; `Default=0` | ▫ M1 (`Default` ✅) |
-| Predicates `is_zero/one/minus_one/positive/negative/even/odd`; `signum` | ▫ M1 |
-| `abs`, `pow(u32)`; `Add/Sub/Mul/Neg` + `*Assign` (value/ref/`i64`) | ✅ core ops; ▫ M1 `i64`/assign forms |
-| Fused `addmul`/`submul` (§2.6) | ▫ M1 |
-| `div/rem/div_rem_trunc` | ✅ (trunc) |
-| `div/rem/div_rem_euclid`; `div_floor`; `div_exact`; `divides` (§2.2) | ▫ M2 |
-| `gcd` | ✅ |
-| `lcm`, `extended_gcd` | ▫ M4 |
-| `mul_2k`, `div_2k_trunc`, `mod_2k`, `is_power_of_two`, `next/prev_power_of_two`, `trailing_zeros` (§2.3) | ▫ M3 (`trailing_zeros` on `Nat` ✅) |
-| `sqrt_exact`, `nth_root_exact`; `bit_len`, `log2_floor` | ▫ M4 / M1 (`bit_len` on `Nat` ✅) |
-| Two's-complement `bitand/or/xor/not(width)` (§2.4) | ▫ M3 |
-| `bit`, `limbs() -> &[u64]`, `least_significant_limb` (§2.5) | ▫ M1 (`bit` on `Nat` ✅) |
-| `fits_i64/u64`, `to_i64/u64`, `to_f64` | ▫ M5 |
-| `Display` (decimal), `Hash`, `write_radix`; `Clone/Eq/Ord/Debug` | ✅ Display/Ord/Debug; ▫ M1 `Hash`, M5 `write_radix` |
+| Small-value inlining `Small/Large`, demotion, fast paths (§2.1) | ✅ M1 |
+| `From<i8..i128,u8..u64,usize>`; `FromStr` decimal; `from_str_radix`; `from_limbs` | ✅ M1/M5 |
+| `ZERO`/`ONE`/`MINUS_ONE`; `Default=0` | ✅ M1 |
+| Predicates `is_zero/one/minus_one/positive/negative/even/odd`; `signum` | ✅ M1 |
+| `abs`, `pow(u32)`; `Add/Sub/Mul/Neg` + `*Assign` (value/ref/`i64`) | ✅ M1 |
+| Fused `addmul`/`submul` (§2.6) | ✅ M1 |
+| `div/rem/div_rem_trunc` | ✅ M2 |
+| `div/rem/div_rem_euclid`; `div_floor`; `div_exact`; `divides` (§2.2) | ✅ M2 |
+| `gcd` | ✅ M4 |
+| `lcm`, `extended_gcd` | ✅ M4 |
+| `mul_2k`, `div_2k_trunc`, `mod_2k`, `is_power_of_two`, `next/prev_power_of_two`, `trailing_zeros` (§2.3) | ✅ M3 |
+| `sqrt_exact`, `nth_root_exact`; `bit_len`, `log2_floor` | ✅ M4/M1 |
+| Two's-complement `bitand/or/xor/not(width)` (§2.4) | ✅ M3 |
+| `bit`, `limbs() -> &[u64]`, `least_significant_limb` (§2.5) | ✅ M1 |
+| `fits_i64/u64`, `to_i64/u64`, `to_f64` | ✅ M5 |
+| `Display` (decimal), `Hash`, `write_radix`; `Clone/Eq/Ord/Debug` | ✅ M1/M5 |
 
 ### `Rational`
 
 | Feature | Where |
 |---|---|
-| `new` (panic on `den==0`), `checked_new`, `from_integer`, `numerator`/`denominator` | ✅ (via `new -> Result`; ▫ M6 adjusts to panic + `checked_new`) |
-| `ZERO`/`ONE`/`MINUS_ONE`, `power_of_two(i32)` | ▫ M6 |
-| `From<i64>`, `From<Int>`, `FromStr` (`"3"`, `"-3/4"`, `"1.5"`) | ▫ M6 |
-| Predicates + `is_integer` + `signum` | ✅ (`is_integer`/`is_zero`); ▫ M6 rest |
-| `Add/Sub/Mul/Div/Neg` + `*Assign`; `recip`, `abs`, `pow(i32)`, `addmul`/`submul` | ✅ arith/`recip`; ▫ M6 rest |
-| `floor`, `ceil`, `trunc`, `to_integer` | ▫ M6 |
-| `div_floor`/`div_trunc` (→ `Int`), `rem_euclid` (→ `Rational`) | ▫ M6 |
-| `fits_i64`, `to_i64`, `to_f64` | ▫ M6 |
-| `Display`, `Hash`, `write_decimal(precision, truncate)`; `Clone/Eq/Ord/Debug/Default` | ✅ Display/Ord/Debug; ▫ M6 `Hash`/`write_decimal` |
+| `new` (panic on `den==0`), `checked_new`, `from_integer`, `numerator`/`denominator` | ✅ M6 |
+| `ZERO`/`ONE`/`MINUS_ONE`, `power_of_two(i32)` | ✅ M6 |
+| `From<i64>`, `From<Int>`, `FromStr` (`"3"`, `"-3/4"`, `"1.5"`) | ✅ M6 |
+| Predicates + `is_integer` + `signum` | ✅ M6 |
+| `Add/Sub/Mul/Div/Neg` + `*Assign`; `recip`, `abs`, `pow(i32)`, `addmul`/`submul` | ✅ M6 |
+| `floor`, `ceil`, `trunc`, `to_integer` | ✅ M6 |
+| `div_floor`/`div_trunc` (→ `Int`), `rem_euclid` (→ `Rational`) | ✅ M6 |
+| `fits_i64`, `to_i64`, `to_f64` | ✅ M6 |
+| `Display`, `Hash`, `write_decimal(precision, truncate)`; `Clone/Eq/Ord/Debug/Default` | ✅ M6 |
 
 ### Free helpers & canonical invariant
 
 | Feature | Where |
 |---|---|
-| `u_gcd(u32,u32)`, `u64_gcd(u64,u64)` | ▫ M4 |
+| `u_gcd(u32,u32)`, `u64_gcd(u64,u64)` | ✅ M4 |
 | Canonical `Rational` maintained by every op (§2.0) | ✅ (invariant tested) |
 
 ## 8. Correctness bar & testing

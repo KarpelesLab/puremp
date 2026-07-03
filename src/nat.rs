@@ -1198,11 +1198,59 @@ impl Nat {
         if modulus.is_one() {
             return Nat::zero();
         }
-        if !modulus.is_even() && modulus.limbs.len() >= 2 {
+        if modulus.limbs.len() < 2 {
+            self.modpow_simple(exp, modulus)
+        } else if !modulus.is_even() {
             self.modpow_montgomery(exp, modulus)
         } else {
-            self.modpow_simple(exp, modulus)
+            self.modpow_barrett(exp, modulus)
         }
+    }
+
+    /// Square-and-multiply using Barrett reduction (works for any multi-limb
+    /// modulus; used for even moduli, where Montgomery does not apply).
+    fn modpow_barrett(&self, exp: &Nat, modulus: &Nat) -> Nat {
+        let k = modulus.limbs.len();
+        let kbits = k as u64 * LIMB_BITS as u64;
+        // μ = ⌊2^(128k) / m⌋, precomputed once.
+        let mu = Nat::one()
+            .shl(2 * kbits)
+            .div_rem(modulus)
+            .expect("non-zero")
+            .0;
+
+        // Barrett reduction of x < m² into [0, m).
+        let reduce = |x: &Nat| -> Nat {
+            let q3 = x
+                .shr(kbits - LIMB_BITS as u64)
+                .mul(&mu)
+                .shr(kbits + LIMB_BITS as u64);
+            let mask_bits = kbits + LIMB_BITS as u64;
+            let r1 = x.low_bits(mask_bits);
+            let r2 = q3.mul(modulus).low_bits(mask_bits);
+            let mut r = if r1.cmp_ref(&r2) != Ordering::Less {
+                r1.checked_sub(&r2).unwrap()
+            } else {
+                r1.add(&Nat::one().shl(mask_bits)).checked_sub(&r2).unwrap()
+            };
+            while r.cmp_ref(modulus) != Ordering::Less {
+                r = r.checked_sub(modulus).unwrap();
+            }
+            r
+        };
+
+        let mut result = Nat::one();
+        let mut base = self.div_rem(modulus).expect("non-zero").1;
+        let bits = exp.bit_len();
+        for i in 0..bits {
+            if exp.bit(i) {
+                result = reduce(&result.mul(&base));
+            }
+            if i + 1 < bits {
+                base = reduce(&base.square());
+            }
+        }
+        result
     }
 
     /// Square-and-multiply with a division-based reduction after each step.
@@ -1630,6 +1678,15 @@ mod tests {
                 base.modpow_simple(&exp, &m),
                 "montgomery vs simple modpow"
             );
+            // Barrett works for any multi-limb modulus (test the even case).
+            let m_even = m.add(&Nat::one());
+            if m_even.limbs.len() >= 2 {
+                assert_eq!(
+                    base.modpow_barrett(&exp, &m_even),
+                    base.modpow_simple(&exp, &m_even),
+                    "barrett vs simple modpow (even modulus)"
+                );
+            }
         }
     }
 

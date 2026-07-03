@@ -82,6 +82,9 @@ pub mod mod_int;
 #[cfg(feature = "dyadic")]
 pub mod dyadic;
 
+#[cfg(feature = "decimal")]
+pub mod decimal;
+
 #[cfg(feature = "float")]
 pub mod float;
 
@@ -113,6 +116,9 @@ pub use mod_int::ModInt;
 
 #[cfg(feature = "dyadic")]
 pub use dyadic::Dyadic;
+
+#[cfg(feature = "decimal")]
+pub use decimal::{Decimal, Rounding};
 
 #[cfg(feature = "float")]
 pub use fixed_float::FixedFloat;

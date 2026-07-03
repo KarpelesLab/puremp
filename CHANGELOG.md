@@ -7,6 +7,28 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/KarpelesLab/puremp/compare/v0.1.4...v0.1.5) - 2026-07-03
+
+### Other
+
+- document Quadratic and Algebraic numbers
+- Algebraic numbers (2/4): general real Algebraic via Sturm + Faddeev–LeVerrier
+- Algebraic numbers (1/4): Quadratic — exact field ℚ(√d)
+- cover the full expanded type family and number-theory toolkit
+- decimal Display, precision, and scientific {:e}/{:E}
+- TryFrom for primitive integers; to_i128/to_u128; Error::Overflow
+- Add Matrix<T>: generic matrices with exact linear algebra
+- Add Interval: interval arithmetic with outward rounding
+- Add Poly<T>: generic univariate polynomials
+- continued fractions and best rational approximation
+- Add num-traits bridge; Int Div/Rem, Nat/Rational operators
+- Add Complex<T>: generic complex numbers
+- Add Decimal: arbitrary-precision base-10 floating point
+- Add ModInt: modular integers (ℤ/mℤ) with operators
+- Number theory: integer factorization and random_prime
+- Number theory: Jacobi/Legendre, sqrt_mod (Tonelli–Shanks), CRT
+- Number theory: combinatorics (factorial/binomial/multinomial/fibonacci/lucas)
+
 ## [0.1.4](https://github.com/KarpelesLab/puremp/compare/v0.1.3...v0.1.4) - 2026-07-03
 
 ### Other

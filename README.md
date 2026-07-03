@@ -6,17 +6,6 @@ rationals, MPFR-class floating point, and base-10 decimals**, plus derived
 with no foreign-code dependencies. Usable as a Rust crate, a C library, and a
 command-line calculator.
 
-> **Status: feature-complete, pre-1.0.** The full signed-integer and exact
-> rational surface is implemented and tested (small-value inlining, all three
-> division conventions, power-of-two ops, two's-complement bitwise, gcd/lcm/
-> extended-gcd, roots, radix I/O). Multiplication runs a schoolbook → Karatsuba
-> → Toom-3 → Toom-4 → NTT ladder; division uses Knuth Algorithm D and
-> Burnikel–Ziegler; GCD uses Lehmer's algorithm. The optional `Float` layer is
-> correctly-rounded through the transcendentals with the IEEE special values and
-> the MPFR ternary flag. On top sit modular integers, decimals, complex numbers,
-> polynomials (with real-root isolation), matrices, intervals, and exact
-> algebraic numbers.
-
 ## Why
 
 A GMP + MPFR-class toolkit that is:

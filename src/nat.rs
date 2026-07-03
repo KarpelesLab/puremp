@@ -305,10 +305,14 @@ fn bz_div_3n_2n(a: &Nat, b: &Nat, half: usize) -> (Nat, Nat) {
         .add(&Int::from(a3))
         .sub(&Int::from(q_nat.mul(&b2)));
     let mut q_int = Int::from(q_nat);
-    let b_int = Int::from(b.clone());
-    while r_int.is_negative() {
-        q_int = q_int.sub(&Int::ONE);
-        r_int = r_int.add(&b_int);
+    // The estimate is at most two too large, so this correction almost never
+    // runs — only clone the (full-width) divisor into an `Int` when it does.
+    if r_int.is_negative() {
+        let b_int = Int::from(b.clone());
+        while r_int.is_negative() {
+            q_int = q_int.sub(&Int::ONE);
+            r_int = r_int.add(&b_int);
+        }
     }
     (q_int.magnitude(), r_int.magnitude())
 }
@@ -970,7 +974,7 @@ impl Nat {
         let vv = &vn.limbs;
         debug_assert_eq!(vv.len(), n);
         let un = self.shl(shift as u64);
-        let mut u = un.limbs.clone();
+        let mut u = un.limbs; // move: `un` is a fresh local used only here
         u.resize(self.limbs.len() + 1, 0); // exactly m + n + 1 limbs
 
         let (b1, b2) = (vv[n - 1] as u128, vv[n - 2] as u128);

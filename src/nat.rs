@@ -1305,47 +1305,20 @@ impl Nat {
         }
     }
 
-    /// Square-and-multiply using Barrett reduction (works for any multi-limb
-    /// modulus; used for even moduli, where Montgomery does not apply).
+    /// Square-and-multiply using a precomputed Barrett [`Reciprocal`] (works for
+    /// any multi-limb modulus; used for even moduli, where Montgomery does not
+    /// apply).
     fn modpow_barrett(&self, exp: &Nat, modulus: &Nat) -> Nat {
-        let k = modulus.limbs.len();
-        let kbits = k as u64 * LIMB_BITS as u64;
-        // μ = ⌊2^(128k) / m⌋, precomputed once.
-        let mu = Nat::one()
-            .shl(2 * kbits)
-            .div_rem(modulus)
-            .expect("non-zero")
-            .0;
-
-        // Barrett reduction of x < m² into [0, m).
-        let reduce = |x: &Nat| -> Nat {
-            let q3 = x
-                .shr(kbits - LIMB_BITS as u64)
-                .mul(&mu)
-                .shr(kbits + LIMB_BITS as u64);
-            let mask_bits = kbits + LIMB_BITS as u64;
-            let r1 = x.low_bits(mask_bits);
-            let r2 = q3.mul(modulus).low_bits(mask_bits);
-            let mut r = if r1.cmp_ref(&r2) != Ordering::Less {
-                r1.checked_sub(&r2).unwrap()
-            } else {
-                r1.add(&Nat::one().shl(mask_bits)).checked_sub(&r2).unwrap()
-            };
-            while r.cmp_ref(modulus) != Ordering::Less {
-                r = r.checked_sub(modulus).unwrap();
-            }
-            r
-        };
-
+        let recip = Reciprocal::new(modulus);
         let mut result = Nat::one();
         let mut base = self.div_rem(modulus).expect("non-zero").1;
         let bits = exp.bit_len();
         for i in 0..bits {
             if exp.bit(i) {
-                result = reduce(&result.mul(&base));
+                result = recip.reduce(&result.mul(&base));
             }
             if i + 1 < bits {
-                base = reduce(&base.square());
+                base = recip.reduce(&base.square());
             }
         }
         result
@@ -1516,6 +1489,70 @@ impl Nat {
             return false; // definitely composite
         }
         true
+    }
+}
+
+/// A precomputed reciprocal of a fixed modulus for fast repeated reduction
+/// (Barrett's method / Möller–Granlund division by an invariant).
+///
+/// Building one costs a division; each [`Reciprocal::reduce`] then costs a
+/// couple of multiplications, so it pays off when reducing many values modulo
+/// the same modulus (e.g. modular exponentiation, hashing).
+#[derive(Clone, Debug)]
+pub struct Reciprocal {
+    modulus: Nat,
+    /// `μ = ⌊2^(128k) / modulus⌋`, where `k = modulus.limbs.len()`.
+    mu: Nat,
+    kbits: u64,
+}
+
+impl Reciprocal {
+    /// Precomputes the reciprocal of `modulus`. Panics if `modulus` is zero.
+    pub fn new(modulus: &Nat) -> Reciprocal {
+        assert!(!modulus.is_zero(), "Reciprocal: zero modulus");
+        let kbits = modulus.limbs.len() as u64 * LIMB_BITS as u64;
+        let mu = Nat::one()
+            .shl(2 * kbits)
+            .div_rem(modulus)
+            .expect("non-zero")
+            .0;
+        Reciprocal {
+            modulus: modulus.clone(),
+            mu,
+            kbits,
+        }
+    }
+
+    /// Returns the modulus.
+    #[inline]
+    pub fn modulus(&self) -> &Nat {
+        &self.modulus
+    }
+
+    /// Returns `x mod modulus`.
+    ///
+    /// Requires `x < modulus²` — the range that arises when reducing a product
+    /// of two already-reduced values. For a general dividend, use
+    /// [`Nat::div_rem`].
+    pub fn reduce(&self, x: &Nat) -> Nat {
+        let m = &self.modulus;
+        let kbits = self.kbits;
+        let q3 = x
+            .shr(kbits - LIMB_BITS as u64)
+            .mul(&self.mu)
+            .shr(kbits + LIMB_BITS as u64);
+        let mask = kbits + LIMB_BITS as u64;
+        let r1 = x.low_bits(mask);
+        let r2 = q3.mul(m).low_bits(mask);
+        let mut r = if r1.cmp_ref(&r2) != Ordering::Less {
+            r1.checked_sub(&r2).unwrap()
+        } else {
+            r1.add(&Nat::one().shl(mask)).checked_sub(&r2).unwrap()
+        };
+        while r.cmp_ref(m) != Ordering::Less {
+            r = r.checked_sub(m).unwrap();
+        }
+        r
     }
 }
 

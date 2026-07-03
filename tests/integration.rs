@@ -727,3 +727,40 @@ fn next_prime_works() {
     assert!(int("2").prev_prime(&mut rng).is_none());
     assert_eq!(int("100").prev_prime(&mut rng).unwrap().to_string(), "97");
 }
+
+#[test]
+fn reciprocal_reduce() {
+    use puremp::Reciprocal;
+    // reduce(x) == x mod m for x < m², across sizes.
+    for m_s in [
+        "1000000007",
+        "18446744073709551629",
+        "340282366920938463463374607431768211507",
+    ] {
+        let m = nat(m_s);
+        let r = Reciprocal::new(&m);
+        assert_eq!(r.modulus(), &m);
+        for a_s in [
+            "0",
+            "1",
+            "999999999999999999999",
+            "123456789012345678901234567890",
+        ] {
+            let a = nat(a_s);
+            if a >= m {
+                continue;
+            }
+            // (a * b) mod m with a, b < m so the product < m².
+            let b = m.checked_sub(&Nat::one()).unwrap();
+            let prod = a.mul(&b);
+            assert_eq!(
+                r.reduce(&prod),
+                prod.div_rem(&m).unwrap().1,
+                "{a_s} mod {m_s}"
+            );
+        }
+        // m² - 1 is the largest valid input.
+        let big = m.square().checked_sub(&Nat::one()).unwrap();
+        assert_eq!(r.reduce(&big), big.div_rem(&m).unwrap().1);
+    }
+}

@@ -256,6 +256,73 @@ impl Rational {
         self.is_integer().then(|| self.num.clone())
     }
 
+    // --- continued fractions ---
+
+    /// Returns the (finite) simple continued-fraction expansion `[a₀; a₁, a₂, …]`.
+    /// `a₀ = ⌊self⌋` and the remaining terms are positive.
+    pub fn continued_fraction(&self) -> alloc::vec::Vec<Int> {
+        let mut terms = alloc::vec::Vec::new();
+        let mut num = self.num.clone();
+        let mut den = self.den.clone(); // > 0
+        while !den.is_zero() {
+            let (q, r) = num.div_rem_floor(&den);
+            terms.push(q);
+            num = den;
+            den = r;
+        }
+        terms
+    }
+
+    /// Reconstructs a rational from a continued-fraction expansion. Panics on an
+    /// empty slice.
+    pub fn from_continued_fraction(terms: &[Int]) -> Rational {
+        let (last, rest) = terms.split_last().expect("empty continued fraction");
+        let mut acc = Rational::from_integer(last.clone());
+        for t in rest.iter().rev() {
+            acc = Rational::from_integer(t.clone()).add(&acc.recip());
+        }
+        acc
+    }
+
+    /// Returns the best rational approximation to `self` whose denominator does
+    /// not exceed `max_denominator` (via continued fractions / semiconvergents).
+    /// Returns `self` unchanged if it already fits. Panics if `max_denominator`
+    /// is not positive.
+    pub fn approximate(&self, max_denominator: &Int) -> Rational {
+        assert!(
+            max_denominator.is_positive(),
+            "approximate: max_denominator must be positive"
+        );
+        if self.den <= *max_denominator {
+            return self.clone();
+        }
+        let cf = self.continued_fraction();
+        // Convergent recurrence: hₖ = aₖ·hₖ₋₁ + hₖ₋₂, likewise kₖ.
+        let (mut h2, mut h1) = (Int::ZERO, Int::ONE); // h₋₂, h₋₁
+        let (mut k2, mut k1) = (Int::ONE, Int::ZERO); // k₋₂, k₋₁
+        for a in &cf {
+            let k = a.mul(&k1).add(&k2);
+            if k > *max_denominator {
+                // Largest semiconvergent coefficient that still fits.
+                let a_prime = max_denominator.sub(&k2).div_trunc(&k1);
+                let semi = Rational::new(a_prime.mul(&h1).add(&h2), a_prime.mul(&k1).add(&k2));
+                let prev = Rational::new(h1.clone(), k1.clone());
+                // Pick whichever is closer (ties → the lower-denominator convergent).
+                return if self.sub(&prev).abs() <= self.sub(&semi).abs() {
+                    prev
+                } else {
+                    semi
+                };
+            }
+            let h = a.mul(&h1).add(&h2);
+            h2 = h1;
+            h1 = h;
+            k2 = k1;
+            k1 = k;
+        }
+        Rational::new(h1, k1) // exact (unreachable given the early return)
+    }
+
     // --- integer division of rationals ---
 
     /// Returns `⌊self / b⌋` as an integer. Panics if `b` is zero.

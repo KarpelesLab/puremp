@@ -893,3 +893,36 @@ fn factorization_and_random_prime() {
         assert_eq!(p.bit_len(), bits, "wrong bit length for {p}");
     }
 }
+
+#[test]
+fn continued_fractions() {
+    let r = |s: &str| -> Rational { s.parse().unwrap() };
+    let cf = |terms: &[i64]| -> Vec<Int> { terms.iter().map(|&t| Int::from(t)).collect() };
+
+    // 415/93 = [4; 2, 6, 7]
+    assert_eq!(r("415/93").continued_fraction(), cf(&[4, 2, 6, 7]));
+    // reconstruct
+    assert_eq!(
+        Rational::from_continued_fraction(&cf(&[4, 2, 6, 7])).to_string(),
+        "415/93"
+    );
+    // negative: -7/2 = [-4; 2]
+    assert_eq!(r("-7/2").continued_fraction(), cf(&[-4, 2]));
+    assert_eq!(
+        Rational::from_continued_fraction(&cf(&[-4, 2])).to_string(),
+        "-7/2"
+    );
+
+    // Best rational approximation of a good rational π (355/113 has den 113).
+    let pi = r("314159265358979/100000000000000");
+    assert_eq!(pi.approximate(&Int::from(10)).to_string(), "22/7");
+    assert_eq!(pi.approximate(&Int::from(113)).to_string(), "355/113");
+    assert_eq!(pi.approximate(&Int::from(150)).to_string(), "355/113");
+    // A value that already fits is returned unchanged.
+    assert_eq!(r("3/4").approximate(&Int::from(10)).to_string(), "3/4");
+    // Every approximation respects the denominator bound.
+    for bound in [1i64, 2, 5, 50, 1000] {
+        let a = pi.approximate(&Int::from(bound));
+        assert!(a.denominator() <= &Int::from(bound));
+    }
+}

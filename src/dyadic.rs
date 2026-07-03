@@ -1,14 +1,16 @@
-//! Exact dyadic rationals — numbers of the form `n · 2^k` (equivalently
-//! `n · 2^-k`), the rationals whose denominator is a power of two.
+//! Exact dyadic rationals — numbers of the form `n · 2^-k`, the rationals whose
+//! denominator is a power of two.
 //!
 //! [`Dyadic`] is exact and closed under addition, subtraction, multiplication,
 //! and scaling by powers of two (division in general is not — `1/3` is not
 //! dyadic). Every dyadic value has a *terminating* decimal expansion, which
 //! [`Dyadic`]'s [`Display`](core::fmt::Display) prints exactly.
 //!
-//! A value is stored as `mantissa · 2^exponent` in canonical form: the mantissa
+//! A value is stored as `numerator · 2^-scale` in canonical form: the numerator
 //! is odd (so the representation is unique), or the value is zero
-//! (`mantissa == 0`, `exponent == 0`).
+//! (`numerator == 0`, `scale == 0`). The `scale` is the number of fractional
+//! binary digits; it is signed, so an even integer such as `8 = 1 · 2^-(-3)` has
+//! a negative scale after normalization.
 
 use core::cmp::Ordering;
 use core::fmt;
@@ -18,43 +20,48 @@ use alloc::string::ToString;
 use crate::int::{Int, Sign};
 use crate::nat::Nat;
 
-/// An exact dyadic rational, `mantissa · 2^exponent`.
+/// An exact dyadic rational, `numerator · 2^-scale`.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Dyadic {
-    mantissa: Int,
-    exponent: i64,
+    numerator: Int,
+    scale: i64,
 }
 
 impl Dyadic {
     /// The value zero.
     pub fn zero() -> Dyadic {
         Dyadic {
-            mantissa: Int::ZERO,
-            exponent: 0,
+            numerator: Int::ZERO,
+            scale: 0,
         }
     }
 
     /// The value one.
     pub fn one() -> Dyadic {
         Dyadic {
-            mantissa: Int::ONE,
-            exponent: 0,
+            numerator: Int::ONE,
+            scale: 0,
         }
     }
 
-    /// Builds `mantissa · 2^exponent`, canonicalizing to an odd mantissa.
-    pub fn new(mantissa: Int, exponent: i64) -> Dyadic {
-        if mantissa.is_zero() {
+    /// Builds `n · 2^-k`, canonicalizing to an odd numerator (so a positive `k`
+    /// scales the value *down*, matching the `n·2⁻ᵏ` convention).
+    pub fn new(n: Int, k: i64) -> Dyadic {
+        if n.is_zero() {
             return Dyadic::zero();
         }
-        let t = mantissa.trailing_zeros();
+        let t = n.trailing_zeros();
         if t > 0 {
+            // n = m·2^t (m odd): n·2^-k = m·2^-(k - t).
             Dyadic {
-                mantissa: mantissa.div_2k_trunc(t),
-                exponent: exponent + t as i64,
+                numerator: n.div_2k_trunc(t),
+                scale: k - t as i64,
             }
         } else {
-            Dyadic { mantissa, exponent }
+            Dyadic {
+                numerator: n,
+                scale: k,
+            }
         }
     }
 
@@ -64,49 +71,50 @@ impl Dyadic {
         Dyadic::new(n, 0)
     }
 
-    /// Returns the (odd, or zero) mantissa.
+    /// Returns the (odd, or zero) numerator.
     #[inline]
-    pub fn mantissa(&self) -> &Int {
-        &self.mantissa
+    pub fn numerator(&self) -> &Int {
+        &self.numerator
     }
 
-    /// Returns the base-2 exponent.
+    /// Returns the scale `k`, so that the value equals `numerator · 2^-k`. A
+    /// positive scale is the count of fractional binary digits.
     #[inline]
-    pub fn exponent(&self) -> i64 {
-        self.exponent
+    pub fn scale(&self) -> i64 {
+        self.scale
     }
 
     /// Returns `true` if this value is zero.
     #[inline]
     pub fn is_zero(&self) -> bool {
-        self.mantissa.is_zero()
+        self.numerator.is_zero()
     }
 
-    /// Returns `true` if this value is an integer (`exponent >= 0`).
+    /// Returns `true` if this value is an integer (`scale <= 0`).
     #[inline]
     pub fn is_integer(&self) -> bool {
-        self.is_zero() || self.exponent >= 0
+        self.is_zero() || self.scale <= 0
     }
 
     /// Returns the sign of this value.
     #[inline]
     pub fn sign(&self) -> Sign {
-        self.mantissa.sign()
+        self.numerator.sign()
     }
 
     /// Returns `-self`.
     pub fn neg(&self) -> Dyadic {
         Dyadic {
-            mantissa: self.mantissa.neg(),
-            exponent: self.exponent,
+            numerator: self.numerator.neg(),
+            scale: self.scale,
         }
     }
 
     /// Returns `|self|`.
     pub fn abs(&self) -> Dyadic {
         Dyadic {
-            mantissa: self.mantissa.abs(),
-            exponent: self.exponent,
+            numerator: self.numerator.abs(),
+            scale: self.scale,
         }
     }
 
@@ -115,19 +123,20 @@ impl Dyadic {
         if self.is_zero() {
             return Dyadic::zero();
         }
+        // value · 2^k = numerator · 2^-(scale - k).
         Dyadic {
-            mantissa: self.mantissa.clone(),
-            exponent: self.exponent + k,
+            numerator: self.numerator.clone(),
+            scale: self.scale - k,
         }
     }
 
-    /// Aligns two values to a common exponent, returning their mantissas at that
-    /// scale and the exponent.
+    /// Aligns two values to a common (finer) scale, returning their numerators
+    /// at that scale and the scale.
     fn aligned(&self, other: &Dyadic) -> (Int, Int, i64) {
-        let emin = self.exponent.min(other.exponent);
-        let a = self.mantissa.mul_2k((self.exponent - emin) as u32);
-        let b = other.mantissa.mul_2k((other.exponent - emin) as u32);
-        (a, b, emin)
+        let smax = self.scale.max(other.scale);
+        let a = self.numerator.mul_2k((smax - self.scale) as u32);
+        let b = other.numerator.mul_2k((smax - other.scale) as u32);
+        (a, b, smax)
     }
 
     /// Returns `self + rhs` (exact).
@@ -138,8 +147,8 @@ impl Dyadic {
         if rhs.is_zero() {
             return self.clone();
         }
-        let (a, b, emin) = self.aligned(rhs);
-        Dyadic::new(a.add(&b), emin)
+        let (a, b, smax) = self.aligned(rhs);
+        Dyadic::new(a.add(&b), smax)
     }
 
     /// Returns `self - rhs` (exact).
@@ -149,10 +158,7 @@ impl Dyadic {
 
     /// Returns `self · rhs` (exact).
     pub fn mul(&self, rhs: &Dyadic) -> Dyadic {
-        Dyadic::new(
-            self.mantissa.mul(&rhs.mantissa),
-            self.exponent + rhs.exponent,
-        )
+        Dyadic::new(self.numerator.mul(&rhs.numerator), self.scale + rhs.scale)
     }
 
     /// Returns `self` raised to `exp` (exact).
@@ -160,25 +166,25 @@ impl Dyadic {
         if exp == 0 {
             return Dyadic::one();
         }
-        Dyadic::new(self.mantissa.pow(exp), self.exponent * exp as i64)
+        Dyadic::new(self.numerator.pow(exp), self.scale * exp as i64)
     }
 
     /// Returns the greatest integer `<= self`.
     pub fn floor(&self) -> Int {
-        if self.exponent >= 0 {
-            self.mantissa.mul_2k(self.exponent as u32)
+        if self.scale <= 0 {
+            self.numerator.mul_2k((-self.scale) as u32)
         } else {
-            self.mantissa
-                .div_floor(&Int::ONE.mul_2k((-self.exponent) as u32))
+            self.numerator
+                .div_floor(&Int::ONE.mul_2k(self.scale as u32))
         }
     }
 
     /// Returns `self` truncated toward zero as an integer.
     pub fn trunc(&self) -> Int {
-        if self.exponent >= 0 {
-            self.mantissa.mul_2k(self.exponent as u32)
+        if self.scale <= 0 {
+            self.numerator.mul_2k((-self.scale) as u32)
         } else {
-            self.mantissa.div_2k_trunc((-self.exponent) as u32)
+            self.numerator.div_2k_trunc(self.scale as u32)
         }
     }
 }
@@ -224,17 +230,17 @@ impl fmt::Display for Dyadic {
         if self.is_zero() {
             return f.write_str("0");
         }
-        if self.mantissa.is_negative() {
+        if self.numerator.is_negative() {
             f.write_str("-")?;
         }
-        let mag = self.mantissa.magnitude();
-        if self.exponent >= 0 {
-            // Integer: |mantissa| << exponent.
-            return fmt::Display::fmt(&mag.shl(self.exponent as u64), f);
+        let mag = self.numerator.magnitude();
+        if self.scale <= 0 {
+            // Integer: |numerator| << (-scale).
+            return fmt::Display::fmt(&mag.shl((-self.scale) as u64), f);
         }
-        // value = |mantissa| / 2^k = |mantissa|·5^k / 10^k; place the point k
+        // value = |numerator| / 2^k = |numerator|·5^k / 10^k; place the point k
         // digits from the right.
-        let k = (-self.exponent) as u32;
+        let k = self.scale as u32;
         let scaled = mag.mul(&Nat::from_u64(5).pow(k));
         let digits = scaled.to_string();
         let k = k as usize;
@@ -255,7 +261,7 @@ impl fmt::Display for Dyadic {
 
 impl fmt::Debug for Dyadic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Dyadic({} · 2^{})", self.mantissa, self.exponent)
+        write!(f, "Dyadic({} · 2^-{})", self.numerator, self.scale)
     }
 }
 
@@ -303,13 +309,10 @@ impl Dyadic {
     /// Returns the exact value as a [`Rational`](crate::rational::Rational).
     pub fn to_rational(&self) -> crate::rational::Rational {
         use crate::rational::Rational;
-        if self.exponent >= 0 {
-            Rational::from_integer(self.mantissa.mul_2k(self.exponent as u32))
+        if self.scale <= 0 {
+            Rational::from_integer(self.numerator.mul_2k((-self.scale) as u32))
         } else {
-            Rational::new(
-                self.mantissa.clone(),
-                Int::ONE.mul_2k((-self.exponent) as u32),
-            )
+            Rational::new(self.numerator.clone(), Int::ONE.mul_2k(self.scale as u32))
         }
     }
 
@@ -317,7 +320,7 @@ impl Dyadic {
     /// `None` if its denominator is not a power of two.
     pub fn try_from_rational(r: &crate::rational::Rational) -> Option<Dyadic> {
         let k = r.denominator().is_power_of_two()?;
-        Some(Dyadic::new(r.numerator().clone(), -(k as i64)))
+        Some(Dyadic::new(r.numerator().clone(), k as i64))
     }
 }
 
@@ -334,15 +337,15 @@ impl Dyadic {
     }
 
     /// Converts a finite [`Float`](crate::float::Float) to an exact [`Dyadic`],
-    /// or `None` for NaN / ±∞ (both are exact for finite floats).
+    /// or `None` for NaN / ±∞ (finite floats are always exactly dyadic).
     pub fn from_float(f: &crate::float::Float) -> Option<Dyadic> {
         if f.is_zero() {
             return Some(Dyadic::zero());
         }
         let sig = f.significand()?; // None for NaN/±∞
-        let exp = f.exponent()?;
-        let mantissa = Int::from_sign_magnitude(f.sign(), sig.clone());
-        Some(Dyadic::new(mantissa, exp))
+        let exp = f.exponent()?; // value = ±sig · 2^exp = ±sig · 2^-(-exp)
+        let numerator = Int::from_sign_magnitude(f.sign(), sig.clone());
+        Some(Dyadic::new(numerator, -exp))
     }
 }
 

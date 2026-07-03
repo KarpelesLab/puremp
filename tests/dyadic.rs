@@ -23,13 +23,19 @@ fn arithmetic_is_exact() {
 
 #[test]
 fn canonical_and_ordering() {
-    // 4 * 2^-2 normalizes to mantissa 1, exponent 0.
-    let x = Dyadic::new(Int::from(4), -2);
-    assert_eq!(x.mantissa(), &Int::from(1));
-    assert_eq!(x.exponent(), 0);
+    // new(n, k) == n·2^-k. 4·2^-2 == 1 normalizes to numerator 1, scale 0.
+    let x = Dyadic::new(Int::from(4), 2);
+    assert_eq!(x.numerator(), &Int::from(1));
+    assert_eq!(x.scale(), 0);
     assert_eq!(x.to_string(), "1");
-    // equal values compare equal regardless of construction
-    assert_eq!(Dyadic::new(Int::from(2), -1), d("1"));
+    // 3·2^-3 == 0.375
+    assert_eq!(Dyadic::new(Int::from(3), 3).to_string(), "0.375");
+    // a positive k divides; equal values compare equal regardless of construction
+    assert_eq!(Dyadic::new(Int::from(2), 1), d("1")); // 2·2^-1 == 1
+    // a large even integer gets a negative scale after normalization
+    let eight = Dyadic::from(8i64);
+    assert_eq!(eight.numerator(), &Int::from(1));
+    assert_eq!(eight.scale(), -3); // 8 == 1·2^-(-3)
     assert!(d("0.5") < d("0.75"));
     assert!(d("-1") < d("0.001953125")); // -1 < 2^-9
     assert_eq!(d("0").to_string(), "0");

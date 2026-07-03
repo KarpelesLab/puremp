@@ -81,3 +81,103 @@ fn precision_growth_keeps_value() {
     assert!((back.to_f64() - 1.0).abs() < 1e-28);
     assert_eq!(third.precision(), 100);
 }
+
+#[test]
+fn special_values() {
+    let p = 53;
+    let inf = Float::infinity(p);
+    let ninf = Float::neg_infinity(p);
+    let nan = Float::nan(p);
+    let one = from_i64(1, p);
+    let zero = Float::zero(p);
+
+    assert!(inf.is_infinite() && !inf.is_finite());
+    assert!(nan.is_nan());
+    assert!(zero.is_zero() && zero.is_finite());
+
+    let n = RoundingMode::Nearest;
+    // inf arithmetic
+    assert!(inf.add(&one, p, n).is_infinite());
+    assert!(inf.add(&ninf, p, n).is_nan()); // ∞ + (−∞) = NaN
+    assert!(inf.mul(&zero, p, n).is_nan()); // ∞ · 0 = NaN
+    assert_eq!(one.div(&zero, p, n), inf); // 1/0 = +∞
+    assert!(zero.div(&zero, p, n).is_nan()); // 0/0 = NaN
+    assert!(one.div(&inf, p, n).is_zero()); // 1/∞ = 0
+    assert!(from_i64(-4, p).sqrt(p, n).is_nan());
+    assert!(inf.sqrt(p, n).is_infinite());
+
+    // NaN compares unordered; NaN != NaN.
+    assert!(nan.partial_cmp(&one).is_none());
+    assert_ne!(nan, nan);
+
+    // signed zero
+    let nzero = Float::neg_zero(p);
+    assert!(nzero.is_sign_negative());
+    assert_eq!(nzero, zero); // −0 == +0 in value
+    assert_eq!(
+        one.neg().mul(&zero, p, n).to_f64().to_bits(),
+        (-0.0f64).to_bits()
+    );
+}
+
+#[test]
+fn f64_roundtrip_and_conversion() {
+    let p = 53;
+    let n = RoundingMode::Nearest;
+    for &x in &[
+        0.0f64,
+        1.0,
+        -1.0,
+        0.5,
+        0.1,
+        -123.456,
+        3.141592653589793,
+        1e300,
+        1e-300,
+    ] {
+        let f = Float::from_f64(x, p, n);
+        assert_eq!(f.to_f64(), x, "roundtrip {x}");
+    }
+    assert!(Float::from_f64(f64::NAN, p, n).is_nan());
+    assert!(Float::from_f64(f64::INFINITY, p, n).is_infinite());
+    assert_eq!(Float::from_f32(0.25f32, p, n).to_f64(), 0.25);
+}
+
+#[test]
+fn ternary_flag() {
+    // 1/3 at low precision is inexact; nearest rounds it either way, but the
+    // ternary must agree with the sign of (rounded - exact).
+    let p = 8;
+    let one = from_i64(1, 60);
+    let three = from_i64(3, 60);
+    let (q, t) = one.div_ternary(&three, p, RoundingMode::TowardZero);
+    assert_eq!(t, core::cmp::Ordering::Less); // truncation of a positive underestimates
+    assert!(q.to_f64() < 1.0 / 3.0);
+
+    let (q2, t2) = one.div_ternary(&three, p, RoundingMode::TowardPositive);
+    assert_eq!(t2, core::cmp::Ordering::Greater);
+    assert!(q2.to_f64() > 1.0 / 3.0);
+
+    // Exact operation reports Equal.
+    let (_, te) = from_i64(2, p).add_ternary(&from_i64(3, p), p, RoundingMode::Nearest);
+    assert_eq!(te, core::cmp::Ordering::Equal);
+}
+
+#[test]
+fn decimal_and_rational_io() {
+    let n = RoundingMode::Nearest;
+    // Parse decimal string -> Float -> decimal string.
+    let f: Float = "1.5".parse().unwrap();
+    assert_eq!(f.to_decimal_string(1), "1.5");
+    let g: Float = "-0.25".parse().unwrap();
+    assert_eq!(g.to_decimal_string(2), "-0.25");
+    assert!("inf".parse::<Float>().unwrap().is_infinite());
+    assert!("nan".parse::<Float>().unwrap().is_nan());
+
+    // Exact rational conversion round-trips a dyadic value.
+    let three_quarters = Float::from_rational(&"3/4".parse().unwrap(), 53, n);
+    assert_eq!(three_quarters.to_f64(), 0.75);
+    let back = three_quarters.to_rational().unwrap();
+    assert_eq!(back.to_string(), "3/4");
+    assert!(Float::nan(53).to_rational().is_none());
+}

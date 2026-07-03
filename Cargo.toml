@@ -39,9 +39,9 @@ int = ["alloc"]
 # Arbitrary-precision rationals (`Rational`) built on `Int`.
 rational = ["int"]
 # Optional arbitrary-precision binary floats (`Float`) with directed rounding,
-# aiming at MPFR-class correct rounding. Built on `Int`, but NOT part of the
-# integer/rational core contract and not enabled by default.
-float = ["int"]
+# aiming at MPFR-class correct rounding. Built on `Int`/`Rational` (decimal I/O
+# reuses exact rationals), but NOT part of the integer/rational core contract.
+float = ["int", "rational"]
 
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --lib --features ffi --crate-type staticlib`

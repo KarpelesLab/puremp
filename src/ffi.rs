@@ -150,6 +150,9 @@ pub unsafe extern "C" fn puremp_int_pow(base: *const PurempInt, exp: u64) -> *mu
     if base.is_null() {
         return ptr::null_mut();
     }
+    let Ok(exp) = u32::try_from(exp) else {
+        return ptr::null_mut();
+    };
     let r = catch_unwind(AssertUnwindSafe(|| {
         let x = unsafe { &(*base).0 };
         to_handle(x.pow(exp))

@@ -187,8 +187,8 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Some(Tok::Pow)) {
             self.pos += 1;
             let exp = self.unary()?;
-            let exp_u64 = int_to_exponent(&exp)?;
-            Ok(base.pow(exp_u64))
+            let exp_u32 = int_to_exponent(&exp)?;
+            Ok(base.pow(exp_u32))
         } else {
             Ok(base)
         }
@@ -215,16 +215,16 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Converts an exponent [`Int`] into the `u64` that [`Int::pow`] expects,
+/// Converts an exponent [`Int`] into the `u32` that [`Int::pow`] expects,
 /// rejecting negative or oversized exponents with a helpful message.
-fn int_to_exponent(exp: &Int) -> Result<u64, String> {
+fn int_to_exponent(exp: &Int) -> Result<u32, String> {
     use puremp::Sign;
     if exp.sign() == Sign::Negative {
         return Err("negative exponent is not an integer".to_string());
     }
     // Round-trip through the decimal string; exponents are tiny in practice.
     exp.to_string()
-        .parse::<u64>()
+        .parse::<u32>()
         .map_err(|_| "exponent too large".to_string())
 }
 

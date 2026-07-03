@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 
 /// An arbitrary-precision natural number (a non-negative integer).
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct Nat {
     /// Little-endian limbs, normalized so the most-significant limb is non-zero.
     /// The value zero is represented by an empty vector.
@@ -352,6 +352,187 @@ impl Nat {
         n.normalize();
         n
     }
+}
+
+impl Nat {
+    /// Returns the value as a `u64` if it fits in a single limb.
+    pub fn to_u64(&self) -> Option<u64> {
+        match self.limbs.as_slice() {
+            [] => Some(0),
+            &[only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this value is one.
+    #[inline]
+    pub fn is_one(&self) -> bool {
+        self.limbs.as_slice() == [1]
+    }
+
+    /// Returns the little-endian limb slice of the magnitude, normalized so the
+    /// most-significant limb is non-zero (empty for zero).
+    #[inline]
+    pub fn as_limbs(&self) -> &[Limb] {
+        &self.limbs
+    }
+
+    /// Builds a natural from little-endian limbs (any trailing zeros are
+    /// stripped).
+    pub fn from_limbs(limbs: &[Limb]) -> Nat {
+        let mut n = Nat {
+            limbs: limbs.to_vec(),
+        };
+        n.normalize();
+        n
+    }
+
+    /// Returns the low `k` bits of this value, i.e. `self mod 2^k`.
+    pub fn low_bits(&self, k: u64) -> Nat {
+        if k == 0 {
+            return Nat::zero();
+        }
+        let full = (k / LIMB_BITS as u64) as usize;
+        let rem = (k % LIMB_BITS as u64) as u32;
+        let take = full.min(self.limbs.len());
+        let mut out: Vec<Limb> = self.limbs[..take].to_vec();
+        if rem > 0 && full < self.limbs.len() {
+            while out.len() < full {
+                out.push(0);
+            }
+            out.push(self.limbs[full] & ((1u64 << rem) - 1));
+        }
+        let mut n = Nat { limbs: out };
+        n.normalize();
+        n
+    }
+
+    /// Returns `self` raised to `exp` (`self^0 == 1`), by square-and-multiply.
+    pub fn pow(&self, exp: u32) -> Nat {
+        let mut result = Nat::one();
+        let mut base = self.clone();
+        let mut e = exp;
+        while e > 0 {
+            if e & 1 == 1 {
+                result = result.mul(&base);
+            }
+            e >>= 1;
+            if e > 0 {
+                base = base.mul(&base);
+            }
+        }
+        result
+    }
+
+    /// Returns the floor of the square root, `⌊√self⌋`, via Newton's method.
+    pub fn isqrt(&self) -> Nat {
+        if self.is_zero() {
+            return Nat::zero();
+        }
+        if self.bit_len() <= 2 {
+            // values 1..=3 all have isqrt 1
+            return Nat::one();
+        }
+        let mut x = Nat::one().shl(self.bit_len().div_ceil(2));
+        loop {
+            let (q, _) = self.div_rem(&x).expect("x is non-zero");
+            let y = x.add(&q).shr(1);
+            if y.cmp_ref(&x) != Ordering::Less {
+                return x;
+            }
+            x = y;
+        }
+    }
+
+    /// Returns the floor of the `k`th root, `⌊self^(1/k)⌋`, for `k >= 1`, by
+    /// bitwise binary search.
+    pub fn nth_root_floor(&self, k: u32) -> Nat {
+        assert!(k >= 1, "nth_root_floor: k must be >= 1");
+        if k == 1 || self.is_zero() || self.is_one() {
+            return self.clone();
+        }
+        if k == 2 {
+            return self.isqrt();
+        }
+        let hb = self.bit_len().div_ceil(k as u64);
+        let mut root = Nat::zero();
+        for bit in (0..=hb).rev() {
+            let cand = root.add(&Nat::one().shl(bit));
+            if cand.pow(k).cmp_ref(self) != Ordering::Greater {
+                root = cand;
+            }
+        }
+        root
+    }
+
+    /// Writes the magnitude in the given `radix` (2–36) to `out`.
+    pub fn write_radix(&self, out: &mut impl fmt::Write, radix: u32) -> fmt::Result {
+        assert!((2..=36).contains(&radix), "radix must be in 2..=36");
+        if self.is_zero() {
+            return out.write_str("0");
+        }
+        let mut n = self.clone();
+        let mut buf = Vec::new();
+        while !n.is_zero() {
+            let (q, r) = n.divmod_small(radix as Limb);
+            buf.push(digit_char(r as u32));
+            n = q;
+        }
+        buf.reverse();
+        out.write_str(core::str::from_utf8(&buf).unwrap_or("<nan>"))
+    }
+}
+
+/// Maps a digit value `0..36` to its ASCII character (`0-9`, then `a-z`).
+#[inline]
+fn digit_char(d: u32) -> u8 {
+    if d < 10 {
+        b'0' + d as u8
+    } else {
+        b'a' + (d - 10) as u8
+    }
+}
+
+/// Parses an unsigned integer in the given `radix` (2–36).
+pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
+    if !(2..=36).contains(&radix) || s.is_empty() {
+        return Err(Error::Parse);
+    }
+    let mut n = Nat::zero();
+    for ch in s.chars() {
+        let d = ch.to_digit(radix).ok_or(Error::Parse)?;
+        n = n.mul_add_small(radix as Limb, d as Limb);
+    }
+    Ok(n)
+}
+
+/// Binary GCD on two machine words.
+pub fn u64_gcd(mut u: u64, mut v: u64) -> u64 {
+    if u == 0 {
+        return v;
+    }
+    if v == 0 {
+        return u;
+    }
+    let shift = (u | v).trailing_zeros();
+    u >>= u.trailing_zeros();
+    loop {
+        v >>= v.trailing_zeros();
+        if u > v {
+            core::mem::swap(&mut u, &mut v);
+        }
+        v -= u;
+        if v == 0 {
+            break;
+        }
+    }
+    u << shift
+}
+
+/// Binary GCD on two 32-bit machine words.
+#[inline]
+pub fn u_gcd(u: u32, v: u32) -> u32 {
+    u64_gcd(u as u64, v as u64) as u32
 }
 
 impl PartialOrd for Nat {

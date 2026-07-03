@@ -62,7 +62,7 @@ pub use error::{Error, Result};
 #[cfg(feature = "int")]
 pub use int::{Int, Sign};
 #[cfg(feature = "int")]
-pub use nat::Nat;
+pub use nat::{Nat, u_gcd, u64_gcd};
 
 #[cfg(feature = "rational")]
 pub use rational::Rational;

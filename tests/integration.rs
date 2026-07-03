@@ -157,3 +157,262 @@ fn rational_sign_is_canonical() {
     assert_eq!(r.numerator().to_string(), "-1");
     assert_eq!(r.denominator().to_string(), "2");
 }
+
+// ---- Int: small/large inline representation ----
+
+#[test]
+fn small_large_boundary_arithmetic() {
+    // Values straddling the single-limb (u64) inline boundary.
+    let u64_max = int("18446744073709551615"); // 2^64 - 1 (largest inline magnitude)
+    let two64 = int("18446744073709551616"); // 2^64 (first Large value)
+    assert_eq!(u64_max.add(&Int::ONE), two64);
+    assert_eq!(two64.sub(&Int::ONE), u64_max);
+    // Demotion: Large - Large that fits back inline.
+    assert_eq!(two64.sub(&two64), Int::ZERO);
+    assert!(two64.sub(&Int::ONE).fits_u64());
+
+    // i64::MIN / i64::MAX inline edges, and -i64::MIN which overflows i64.
+    let imin = Int::from_i64(i64::MIN);
+    assert_eq!(imin.to_i64(), Some(i64::MIN));
+    assert_eq!(imin.neg().to_string(), "9223372036854775808"); // 2^63, no longer fits i64
+    assert!(!imin.neg().fits_i64());
+    assert_eq!(Int::from_i64(i64::MAX).to_i64(), Some(i64::MAX));
+}
+
+#[test]
+fn from_primitives_and_conversions() {
+    assert_eq!(Int::from(-5i8).to_string(), "-5");
+    assert_eq!(Int::from(u64::MAX).to_string(), "18446744073709551615");
+    assert_eq!(
+        Int::from(i128::MIN).to_string(),
+        "-170141183460469231731687303715884105728"
+    );
+    assert_eq!(Int::from(255u8).to_u64(), Some(255));
+    assert_eq!(int("-1").to_u64(), None);
+    assert_eq!(int("99999999999999999999999").to_i64(), None);
+    assert_eq!(Int::from(42i64).to_f64(), 42.0);
+    assert_eq!(int("-1000000").to_f64(), -1_000_000.0);
+    assert_eq!(int("18446744073709551616").to_f64(), 2f64.powi(64));
+}
+
+// ---- Int: three division conventions, cross-checked against i64 ----
+
+#[test]
+fn division_conventions_match_i64() {
+    for a in -25i64..=25 {
+        for b in -7i64..=7 {
+            if b == 0 {
+                continue;
+            }
+            let (ia, ib) = (Int::from_i64(a), Int::from_i64(b));
+
+            // Truncated: matches Rust's `/` and `%`.
+            let (qt, rt) = ia.div_rem_trunc(&ib);
+            assert_eq!(qt.to_i64(), Some(a / b), "trunc q {a}/{b}");
+            assert_eq!(rt.to_i64(), Some(a % b), "trunc r {a}/{b}");
+            assert_eq!(qt.mul(&ib).add(&rt), ia, "trunc identity {a}/{b}");
+
+            // Euclidean: matches div_euclid/rem_euclid; 0 <= r < |b|.
+            let (qe, re) = ia.div_rem_euclid(&ib);
+            assert_eq!(qe.to_i64(), Some(a.div_euclid(b)), "euclid q {a}/{b}");
+            assert_eq!(re.to_i64(), Some(a.rem_euclid(b)), "euclid r {a}/{b}");
+            assert!(!re.is_negative() && re < ib.abs(), "euclid range {a}/{b}");
+            assert_eq!(qe.mul(&ib).add(&re), ia, "euclid identity {a}/{b}");
+
+            // Floored: quotient toward -inf, remainder sign of divisor.
+            let qf_oracle = {
+                let mut q = a / b;
+                if a % b != 0 && (a % b < 0) != (b < 0) {
+                    q -= 1;
+                }
+                q
+            };
+            let (qfl, rfl) = ia.div_rem_floor(&ib);
+            assert_eq!(qfl.to_i64(), Some(qf_oracle), "floor q {a}/{b}");
+            assert_eq!(qfl.mul(&ib).add(&rfl), ia, "floor identity {a}/{b}");
+            assert!(
+                rfl.is_zero() || (rfl.is_negative() == (b < 0)),
+                "floor r sign {a}/{b}"
+            );
+        }
+    }
+}
+
+#[test]
+fn division_big_operands() {
+    let a = int("-123456789012345678901234567890");
+    let b = int("987654321987654321");
+    let (q, r) = a.div_rem_trunc(&b);
+    assert_eq!(q.mul(&b).add(&r), a);
+    assert!(r.abs() < b.abs());
+    assert!(r.is_negative()); // trunc remainder follows dividend
+
+    let (qe, re) = a.div_rem_euclid(&b);
+    assert!(!re.is_negative() && re < b.abs());
+    assert_eq!(qe.mul(&b).add(&re), a);
+
+    assert!(int("1").div_rem(&Int::ZERO).is_none());
+    assert!(int("100").div_exact(&int("4")) == int("25"));
+    assert!(int("4").divides(&int("100")));
+    assert!(!int("3").divides(&int("100")));
+}
+
+// ---- Int: number theory ----
+
+#[test]
+fn gcd_lcm_extended() {
+    let a = int("461952");
+    let b = int("116298");
+    let g = a.gcd(&b);
+    assert_eq!(g.to_string(), "18");
+    // gcd*lcm == |a*b|
+    assert_eq!(g.mul(&a.lcm(&b)), a.mul(&b).abs());
+    // extended: g == a*x + b*y
+    let (g2, x, y) = a.extended_gcd(&b);
+    assert_eq!(g2, g);
+    assert_eq!(a.mul(&x).add(&b.mul(&y)), g);
+    // negatives
+    let (g3, x3, y3) = int("-12").extended_gcd(&int("18"));
+    assert_eq!(g3.to_string(), "6");
+    assert_eq!(int("-12").mul(&x3).add(&int("18").mul(&y3)), g3);
+
+    use puremp::{u_gcd, u64_gcd};
+    assert_eq!(u64_gcd(1071, 462), 21);
+    assert_eq!(u_gcd(48, 36), 12);
+}
+
+#[test]
+fn roots() {
+    assert_eq!(int("144").sqrt_exact().unwrap().to_string(), "12");
+    assert!(int("145").sqrt_exact().is_none());
+    assert!(int("-4").sqrt_exact().is_none());
+    // (10^15)^2
+    assert_eq!(
+        int("1000000000000000000000000000000")
+            .sqrt_exact()
+            .unwrap()
+            .to_string(),
+        "1000000000000000"
+    );
+    assert_eq!(int("27").nth_root_exact(3).unwrap().to_string(), "3");
+    assert_eq!(int("-27").nth_root_exact(3).unwrap().to_string(), "-3");
+    assert!(int("-16").nth_root_exact(4).is_none());
+    assert!(int("28").nth_root_exact(3).is_none());
+}
+
+// ---- Int: power-of-two & bit access ----
+
+#[test]
+fn power_of_two_ops() {
+    let x = int("12345");
+    assert_eq!(x.mul_2k(10), x.mul(&Int::from_i64(1024)));
+    assert_eq!(x.div_2k_trunc(3).to_string(), "1543"); // 12345 >> 3
+    // mod_2k == rem_euclid(2^k), always non-negative
+    for k in 0u32..12 {
+        let m = Int::from_i64(1i64 << k);
+        assert_eq!(x.mod_2k(k), x.rem_euclid(&m), "mod_2k {k}");
+        assert_eq!(
+            int("-12345").mod_2k(k),
+            int("-12345").rem_euclid(&m),
+            "neg mod_2k {k}"
+        );
+    }
+    assert_eq!(int("1024").is_power_of_two(), Some(10));
+    assert_eq!(int("-1024").is_power_of_two(), Some(10));
+    assert_eq!(int("1000").is_power_of_two(), None);
+    assert_eq!(int("48").trailing_zeros(), 4); // 48 = 16*3
+    assert_eq!(int("0").trailing_zeros(), 0);
+    assert_eq!(int("255").bit_len(), 8);
+    assert_eq!(int("256").log2_floor(), 8);
+}
+
+#[test]
+fn twos_complement_bitwise() {
+    // Match Rust's i64 two's-complement operators, including negatives.
+    for a in [-9i64, -1, 0, 5, 12, 255, -256, 1023] {
+        for b in [-7i64, -1, 0, 3, 8, 100, -100] {
+            let (ia, ib) = (Int::from_i64(a), Int::from_i64(b));
+            assert_eq!(ia.bitand(&ib).to_i64(), Some(a & b), "{a} & {b}");
+            assert_eq!(ia.bitor(&ib).to_i64(), Some(a | b), "{a} | {b}");
+            assert_eq!(ia.bitxor(&ib).to_i64(), Some(a ^ b), "{a} ^ {b}");
+        }
+        // bitnot within an 8-bit window: sign-extend (!a & 0xFF).
+        let u = (!a as u64) & 0xFF;
+        let oracle = if u & 0x80 != 0 {
+            u as i64 - 256
+        } else {
+            u as i64
+        };
+        assert_eq!(
+            Int::from_i64(a).bitnot(8).to_i64(),
+            Some(oracle),
+            "bitnot8 {a}"
+        );
+    }
+}
+
+// ---- Int: limb access, hashing, radix ----
+
+#[test]
+fn limb_roundtrip_and_access() {
+    for s in [
+        "0",
+        "1",
+        "-1",
+        "18446744073709551616",
+        "-340282366920938463463374607431768211457",
+    ] {
+        let x = int(s);
+        let rebuilt = Int::from_limbs(x.sign(), x.limbs());
+        assert_eq!(rebuilt, x, "limb roundtrip {s}");
+    }
+    let big = int("340282366920938463463374607431768211456"); // 2^128
+    assert_eq!(big.limbs(), &[0, 0, 1]);
+    assert_eq!(big.least_significant_limb(), 0);
+    assert_eq!(int("18446744073709551617").least_significant_limb(), 1);
+    assert!(int("1024").bit(10));
+    assert!(!int("1024").bit(9));
+}
+
+#[test]
+fn hash_is_consistent_with_eq() {
+    use std::collections::HashSet;
+    let mut set = HashSet::new();
+    set.insert(int("340282366920938463463374607431768211456")); // 2^128 built via parse
+    // Same value built a different way must be found (equal => equal hash).
+    let via_mul = int("18446744073709551616").mul(&int("18446744073709551616"));
+    assert!(set.contains(&via_mul));
+    assert!(set.contains(&Int::from(2i64).pow(128)));
+    assert!(!set.contains(&int("7")));
+}
+
+#[test]
+fn radix_roundtrip() {
+    assert_eq!(Int::from_str_radix("ff", 16).unwrap().to_string(), "255");
+    assert_eq!(Int::from_str_radix("-101", 2).unwrap().to_string(), "-5");
+    for s in ["0", "255", "-4096", "123456789012345678901234567890"] {
+        let x = int(s);
+        for radix in [2u32, 8, 16, 36] {
+            let mut buf = String::new();
+            x.write_radix(&mut buf, radix).unwrap();
+            assert_eq!(
+                Int::from_str_radix(&buf, radix).unwrap(),
+                x,
+                "radix {radix} for {s}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fused_addmul_submul() {
+    let mut acc = int("1000");
+    acc.addmul(&int("3"), &int("7")); // 1000 + 21
+    assert_eq!(acc.to_string(), "1021");
+    acc.submul(&int("2"), &int("11")); // 1021 - 22
+    assert_eq!(acc.to_string(), "999");
+    // Large operands
+    let mut big = Int::ZERO;
+    big.addmul(&int("18446744073709551616"), &int("18446744073709551616"));
+    assert_eq!(big.to_string(), "340282366920938463463374607431768211456");
+}

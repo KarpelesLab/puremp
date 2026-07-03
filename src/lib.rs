@@ -70,6 +70,9 @@ pub mod nat;
 #[cfg(feature = "int")]
 pub mod random;
 
+#[cfg(feature = "num-traits")]
+mod num_traits_impls;
+
 #[cfg(feature = "rational")]
 pub mod rational;
 

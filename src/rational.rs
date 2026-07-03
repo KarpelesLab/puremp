@@ -202,6 +202,13 @@ impl Rational {
         Rational::normalize(self.num.mul(&rhs.den), self.den.mul(&rhs.num))
     }
 
+    /// Returns the remainder `self − rhs·trunc(self/rhs)` (the truncated-division
+    /// remainder; consistent with `Int`'s `%`). Panics if `rhs` is zero.
+    pub fn rem(&self, rhs: &Rational) -> Rational {
+        let q = self.div(rhs).trunc(); // integer part of the quotient
+        self.sub(&rhs.mul(&Rational::from_integer(q)))
+    }
+
     /// Returns `self` raised to `n` (negative `n` via the reciprocal). Panics on
     /// `0` to a negative power.
     pub fn pow(&self, n: i32) -> Rational {
@@ -476,6 +483,7 @@ rat_binops!(Add, add, AddAssign, add_assign);
 rat_binops!(Sub, sub, SubAssign, sub_assign);
 rat_binops!(Mul, mul, MulAssign, mul_assign);
 rat_binops!(Div, div, DivAssign, div_assign);
+rat_binops!(Rem, rem, RemAssign, rem_assign);
 
 impl core::ops::Neg for Rational {
     type Output = Rational;

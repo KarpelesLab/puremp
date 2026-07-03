@@ -68,12 +68,18 @@ rand = ["dep:rand_core", "int"]
 # for the number types, round-tripping via their exact string forms.
 serde = ["dep:serde", "int"]
 
+# Optional `num-traits` bridge: implements Zero/One/Num/Signed/ToPrimitive/
+# FromPrimitive for `Int`/`Rational` (and Zero/One/Unsigned for `Nat`) so the
+# types slot into generic numeric code.
+num-traits = ["dep:num-traits", "int", "rational"]
+
 # The arithmetic core is a clean-room, dependency-free implementation (see
 # ROADMAP.md "License & provenance"); the only dependencies are optional,
 # opt-in ecosystem bridges that the default build never pulls in.
 [dependencies]
 rand_core = { version = "0.6", optional = true, default-features = false }
 serde = { version = "1", optional = true, default-features = false, features = ["alloc"] }
+num-traits = { version = "0.2", optional = true, default-features = false }
 
 # Test-only: exercise the `serde` impls through a real format. Not shipped to
 # consumers, and only used by the `serde`-gated tests.

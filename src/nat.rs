@@ -1886,6 +1886,38 @@ impl core::ops::Mul for &Nat {
     }
 }
 
+// Owned `+`/`*` (and assign forms). Subtraction is intentionally absent —
+// naturals are not closed under it; use `checked_sub`.
+impl core::ops::Add for Nat {
+    type Output = Nat;
+    #[inline]
+    fn add(self, rhs: Nat) -> Nat {
+        Nat::add(&self, &rhs)
+    }
+}
+
+impl core::ops::Mul for Nat {
+    type Output = Nat;
+    #[inline]
+    fn mul(self, rhs: Nat) -> Nat {
+        Nat::mul(&self, &rhs)
+    }
+}
+
+impl core::ops::AddAssign for Nat {
+    #[inline]
+    fn add_assign(&mut self, rhs: Nat) {
+        *self = Nat::add(self, &rhs);
+    }
+}
+
+impl core::ops::MulAssign for Nat {
+    #[inline]
+    fn mul_assign(&mut self, rhs: Nat) {
+        *self = Nat::mul(self, &rhs);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

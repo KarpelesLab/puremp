@@ -1281,6 +1281,36 @@ binops!(Add, add, AddAssign, add_assign);
 binops!(Sub, sub, SubAssign, sub_assign);
 binops!(Mul, mul, MulAssign, mul_assign);
 
+/// `/` and `%` use truncated (toward-zero) division, matching `i64`/`i128`. Use
+/// the `div_rem_euclid`/`div_rem_floor` methods for the other conventions.
+macro_rules! div_binops {
+    ($tr:ident, $m:ident, $method:ident, $atr:ident, $am:ident) => {
+        impl core::ops::$tr for Int {
+            type Output = Int;
+            #[inline]
+            fn $m(self, rhs: Int) -> Int {
+                Int::$method(&self, &rhs)
+            }
+        }
+        impl core::ops::$tr<&Int> for &Int {
+            type Output = Int;
+            #[inline]
+            fn $m(self, rhs: &Int) -> Int {
+                Int::$method(self, rhs)
+            }
+        }
+        impl core::ops::$atr for Int {
+            #[inline]
+            fn $am(&mut self, rhs: Int) {
+                *self = Int::$method(self, &rhs);
+            }
+        }
+    };
+}
+
+div_binops!(Div, div, div_trunc, DivAssign, div_assign);
+div_binops!(Rem, rem, rem_trunc, RemAssign, rem_assign);
+
 impl core::ops::Neg for Int {
     type Output = Int;
     #[inline]

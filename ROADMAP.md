@@ -363,16 +363,32 @@ Aligned to the spec's test list; property tests run randomized, many iterations:
 ## 8a. Extended numeric types ✅
 
 Beyond the core `Int`/`Rational` contract and the optional `Float`, the crate
-ships a small family of exact/convenience types layered on the same foundation:
+ships a family of exact/convenience/derived types layered on the same
+foundation:
 
-- **`Dyadic`** (`dyadic` feature) — exact dyadic rationals `n·2^-k` (denominator
-  a power of two): exact `+`/`-`/`*`/`pow`/`mul_2k`, a terminating-decimal
-  `Display`, and conversions to/from `Rational`/`Float`.
-- **`InfRational`** (`rational` feature) — `Rational` extended with `±∞`/`NaN`
-  and IEEE-style arithmetic, exact on the finite part.
-- **`FixedFloat`** (`float` feature) — a fixed-precision wrapper over `Float`
-  that bakes in the precision and rounding mode so it supports the ordinary
-  `+ - * /` operators and method-style transcendentals.
+- **`Dyadic`** (`dyadic`) — exact dyadic rationals `n·2^-k`: exact
+  `+`/`-`/`*`/`pow`/`mul_2k`, a terminating-decimal `Display`, conversions
+  to/from `Rational`/`Float`.
+- **`Decimal`** (`decimal`) — exact base-10 floating point (Python `Decimal`
+  analog): exact `+`/`-`/`*`, `div`/`quantize`/`round_to_digits` with seven
+  rounding modes, scientific parsing.
+- **`InfRational`** (`rational`) — `Rational` extended with `±∞`/`NaN`.
+- **`FixedFloat`** (`float`) — a fixed-precision `Float` wrapper with operators.
+- **`ModInt`** (`int`) — modular integers `ℤ/mℤ` with a shared Barrett reciprocal.
+- **`Complex<T>`** (`complex`) — generic complex numbers / Gaussian integers.
+- **`Poly<T>`** (`poly`) — generic univariate polynomials (division/GCD over a
+  field component).
+- **`Matrix<T>`** (`matrix`) — dense matrices; exact Bareiss integer determinant
+  and rational determinant/inverse/solve/rank.
+- **`Interval`** (`interval`) — outward-rounded interval arithmetic.
+
+### Number-theory toolkit (on `Int`/`Rational`/`Nat`)
+
+`factorize` (Pollard ρ), `sqrt_mod` (Tonelli–Shanks), `jacobi`/`legendre`,
+`crt`, `random_prime`, `factorial`/`binomial`/`multinomial`,
+`fibonacci`/`lucas` (fast doubling), and `Rational::continued_fraction` /
+`approximate` (best rational approximation). An optional `num-traits` bridge
+implements the standard generic-numeric interfaces.
 
 ## 9. Non-goals
 

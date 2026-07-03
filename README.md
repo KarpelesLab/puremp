@@ -1,8 +1,10 @@
 # puremp
 
 Pure-Rust, MIT-licensed, arbitrary-precision arithmetic — **integers,
-rationals, and MPFR-class floating point** — with no foreign-code dependencies.
-Usable as a Rust crate, a C library, and a command-line calculator.
+rationals, MPFR-class floating point, and base-10 decimals**, plus derived
+**modular integers, complex numbers, polynomials, matrices, and intervals** —
+with no foreign-code dependencies. Usable as a Rust crate, a C library, and a
+command-line calculator.
 
 > **Status: feature-complete, pre-1.0.** The full signed-integer and exact
 > rational surface is implemented and tested (small-value inlining, all three
@@ -98,9 +100,20 @@ int main(void) {
 | `int` | ✔ | `Nat` and `Int` |
 | `rational` | ✔ | `Rational` and `InfRational` (implies `int`) |
 | `dyadic` | ✔ | `Dyadic` — exact `n·2⁻ᵏ` binary fractions (implies `int`) |
+| `decimal` | ✔ | `Decimal` — exact base-10 floating point (implies `int`) |
+| `complex` | ✔ | `Complex<T>` — generic complex / Gaussian integers |
+| `poly` | ✔ | `Poly<T>` — generic univariate polynomials |
+| `matrix` | ✔ | `Matrix<T>` — dense matrices with exact linear algebra |
+| `interval` | ✔ | `Interval` — outward-rounded interval arithmetic (implies `float`) |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
+| `num-traits` | | Implements `num-traits` interfaces for `Int`/`Rational`/`Nat` |
 | `ffi` | | The C ABI module (`include/puremp.h`) |
 | `cli` | ✔ | The `puremp` binary |
+
+Beyond the base types, `Int`/`Rational` provide a number-theory toolkit —
+`factorize`, `sqrt_mod` (Tonelli–Shanks), `jacobi`/`legendre`, `crt`,
+`random_prime`, `factorial`/`binomial`/`fibonacci`, and continued-fraction
+`approximate` — plus `ModInt` for modular arithmetic.
 
 For a bare `no_std` build: `--no-default-features` (add `--features int` for the
 integer types).

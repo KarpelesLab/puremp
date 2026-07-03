@@ -13,6 +13,23 @@
 //!    precision and directed [`RoundingMode`], aiming at MPFR-class correct
 //!    rounding, plus [`FixedFloat`], a fixed-precision wrapper with operators.
 //!    `float` feature.
+//! 5. **Decimals** — [`Decimal`], exact base-10 floating point (Python
+//!    `Decimal`-style), with directed rounding. `decimal` feature.
+//!
+//! Built on top of these are several *derived* structures, each generic or
+//! specialised as noted:
+//!
+//! - [`ModInt`] — modular integers `ℤ/mℤ` with automatic reduction (`int`).
+//! - [`Complex`] — generic complex numbers / Gaussian integers (`complex`).
+//! - [`Poly`] — generic univariate polynomials (`poly`).
+//! - [`Matrix`] — dense matrices with exact determinant/inverse/solve
+//!   (`matrix`).
+//! - [`Interval`] — outward-rounded interval arithmetic (`interval`).
+//!
+//! `Int`/`Rational` also carry a number-theory toolkit (factorization,
+//! `sqrt_mod`, Jacobi/Legendre, CRT, `random_prime`, combinatorics,
+//! continued-fraction approximation), and an optional `num-traits` bridge slots
+//! the types into generic numeric code.
 //!
 //! `puremp` is usable as a Rust library, a C library (the `ffi` feature; see
 //! `include/puremp.h`), and a standalone command-line calculator (the `cli`

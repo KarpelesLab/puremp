@@ -117,6 +117,9 @@ pub mod matrix;
 #[cfg(feature = "algebraic")]
 pub mod quadratic;
 
+#[cfg(feature = "algebraic")]
+pub mod algebraic;
+
 #[cfg(feature = "float")]
 pub mod float;
 
@@ -164,6 +167,8 @@ pub use poly::Poly;
 #[cfg(feature = "matrix")]
 pub use matrix::Matrix;
 
+#[cfg(feature = "algebraic")]
+pub use algebraic::Algebraic;
 #[cfg(feature = "algebraic")]
 pub use quadratic::Quadratic;
 

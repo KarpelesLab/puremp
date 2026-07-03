@@ -20,6 +20,11 @@ use alloc::vec::Vec;
 use crate::error::{Error, Result};
 use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 
+/// Operands with fewer than this many limbs use schoolbook multiplication;
+/// larger ones recurse via Karatsuba. Chosen conservatively; a tuned crossover
+/// is a later milestone (see `ROADMAP.md`).
+const KARATSUBA_THRESHOLD: usize = 32;
+
 /// An arbitrary-precision natural number (a non-negative integer).
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct Nat {
@@ -161,14 +166,23 @@ impl Nat {
         Some(n)
     }
 
-    /// Returns `self · rhs` using the quadratic schoolbook algorithm.
+    /// Returns `self · rhs`, dispatching to schoolbook or Karatsuba by size.
     ///
-    /// Sub-quadratic multiplication (Karatsuba, Toom-Cook, FFT) is a later
-    /// milestone; see `ROADMAP.md`.
+    /// Toom-Cook and FFT/NTT multiplication for very large operands are later
+    /// milestones; see `ROADMAP.md`.
     pub fn mul(&self, rhs: &Nat) -> Nat {
         if self.is_zero() || rhs.is_zero() {
             return Nat::zero();
         }
+        if self.limbs.len().min(rhs.limbs.len()) < KARATSUBA_THRESHOLD {
+            self.mul_schoolbook(rhs)
+        } else {
+            self.mul_karatsuba(rhs)
+        }
+    }
+
+    /// Quadratic schoolbook (long) multiplication.
+    fn mul_schoolbook(&self, rhs: &Nat) -> Nat {
         let mut out = alloc::vec![0 as Limb; self.limbs.len() + rhs.limbs.len()];
         for (i, &a) in self.limbs.iter().enumerate() {
             let mut carry = 0;
@@ -182,6 +196,39 @@ impl Nat {
         let mut n = Nat { limbs: out };
         n.normalize();
         n
+    }
+
+    /// Returns `(low, high)` where `self == low + high·2^(64·at)`.
+    fn split_at_limb(&self, at: usize) -> (Nat, Nat) {
+        if at >= self.limbs.len() {
+            return (self.clone(), Nat::zero());
+        }
+        (
+            Nat::from_limbs(&self.limbs[..at]),
+            Nat::from_limbs(&self.limbs[at..]),
+        )
+    }
+
+    /// Karatsuba multiplication: three half-size products instead of four.
+    fn mul_karatsuba(&self, rhs: &Nat) -> Nat {
+        let n = self.limbs.len().max(rhs.limbs.len());
+        if self.limbs.len().min(rhs.limbs.len()) < KARATSUBA_THRESHOLD {
+            return self.mul_schoolbook(rhs);
+        }
+        let half = n / 2;
+        let (a0, a1) = self.split_at_limb(half);
+        let (b0, b1) = rhs.split_at_limb(half);
+        let z0 = a0.mul(&b0);
+        let z2 = a1.mul(&b1);
+        // z1 = (a0+a1)(b0+b1) - z2 - z0
+        let z1 = a0
+            .add(&a1)
+            .mul(&b0.add(&b1))
+            .checked_sub(&z2)
+            .and_then(|t| t.checked_sub(&z0))
+            .expect("karatsuba middle term is non-negative");
+        let bits = (half * LIMB_BITS as usize) as u64;
+        z2.shl(2 * bits).add(&z1.shl(bits)).add(&z0)
     }
 
     /// Returns `self << bits`.
@@ -286,32 +333,90 @@ impl Nat {
     /// `self == quotient·rhs + remainder` and `remainder < rhs`, or `None` if
     /// `rhs` is zero.
     ///
-    /// The scaffold implementation is bit-at-a-time long division — simple and
-    /// obviously correct. Sub-quadratic schemes (Knuth Algorithm D, then
-    /// Burnikel–Ziegler recursive division) are later milestones; see
-    /// `ROADMAP.md`.
+    /// Dispatches to single-limb division or Knuth's Algorithm D (TAOCP Vol. 2
+    /// §4.3.1). Sub-quadratic Burnikel–Ziegler recursive division is a later
+    /// milestone; see `ROADMAP.md`.
     pub fn div_rem(&self, rhs: &Nat) -> Option<(Nat, Nat)> {
         if rhs.is_zero() {
             return None;
         }
-        if self.cmp_ref(rhs) == Ordering::Less {
-            return Some((Nat::zero(), self.clone()));
+        match self.cmp_ref(rhs) {
+            Ordering::Less => return Some((Nat::zero(), self.clone())),
+            Ordering::Equal => return Some((Nat::one(), Nat::zero())),
+            Ordering::Greater => {}
         }
-        let one = Nat::one();
-        let mut q = Nat::zero();
-        let mut r = Nat::zero();
-        for i in (0..self.bit_len()).rev() {
-            r = r.shl(1);
-            if self.bit(i) {
-                r = r.add(&one);
+        if rhs.limbs.len() == 1 {
+            let (q, r) = self.divmod_small(rhs.limbs[0]);
+            return Some((q, Nat::from_u64(r)));
+        }
+        Some(self.div_rem_knuth(rhs))
+    }
+
+    /// Knuth Algorithm D: schoolbook long division in base `2^64`, with a
+    /// normalized divisor and the 2-by-1 limb quotient estimate. Precondition:
+    /// `rhs` has ≥ 2 limbs and `self > rhs`.
+    fn div_rem_knuth(&self, rhs: &Nat) -> (Nat, Nat) {
+        const B: u128 = 1 << LIMB_BITS;
+        let n = rhs.limbs.len();
+        let m = self.limbs.len() - n;
+
+        // Normalize so the divisor's top limb has its high bit set.
+        let shift = rhs.limbs[n - 1].leading_zeros();
+        let vn = rhs.shl(shift as u64);
+        let vv = &vn.limbs;
+        debug_assert_eq!(vv.len(), n);
+        let un = self.shl(shift as u64);
+        let mut u = un.limbs.clone();
+        u.resize(self.limbs.len() + 1, 0); // exactly m + n + 1 limbs
+
+        let (b1, b2) = (vv[n - 1] as u128, vv[n - 2] as u128);
+        let mut q = alloc::vec![0 as Limb; m + 1];
+
+        for j in (0..=m).rev() {
+            // Estimate the quotient limb from the top two dividend limbs.
+            let num = ((u[j + n] as u128) << LIMB_BITS) | u[j + n - 1] as u128;
+            let mut qhat = num / b1;
+            let mut rhat = num % b1;
+            while qhat >= B || qhat * b2 > ((rhat << LIMB_BITS) | u[j + n - 2] as u128) {
+                qhat -= 1;
+                rhat += b1;
+                if rhat >= B {
+                    break;
+                }
             }
-            q = q.shl(1);
-            if r.cmp_ref(rhs) != Ordering::Less {
-                r = r.checked_sub(rhs).expect("r >= rhs checked");
-                q = q.add(&one);
+
+            // Multiply and subtract: u[j..=j+n] -= qhat · vv.
+            let mut carry: u128 = 0;
+            let mut borrow: i64 = 0;
+            for i in 0..n {
+                let p = qhat * vv[i] as u128 + carry;
+                carry = p >> LIMB_BITS;
+                let d = (u[j + i] as i128) - ((p as u64) as i128) - (borrow as i128);
+                u[j + i] = d as u64;
+                borrow = if d < 0 { 1 } else { 0 };
+            }
+            let d = (u[j + n] as i128) - (carry as i128) - (borrow as i128);
+            u[j + n] = d as u64;
+
+            q[j] = qhat as Limb;
+            if d < 0 {
+                // qhat was one too large: add the divisor back.
+                q[j] -= 1;
+                let mut add_carry: u128 = 0;
+                for i in 0..n {
+                    let s = u[j + i] as u128 + vv[i] as u128 + add_carry;
+                    u[j + i] = s as u64;
+                    add_carry = s >> LIMB_BITS;
+                }
+                u[j + n] = (u[j + n] as u128 + add_carry) as u64;
             }
         }
-        Some((q, r))
+
+        let mut quotient = Nat { limbs: q };
+        quotient.normalize();
+        // Denormalize the remainder (the low n limbs of u), undoing the shift.
+        let remainder = Nat::from_limbs(&u[..n]).shr(shift as u64);
+        (quotient, remainder)
     }
 
     /// Divides by a single-limb value, returning `(quotient, remainder)`.
@@ -636,5 +741,93 @@ impl core::ops::Mul for &Nat {
     #[inline]
     fn mul(self, rhs: &Nat) -> Nat {
         Nat::mul(self, rhs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::str::FromStr;
+
+    /// Reference bit-at-a-time long division, kept only for differential testing
+    /// against the production Algorithm-D path.
+    fn div_rem_binary(a: &Nat, b: &Nat) -> (Nat, Nat) {
+        assert!(!b.is_zero());
+        if a.cmp_ref(b) == Ordering::Less {
+            return (Nat::zero(), a.clone());
+        }
+        let one = Nat::one();
+        let mut q = Nat::zero();
+        let mut r = Nat::zero();
+        for i in (0..a.bit_len()).rev() {
+            r = r.shl(1);
+            if a.bit(i) {
+                r = r.add(&one);
+            }
+            q = q.shl(1);
+            if r.cmp_ref(b) != Ordering::Less {
+                r = r.checked_sub(b).unwrap();
+                q = q.add(&one);
+            }
+        }
+        (q, r)
+    }
+
+    fn n(s: &str) -> Nat {
+        Nat::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn knuth_matches_binary_reference() {
+        // A spread of dividend/divisor sizes, including multi-limb divisors,
+        // exact multiples, and near-boundary values.
+        let cases = [
+            (
+                "340282366920938463463374607431768211456",
+                "18446744073709551616",
+            ),
+            (
+                "123456789012345678901234567890123456789",
+                "98765432109876543210",
+            ),
+            ("100000000000000000000000000000000000000", "3"),
+            (
+                "18446744073709551617000000000000000000000",
+                "18446744073709551617",
+            ),
+            (
+                "999999999999999999999999999999999999999999",
+                "1000000000000000000001",
+            ),
+        ];
+        for (a_s, b_s) in cases.iter() {
+            let (a, b) = (n(a_s), n(b_s));
+            let (q, r) = a.div_rem(&b).unwrap();
+            let (rq, rr) = div_rem_binary(&a, &b);
+            assert_eq!(q, rq, "quotient {a_s}/{b_s}");
+            assert_eq!(r, rr, "remainder {a_s}/{b_s}");
+            // Reconstruction and range.
+            assert_eq!(q.mul(&b).add(&r), a);
+            assert!(r.cmp_ref(&b) == Ordering::Less);
+        }
+    }
+
+    #[test]
+    fn knuth_stress_products() {
+        // Build large values and divide, checking the identity and the
+        // multi-limb divisor path (10^k has many limbs).
+        let ten_k = Nat::from_u64(10).pow(60); // ~200 bits, several limbs
+        let big = Nat::from_u64(7).pow(200);
+        let (q, r) = big.div_rem(&ten_k).unwrap();
+        assert_eq!(q.mul(&ten_k).add(&r), big);
+        assert!(r.cmp_ref(&ten_k) == Ordering::Less);
+
+        // Exact division: (a*b)/b == a, remainder 0.
+        let a = Nat::from_u64(3).pow(150);
+        let b = Nat::from_u64(11).pow(80);
+        let prod = a.mul(&b);
+        let (q2, r2) = prod.div_rem(&b).unwrap();
+        assert_eq!(q2, a);
+        assert!(r2.is_zero());
     }
 }

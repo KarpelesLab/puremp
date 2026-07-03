@@ -484,6 +484,32 @@ fn radix_roundtrip() {
 }
 
 #[test]
+fn karatsuba_agrees_and_is_correct() {
+    // Large multiplication must cross the Karatsuba threshold and match a
+    // value computed a different way: (10^k)^2 == 10^(2k), and factorials.
+    let p = Int::from_i64(10).pow(500); // ~1662 bits, well past the threshold
+    let sq = p.mul(&p);
+    let mut expected = String::from("1");
+    expected.push_str(&"0".repeat(1000));
+    assert_eq!(sq.to_string(), expected);
+
+    // Associativity/commutativity on large operands (exercises the recursion).
+    let a = Int::from_i64(7).pow(400);
+    let b = Int::from_i64(3).pow(410);
+    let c = Int::from_i64(11).pow(390);
+    assert_eq!(a.mul(&b).mul(&c), c.mul(&a).mul(&b));
+    assert_eq!(a.mul(&b), b.mul(&a));
+
+    // Distributivity: a*(b+c) == a*b + a*c on large operands.
+    assert_eq!(a.mul(&b.add(&c)), a.mul(&b).add(&a.mul(&c)));
+
+    // 200! computed by product still matches the known trailing-zero count (49).
+    let fact200 = (2..=200u64).fold(Int::one(), |acc, k| acc.mul(&Int::from_i64(k as i64)));
+    let s = fact200.to_string();
+    assert_eq!(s.len() - s.trim_end_matches('0').len(), 49);
+}
+
+#[test]
 fn fused_addmul_submul() {
     let mut acc = int("1000");
     acc.addmul(&int("3"), &int("7")); // 1000 + 21

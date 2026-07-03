@@ -270,3 +270,31 @@ fn inverse_hyperbolics_match_f64() {
     // Domain errors.
     assert!(from_i64(0, p).acosh(p, n).is_nan()); // acosh(0) undefined
 }
+
+#[test]
+fn shortest_decimal_round_trips() {
+    let n = RoundingMode::Nearest;
+    // Values built from f64 must produce a short string that round-trips.
+    for &x in &[1.5f64, 0.1, -0.25, 123.0, 0.001, 1000000.0, -12.5, 6.022e5] {
+        let f = Float::from_f64(x, 53, n);
+        let s = f.to_shortest_string();
+        let back: Rational = s.parse().unwrap();
+        assert_eq!(
+            Float::from_rational(&back, 53, n),
+            f,
+            "shortest {s} for {x} must round-trip"
+        );
+    }
+    // Exact small values are minimal.
+    assert_eq!(Float::from_f64(1.5, 53, n).to_shortest_string(), "1.5");
+    assert_eq!(Float::from_f64(-0.25, 53, n).to_shortest_string(), "-0.25");
+    assert_eq!(Float::from_f64(100.0, 53, n).to_shortest_string(), "100");
+    assert_eq!(Float::zero(53).to_shortest_string(), "0");
+    assert_eq!(Float::infinity(53).to_shortest_string(), "inf");
+
+    // High-precision π round-trips through its shortest form.
+    let pi = Float::pi(120, n);
+    let s = pi.to_shortest_string();
+    let back: Rational = s.parse().unwrap();
+    assert_eq!(Float::from_rational(&back, 120, n), pi);
+}

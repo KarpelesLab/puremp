@@ -21,7 +21,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::str::FromStr;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 use crate::error::{Error, Result};
 use crate::int::{Int, Sign};
@@ -457,7 +457,10 @@ impl Float {
                     exp: eb,
                 },
             ) => {
-                let guard = precision + 2;
+                // Shift so the quotient has ≥ precision + 2 bits regardless of
+                // the operands' own bit lengths (they may differ from `precision`).
+                let guard = (precision as i64 + 2 + sb.bit_len() as i64 - sa.bit_len() as i64)
+                    .max(2) as u64;
                 let num = sa.shl(guard);
                 let (mut q, r) = num.div_rem(sb).expect("divisor is non-zero");
                 if !r.is_zero() && q.is_even() {
@@ -623,6 +626,57 @@ impl Float {
         self.to_f64() as f32
     }
 
+    /// Returns the shortest decimal string that, parsed back at this value's
+    /// precision, recovers it exactly — the round-trip-minimal representation
+    /// (like `f64`'s `Display`). NaN/`±∞` render as their tokens.
+    pub fn to_shortest_string(&self) -> String {
+        match &self.repr {
+            Repr::NaN => return String::from("NaN"),
+            Repr::Inf(true) => return String::from("-inf"),
+            Repr::Inf(false) => return String::from("inf"),
+            Repr::Zero(_) => return String::from("0"),
+            Repr::Normal { .. } => {}
+        }
+        let value = self.to_rational().expect("finite non-zero");
+        let abs = value.abs();
+
+        // Decimal exponent of the leading digit: v ∈ [1, 10) with abs = v·10^e10.
+        let ten = Rational::from(Int::from_i64(10));
+        let one = Rational::ONE;
+        let mut e10 = 0i64;
+        let mut v = abs;
+        while v >= ten {
+            v = v.div(&ten);
+            e10 += 1;
+        }
+        while v < one {
+            v = v.mul(&ten);
+            e10 -= 1;
+        }
+
+        // Try 1, 2, 3, … significant digits until the string round-trips.
+        let max_digits = (self.precision as usize) / 3 + 4;
+        for d in 1..=max_digits {
+            let scale = Rational::from(Int::from_i64(10).pow((d - 1) as u32));
+            let scaled = v.mul(&scale);
+            // Round half-up to the nearest integer.
+            let m = scaled.add(&Rational::power_of_two(-1)).floor();
+            let mut ds = m.to_string();
+            let exp = e10 + (ds.len() as i64 - d as i64);
+            while ds.len() > 1 && ds.ends_with('0') {
+                ds.pop();
+            }
+            let candidate = format_plain(self.is_sign_negative(), &ds, exp);
+            if let Ok(r) = candidate.parse::<Rational>()
+                && Float::from_rational(&r, self.precision, RoundingMode::Nearest) == *self
+            {
+                return candidate;
+            }
+        }
+        // Fallback: the exact (long) decimal is guaranteed to round-trip.
+        self.to_decimal_string(max_digits as u32)
+    }
+
     /// Returns an exact, losslessly round-trippable string encoding
     /// (`[-]<significand>p<exp>@<precision>`, or `nan@p`/`[-]inf@p`/`[-]0@p`).
     /// See [`Float::from_exact_string`].
@@ -682,6 +736,35 @@ impl Float {
             }
         }
     }
+}
+
+/// Formats significant digits `ds` (no trailing zeros) as a plain decimal, where
+/// `exp` is the base-10 exponent of the leading digit.
+fn format_plain(neg: bool, ds: &str, exp: i64) -> String {
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    if exp >= 0 {
+        let ip_len = (exp + 1) as usize;
+        if ds.len() <= ip_len {
+            out.push_str(ds);
+            for _ in 0..ip_len - ds.len() {
+                out.push('0');
+            }
+        } else {
+            out.push_str(&ds[..ip_len]);
+            out.push('.');
+            out.push_str(&ds[ip_len..]);
+        }
+    } else {
+        out.push_str("0.");
+        for _ in 0..(-exp - 1) {
+            out.push('0');
+        }
+        out.push_str(ds);
+    }
+    out
 }
 
 /// `Sign` from a sign bit.

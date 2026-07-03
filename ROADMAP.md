@@ -261,8 +261,8 @@ Outside the core contract (§1); behind the `float` feature.
 - ✅ Elementary functions via Ziv's strategy: `pi`/`e`/`ln2`, `exp`/`ln`/`pow`,
   `sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`, `sinh`/`cosh`/`tanh`, and
   `asinh`/`acosh`/`atanh`.
-- ▫ Further: formal correct-rounding proofs / hard-to-round vectors, and decimal
-  shortest round-trip formatting.
+- ✅ Shortest round-tripping decimal (`to_shortest_string`) and an exact codec.
+- ▫ Further: formal correct-rounding proofs / hard-to-round test vectors.
 
 ### M9 — Polish, interop & release
 - ✅ `core::ops` coverage (value/ref/`i64`/assign) for `Int`; value/ref/assign for

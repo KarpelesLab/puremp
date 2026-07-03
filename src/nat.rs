@@ -1354,6 +1354,29 @@ impl Nat {
         }
     }
 
+    /// Deterministic Baillie–PSW probable-primality test (no RNG needed): a
+    /// strong Miller–Rabin test to base 2 plus a strong Lucas test. There are no
+    /// known counterexamples, and it is exact for all `self < 2^64`.
+    pub fn is_prime_bpsw(&self) -> bool {
+        let two = Nat::from_u64(2);
+        let three = Nat::from_u64(3);
+        if self.cmp_ref(&two) == Ordering::Less {
+            return false;
+        }
+        if self.cmp_ref(&three) != Ordering::Greater {
+            return true; // 2 or 3
+        }
+        if self.is_even() {
+            return false;
+        }
+        // A perfect square is composite and would break the Lucas D search.
+        let r = self.isqrt();
+        if r.square() == *self {
+            return false;
+        }
+        miller_rabin_witness(&two, self) && lucas_strong(self)
+    }
+
     /// Miller–Rabin probable-primality test with `rounds` random witnesses.
     ///
     /// Deterministic for the tiny cases; for larger `self` the probability of a
@@ -1396,6 +1419,121 @@ impl Nat {
         }
         true
     }
+}
+
+/// Strong Miller–Rabin test to a single witness `a` for odd `n > 2`; returns
+/// `true` if `a` is not a witness to compositeness.
+fn miller_rabin_witness(a: &Nat, n: &Nat) -> bool {
+    let one = Nat::one();
+    let n1 = n.checked_sub(&one).expect("n >= 1");
+    let s = n1.trailing_zeros();
+    let d = n1.shr(s);
+    let mut x = a.modpow(&d, n);
+    if x == one || x == n1 {
+        return true;
+    }
+    for _ in 1..s {
+        x = x.square().div_rem(n).expect("non-zero").1;
+        if x == n1 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Jacobi symbol `(d/n)` for odd `n > 0`.
+fn jacobi(d: &crate::int::Int, n: &Nat) -> i32 {
+    let mut a = d.rem_euclid(&crate::int::Int::from(n.clone())).magnitude();
+    let mut m = n.clone();
+    let mut result = 1i32;
+    let lo = |x: &Nat| x.limbs.first().copied().unwrap_or(0);
+    while !a.is_zero() {
+        while a.is_even() {
+            a = a.shr(1);
+            let r = lo(&m) & 7;
+            if r == 3 || r == 5 {
+                result = -result;
+            }
+        }
+        core::mem::swap(&mut a, &mut m);
+        if lo(&a) & 3 == 3 && lo(&m) & 3 == 3 {
+            result = -result;
+        }
+        a = a.div_rem(&m).expect("m non-zero").1;
+    }
+    if m.is_one() { result } else { 0 }
+}
+
+/// Strong Lucas probable-primality test with Selfridge parameters, for odd
+/// `n > 3` that is not a perfect square.
+fn lucas_strong(n: &Nat) -> bool {
+    use crate::int::Int;
+
+    // Selfridge D: first of 5, −7, 9, −11, … with (D/n) == −1.
+    let mut d_val: i64 = 5;
+    loop {
+        let j = jacobi(&Int::from_i64(d_val), n);
+        if j == -1 {
+            break;
+        }
+        if j == 0 {
+            // gcd(D, n) > 1: a proper factor means composite, but if n divides D
+            // (only possible for tiny n) skip to the next candidate.
+            let g = Nat::from_u64(d_val.unsigned_abs()).gcd(n);
+            if g.cmp_ref(n) != Ordering::Equal {
+                return false;
+            }
+        }
+        d_val = if d_val > 0 { -(d_val + 2) } else { -d_val + 2 };
+    }
+    let d = Int::from_i64(d_val);
+    let p = Int::ONE;
+    let q = Int::ONE.sub(&d).div_trunc(&Int::from_i64(4)); // (1 − D)/4, exact
+
+    let modn = Int::from(n.clone());
+    let two = Int::from_i64(2);
+    let half_mod = |x: &Int| -> Int {
+        let xm = x.rem_euclid(&modn).magnitude();
+        if xm.is_even() {
+            Int::from(xm.shr(1))
+        } else {
+            Int::from(xm.add(n).shr(1))
+        }
+    };
+
+    // n + 1 = dd · 2^s, dd odd.
+    let np1 = n.add(&Nat::one());
+    let s = np1.trailing_zeros();
+    let dd = np1.shr(s);
+
+    // Build U_dd, V_dd via the Lucas doubling chain over the bits of dd.
+    let mut u = Int::ONE;
+    let mut v = p.clone();
+    let mut qk = q.rem_euclid(&modn);
+    for i in (0..dd.bit_len().saturating_sub(1)).rev() {
+        u = u.mul(&v).rem_euclid(&modn);
+        v = v.mul(&v).sub(&two.mul(&qk)).rem_euclid(&modn);
+        qk = qk.mul(&qk).rem_euclid(&modn);
+        if dd.bit(i) {
+            let u_new = half_mod(&p.mul(&u).add(&v));
+            let v_new = half_mod(&d.mul(&u).add(&v));
+            u = u_new.rem_euclid(&modn);
+            v = v_new.rem_euclid(&modn);
+            qk = qk.mul(&q).rem_euclid(&modn);
+        }
+    }
+
+    if u.is_zero() || v.is_zero() {
+        return true;
+    }
+    for _ in 1..s {
+        v = v.mul(&v).sub(&two.mul(&qk)).rem_euclid(&modn);
+        qk = qk.mul(&qk).rem_euclid(&modn);
+        if v.is_zero() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Binary GCD on two machine words.
@@ -1645,6 +1783,33 @@ mod tests {
             assert_eq!(r_bz, r_kn, "BZ remainder mismatch");
             assert_eq!(q_bz.mul(&b).add(&r_bz), a);
             assert!(r_bz.cmp_ref(&b) == Ordering::Less);
+        }
+    }
+
+    #[test]
+    fn bpsw_matches_trial_division() {
+        fn trial(n: u64) -> bool {
+            if n < 2 {
+                return false;
+            }
+            let mut i = 2u64;
+            while i * i <= n {
+                if n.is_multiple_of(i) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        for n in 0u64..3000 {
+            assert_eq!(Nat::from_u64(n).is_prime_bpsw(), trial(n), "bpsw {n}");
+        }
+        // Large primes, a Mersenne prime, composites, and Carmichael numbers.
+        assert!(n("1000000007").is_prime_bpsw());
+        assert!(n("170141183460469231731687303715884105727").is_prime_bpsw()); // 2^127 − 1
+        assert!(!n("1000000005").is_prime_bpsw());
+        for c in ["561", "1105", "1729", "2465", "2821", "6601", "62745"] {
+            assert!(!n(c).is_prime_bpsw(), "carmichael {c}");
         }
     }
 

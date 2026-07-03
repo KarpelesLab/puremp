@@ -522,6 +522,11 @@ impl Int {
         Some(x.rem_euclid(modulus))
     }
 
+    /// Deterministic Baillie–PSW primality test (`false` for `self < 2`).
+    pub fn is_prime_bpsw(&self) -> bool {
+        !self.is_negative() && self.magnitude().is_prime_bpsw()
+    }
+
     /// Returns the smallest prime strictly greater than `self` (at least 2).
     pub fn next_prime(&self, rng: &mut impl crate::random::RandomSource) -> Int {
         if self < &Int::from_i64(2) {

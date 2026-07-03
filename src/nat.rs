@@ -33,6 +33,109 @@ const TOOM3_THRESHOLD: usize = 128;
 /// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
 const LEHMER_THRESHOLD: usize = 16;
 
+/// Divisors with at least this many limbs use Burnikel–Ziegler recursive
+/// division; smaller ones use Knuth Algorithm D directly.
+const BZ_THRESHOLD: usize = 64;
+
+/// Recursion base case (in half-block limbs) for Burnikel–Ziegler.
+const BZ_BASE: usize = 32;
+
+/// Extracts block `i` (limbs `[i·n, (i+1)·n)`) of `x` as a [`Nat`].
+fn bz_block(x: &Nat, i: usize, n: usize) -> Nat {
+    let lo = i * n;
+    let l = x.limbs.len();
+    if lo >= l {
+        Nat::zero()
+    } else {
+        Nat::from_limbs(&x.limbs[lo..(lo + n).min(l)])
+    }
+}
+
+/// Burnikel–Ziegler top level: normalize the divisor, then process the dividend
+/// in `n`-limb blocks from the top, dividing each `≤ 2n`-limb window. Requires
+/// `a > b` and `b.limbs.len() >= 2`.
+fn bz_div_rem(a: &Nat, b: &Nat) -> (Nat, Nat) {
+    let n = b.limbs.len();
+    let s = b.limbs[n - 1].leading_zeros() as u64;
+    let bn = b.shl(s);
+    let an = a.shl(s);
+    let nbits = n as u64 * LIMB_BITS as u64;
+    let t = an.limbs.len().div_ceil(n).max(2);
+
+    let mut r = Nat::zero();
+    let mut parts: Vec<Nat> = Vec::with_capacity(t);
+    for i in (0..t).rev() {
+        let cur = r.shl(nbits).add(&bz_block(&an, i, n));
+        let (qi, ri) = bz_div_2n_1n(&cur, &bn, n);
+        parts.push(qi);
+        r = ri;
+    }
+    let mut q = Nat::zero();
+    for (j, part) in parts.into_iter().enumerate() {
+        q = q.add(&part.shl((t - 1 - j) as u64 * nbits));
+    }
+    (q, r.shr(s))
+}
+
+/// Divide a `≤ 2n`-limb value by the `n`-limb normalized divisor `b`
+/// (`quotient < 2^(64n)`).
+fn bz_div_2n_1n(a: &Nat, b: &Nat, n: usize) -> (Nat, Nat) {
+    if a.cmp_ref(b) == Ordering::Less {
+        return (Nat::zero(), a.clone());
+    }
+    if n < BZ_BASE || n % 2 == 1 {
+        if a.cmp_ref(b) == Ordering::Equal {
+            return (Nat::one(), Nat::zero());
+        }
+        if b.limbs.len() == 1 {
+            let (q, rr) = a.divmod_small(b.limbs[0]);
+            return (q, Nat::from_u64(rr));
+        }
+        return a.div_rem_knuth(b);
+    }
+    let half = n / 2;
+    let hbits = half as u64 * LIMB_BITS as u64;
+    let (q1, r1) = bz_div_3n_2n(&a.shr(hbits), b, half);
+    let (q2, r2) = bz_div_3n_2n(&r1.shl(hbits).add(&a.low_bits(hbits)), b, half);
+    (q1.shl(hbits).add(&q2), r2)
+}
+
+/// Divide a `≤ 3·half`-limb value by the `2·half`-limb normalized divisor `b`.
+fn bz_div_3n_2n(a: &Nat, b: &Nat, half: usize) -> (Nat, Nat) {
+    use crate::int::Int;
+    let hbits = half as u64 * LIMB_BITS as u64;
+    let b1 = b.shr(hbits);
+    let b2 = b.low_bits(hbits);
+    let a12 = a.shr(hbits);
+    let a3 = a.low_bits(hbits);
+
+    let (q_nat, r_pre): (Nat, Int) = if a12.shr(hbits).cmp_ref(&b1) == Ordering::Less {
+        let (q, r) = bz_div_2n_1n(&a12, &b1, half);
+        (q, Int::from(r))
+    } else {
+        // q = 2^(64·half) − 1; R = A12 − q·B1.
+        let q = Nat::one()
+            .shl(hbits)
+            .checked_sub(&Nat::one())
+            .expect("2^k >= 1");
+        let r = Int::from(a12).sub(&Int::from(q.mul(&b1)));
+        (q, r)
+    };
+
+    // R = R·2^(64·half) + A3 − q·B2, corrected to be non-negative.
+    let mut r_int = r_pre
+        .mul_2k(hbits as u32)
+        .add(&Int::from(a3))
+        .sub(&Int::from(q_nat.mul(&b2)));
+    let mut q_int = Int::from(q_nat);
+    let b_int = Int::from(b.clone());
+    while r_int.is_negative() {
+        q_int = q_int.sub(&Int::ONE);
+        r_int = r_int.add(&b_int);
+    }
+    (q_int.magnitude(), r_int.magnitude())
+}
+
 /// `s·a + t·b` as an [`Int`], for the Lehmer cofactor combination.
 fn lincomb(s: i128, a: &crate::int::Int, t: i128, b: &crate::int::Int) -> crate::int::Int {
     use crate::int::Int;
@@ -582,6 +685,9 @@ impl Nat {
             let (q, r) = self.divmod_small(rhs.limbs[0]);
             return Some((q, Nat::from_u64(r)));
         }
+        if rhs.limbs.len() >= BZ_THRESHOLD {
+            return Some(bz_div_rem(self, rhs));
+        }
         Some(self.div_rem_knuth(rhs))
     }
 
@@ -1107,6 +1213,38 @@ mod tests {
             // Reconstruction and range.
             assert_eq!(q.mul(&b).add(&r), a);
             assert!(r.cmp_ref(&b) == Ordering::Less);
+        }
+    }
+
+    #[test]
+    fn burnikel_ziegler_matches_knuth() {
+        // Differential: BZ recursive division must match Knuth Algorithm D over
+        // random large operands, and satisfy a == q·b + r with r < b.
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let build = |cnt: usize, f: &mut dyn FnMut() -> u64| {
+            let bytes: Vec<u8> = (0..cnt * 8).map(|_| f() as u8).collect();
+            Nat::from_bytes_le(&bytes)
+        };
+        for _ in 0..25 {
+            // Divisor 70–110 limbs (crosses BZ recursion), dividend larger.
+            let b = build(70 + (next() % 40) as usize, &mut next);
+            let extra = build(30 + (next() % 90) as usize, &mut next);
+            let a = b.mul(&extra).add(&build(40, &mut next));
+            if b.is_zero() || a.cmp_ref(&b) != Ordering::Greater {
+                continue;
+            }
+            let (q_bz, r_bz) = bz_div_rem(&a, &b);
+            let (q_kn, r_kn) = a.div_rem_knuth(&b);
+            assert_eq!(q_bz, q_kn, "BZ quotient mismatch");
+            assert_eq!(r_bz, r_kn, "BZ remainder mismatch");
+            assert_eq!(q_bz.mul(&b).add(&r_bz), a);
+            assert!(r_bz.cmp_ref(&b) == Ordering::Less);
         }
     }
 

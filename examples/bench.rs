@@ -43,7 +43,7 @@ fn main() {
 
     // Division (Knuth Algorithm D).
     let prod = big.mul(&big2);
-    bench("div (Knuth-D) large/large", 5, || prod.div_rem(&big));
+    bench("div large/large (BZ)", 5, || prod.div_rem(&big));
 
     // GCD (binary), on coprime-ish large operands.
     bench("gcd ~large", 20, || big.gcd(&big2));

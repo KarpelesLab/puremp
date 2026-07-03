@@ -764,3 +764,38 @@ fn reciprocal_reduce() {
         assert_eq!(r.reduce(&big), big.div_rem(&m).unwrap().1);
     }
 }
+
+#[test]
+fn combinatorics() {
+    assert_eq!(Int::factorial(0).to_string(), "1");
+    assert_eq!(Int::factorial(10).to_string(), "3628800");
+    assert_eq!(Int::factorial(25).to_string(), "15511210043330985984000000");
+
+    assert_eq!(Int::binomial(10, 3).to_string(), "120");
+    assert_eq!(Int::binomial(52, 5).to_string(), "2598960");
+    assert_eq!(Int::binomial(5, 8).to_string(), "0");
+    assert_eq!(
+        Int::binomial(100, 50).to_string(),
+        "100891344545564193334812497256"
+    );
+    // symmetry
+    assert_eq!(Int::binomial(30, 7), Int::binomial(30, 23));
+
+    // multinomial(1,2,3) = 6!/(1!2!3!) = 60
+    assert_eq!(Int::multinomial(&[1, 2, 3]).to_string(), "60");
+    assert_eq!(Int::multinomial(&[2, 2, 2]).to_string(), "90"); // 6!/(2!2!2!)
+
+    // Fibonacci / Lucas
+    assert_eq!(Int::fibonacci(0).to_string(), "0");
+    assert_eq!(Int::fibonacci(10).to_string(), "55");
+    assert_eq!(Int::fibonacci(100).to_string(), "354224848179261915075");
+    assert_eq!(Int::lucas(0).to_string(), "2");
+    assert_eq!(Int::lucas(10).to_string(), "123");
+    // Identity: L(n) = F(n-1) + F(n+1)
+    for n in 1..40u64 {
+        assert_eq!(
+            Int::lucas(n),
+            Int::fibonacci(n - 1).add(&Int::fibonacci(n + 1))
+        );
+    }
+}

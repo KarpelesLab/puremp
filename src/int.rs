@@ -871,6 +871,70 @@ fn mask_to_width(v: &mut [u64], width: u32) {
     }
 }
 
+/// `(F(n), F(n+1))` by fast doubling.
+fn fib_pair(n: u64) -> (Int, Int) {
+    if n == 0 {
+        return (Int::ZERO, Int::ONE);
+    }
+    let (a, b) = fib_pair(n >> 1); // (F(k), F(k+1)), k = n >> 1
+    let c = a.mul(&b.mul_2k(1).sub(&a)); // F(2k)   = F(k)·(2·F(k+1) − F(k))
+    let d = a.square().add(&b.square()); // F(2k+1) = F(k)² + F(k+1)²
+    if n & 1 == 0 {
+        (c, d)
+    } else {
+        let next = c.add(&d);
+        (d, next)
+    }
+}
+
+impl Int {
+    /// Returns `n!` (`0! == 1! == 1`).
+    pub fn factorial(n: u64) -> Int {
+        let mut acc = Int::ONE;
+        for k in 2..=n {
+            acc = acc.mul(&Int::from(k));
+        }
+        acc
+    }
+
+    /// Returns the binomial coefficient `C(n, k)` (`0` if `k > n`).
+    pub fn binomial(n: u64, k: u64) -> Int {
+        if k > n {
+            return Int::ZERO;
+        }
+        let k = k.min(n - k);
+        let mut result = Int::ONE;
+        for i in 1..=k {
+            // Each intermediate C(n-k+i, i) is an integer, so the division exact.
+            result = result.mul(&Int::from(n - k + i)).div_exact(&Int::from(i));
+        }
+        result
+    }
+
+    /// Returns the multinomial coefficient `(Σkᵢ)! / ∏(kᵢ!)`.
+    pub fn multinomial(ks: &[u64]) -> Int {
+        let mut total = 0u64;
+        let mut result = Int::ONE;
+        for &k in ks {
+            total += k;
+            result = result.mul(&Int::binomial(total, k));
+        }
+        result
+    }
+
+    /// Returns the `n`th Fibonacci number `F(n)` (`F(0) = 0`, `F(1) = 1`), by
+    /// fast doubling.
+    pub fn fibonacci(n: u64) -> Int {
+        fib_pair(n).0
+    }
+
+    /// Returns the `n`th Lucas number `L(n)` (`L(0) = 2`, `L(1) = 1`).
+    pub fn lucas(n: u64) -> Int {
+        let (f_n, f_n1) = fib_pair(n);
+        f_n1.mul_2k(1).sub(&f_n) // L(n) = 2·F(n+1) − F(n)
+    }
+}
+
 impl PartialOrd for Int {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

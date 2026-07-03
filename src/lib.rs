@@ -94,6 +94,9 @@ pub mod complex;
 #[cfg(feature = "poly")]
 pub mod poly;
 
+#[cfg(feature = "matrix")]
+pub mod matrix;
+
 #[cfg(feature = "float")]
 pub mod float;
 
@@ -137,6 +140,9 @@ pub use complex::Complex;
 
 #[cfg(feature = "poly")]
 pub use poly::Poly;
+
+#[cfg(feature = "matrix")]
+pub use matrix::Matrix;
 
 #[cfg(feature = "float")]
 pub use fixed_float::FixedFloat;

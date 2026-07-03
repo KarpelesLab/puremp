@@ -28,7 +28,7 @@ name = "puremp"
 # `float` is a separable layer (not part of the core contract, see ROADMAP.md
 # §1) but is enabled by default for convenience; disable it with
 # `--no-default-features` (optionally re-enabling `rational`/`cli`).
-default = ["std", "rational", "float", "dyadic", "decimal", "complex", "poly", "interval", "cli"]
+default = ["std", "rational", "float", "dyadic", "decimal", "complex", "poly", "interval", "matrix", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -47,6 +47,8 @@ decimal = ["int"]
 complex = ["int"]
 # Generic polynomials (`Poly<T>`) over any ring/field component type.
 poly = ["alloc"]
+# Generic dense matrices (`Matrix<T>`); exact determinant for Int/Rational.
+matrix = ["alloc"]
 # Optional arbitrary-precision binary floats (`Float`) with directed rounding,
 # aiming at MPFR-class correct rounding. Built on `Int`/`Rational` (decimal I/O
 # reuses exact rationals), but NOT part of the integer/rational core contract.

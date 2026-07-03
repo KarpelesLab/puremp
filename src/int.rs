@@ -498,6 +498,30 @@ impl Int {
         Int::from(reduced.mul(&mb))
     }
 
+    /// Returns `self^exp mod modulus`, a non-negative value in `[0, |modulus|)`.
+    /// Panics if `exp` is negative (use [`Int::modinv`] first) or `modulus` is
+    /// zero.
+    pub fn modpow(&self, exp: &Int, modulus: &Int) -> Int {
+        assert!(!exp.is_negative(), "modpow: negative exponent");
+        assert!(!modulus.is_zero(), "modpow: zero modulus");
+        let m = modulus.magnitude();
+        let base = self.rem_euclid(modulus).magnitude(); // in [0, |m|)
+        Int::from(base.modpow(&exp.magnitude(), &m))
+    }
+
+    /// Returns the modular inverse of `self` mod `modulus` (in `[0, |modulus|)`),
+    /// or `None` if `self` is not invertible (`gcd(self, modulus) != 1`).
+    pub fn modinv(&self, modulus: &Int) -> Option<Int> {
+        if modulus.is_zero() {
+            return None;
+        }
+        let (g, x, _) = self.extended_gcd(modulus);
+        if !g.is_one() {
+            return None;
+        }
+        Some(x.rem_euclid(modulus))
+    }
+
     /// Extended GCD: returns `(g, x, y)` with `g == self·x + b·y` and `g ≥ 0`.
     pub fn extended_gcd(&self, b: &Int) -> (Int, Int, Int) {
         let (mut old_r, mut r) = (self.clone(), b.clone());

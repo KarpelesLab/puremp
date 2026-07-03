@@ -223,9 +223,9 @@ Truncated, Euclidean, and floored `div_*`/`rem_*`/`div_rem_*`; `div_exact`;
 `bitand`/`bitor`/`bitxor`/`bitnot(width)`, truth-table tested.
 
 ### M4 — Number theory & roots ✅
-`gcd`/`lcm`/`extended_gcd`; free `u_gcd`/`u64_gcd`; `sqrt_exact`/`nth_root_exact`.
-- ▫ Later: modular arithmetic (Barrett/Montgomery), modpow, primality — for
-  downstream crypto users, beyond the spec's core.
+`gcd`/`lcm`/`extended_gcd`; free `u_gcd`/`u64_gcd`; `sqrt_exact`/`nth_root_exact`;
+`modpow`, `modinv`, and Miller–Rabin `is_probable_prime`.
+- ▫ Later: Barrett/Montgomery reduction to speed up `modpow`; `next_prime`.
 
 ### M5 — Radix & string I/O, bounded conversions ✅
 `from_str_radix`/`write_radix`; decimal `FromStr`/`Display`; `fits_i64`/

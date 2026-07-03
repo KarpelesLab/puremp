@@ -617,3 +617,66 @@ fn square_matches_mul() {
     let n = nat("123456789012345678901234567890").pow(20);
     assert_eq!(n.square(), n.mul(&n));
 }
+
+#[test]
+fn modular_arithmetic() {
+    // modpow
+    assert_eq!(int("2").modpow(&int("10"), &int("1000")).to_string(), "24"); // 1024 mod 1000
+    assert_eq!(int("3").modpow(&int("0"), &int("7")).to_string(), "1");
+    // Fermat: a^(p-1) ≡ 1 (mod p) for prime p, gcd(a,p)=1.
+    let p = int("1000000007");
+    assert_eq!(int("123456").modpow(&p.sub(&int("1")), &p).to_string(), "1");
+    // Big modular exponentiation.
+    let big = int("2").modpow(&int("1000000"), &int("999999999999999999999"));
+    assert!(big >= Int::ZERO && big < int("999999999999999999999"));
+
+    // modular inverse
+    assert_eq!(int("3").modinv(&int("11")).unwrap().to_string(), "4"); // 3*4=12≡1
+    assert!(int("6").modinv(&int("9")).is_none()); // gcd(6,9)=3
+    let inv = int("123456789").modinv(&p).unwrap();
+    assert_eq!(int("123456789").mul(&inv).rem_euclid(&p).to_string(), "1");
+
+    // negative base reduces correctly
+    assert_eq!(int("-1").modpow(&int("3"), &int("5")).to_string(), "4"); // (-1)^3 = -1 ≡ 4
+}
+
+#[test]
+fn primality_testing() {
+    use puremp::RandomSource;
+    struct Lcg(u64);
+    impl RandomSource for Lcg {
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for b in dest.iter_mut() {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (self.0 >> 33) as u8;
+            }
+        }
+    }
+    let mut rng = Lcg(0xdeadbeef);
+    let is_prime = |s: &str, rng: &mut Lcg| nat(s).is_probable_prime(40, rng);
+
+    for p in [
+        "2",
+        "3",
+        "5",
+        "97",
+        "1000000007",
+        "170141183460469231731687303715884105727",
+    ] {
+        assert!(is_prime(p, &mut rng), "{p} should be prime");
+    }
+    for c in [
+        "1",
+        "4",
+        "100",
+        "1000000009000000000",
+        "170141183460469231731687303715884105721",
+    ] {
+        assert!(!is_prime(c, &mut rng), "{c} should be composite");
+    }
+    // A Carmichael number (561 = 3·11·17) must be caught by Miller–Rabin.
+    assert!(!nat("561").is_probable_prime(40, &mut rng));
+}

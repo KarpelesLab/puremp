@@ -1188,6 +1188,74 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
     Ok(n)
 }
 
+impl Nat {
+    /// Returns `self^exp mod modulus` by square-and-multiply with reduction
+    /// after each step. Panics if `modulus` is zero.
+    ///
+    /// (Barrett/Montgomery reduction would speed this up; see `ROADMAP.md`.)
+    pub fn modpow(&self, exp: &Nat, modulus: &Nat) -> Nat {
+        assert!(!modulus.is_zero(), "modpow: zero modulus");
+        if modulus.is_one() {
+            return Nat::zero();
+        }
+        let mut result = Nat::one();
+        let mut base = self.div_rem(modulus).expect("non-zero modulus").1;
+        let bits = exp.bit_len();
+        for i in 0..bits {
+            if exp.bit(i) {
+                result = result.mul(&base).div_rem(modulus).expect("non-zero").1;
+            }
+            if i + 1 < bits {
+                base = base.square().div_rem(modulus).expect("non-zero").1;
+            }
+        }
+        result
+    }
+
+    /// Miller–Rabin probable-primality test with `rounds` random witnesses.
+    ///
+    /// Deterministic for the tiny cases; for larger `self` the probability of a
+    /// composite passing is at most `4^-rounds`.
+    pub fn is_probable_prime(
+        &self,
+        rounds: u32,
+        rng: &mut impl crate::random::RandomSource,
+    ) -> bool {
+        let two = Nat::from_u64(2);
+        let three = Nat::from_u64(3);
+        if self.cmp_ref(&two) == Ordering::Less {
+            return false;
+        }
+        if self.cmp_ref(&three) != Ordering::Greater {
+            return true; // 2 or 3
+        }
+        if self.is_even() {
+            return false;
+        }
+        let one = Nat::one();
+        let n1 = self.checked_sub(&one).expect("self >= 1");
+        let s = n1.trailing_zeros();
+        let d = n1.shr(s);
+        let n3 = self.checked_sub(&three).expect("self >= 3");
+
+        'witness: for _ in 0..rounds {
+            let a = two.add(&Nat::random_below(&n3, rng).unwrap_or_else(Nat::zero));
+            let mut x = a.modpow(&d, self);
+            if x == one || x == n1 {
+                continue;
+            }
+            for _ in 1..s {
+                x = x.square().div_rem(self).expect("non-zero").1;
+                if x == n1 {
+                    continue 'witness;
+                }
+            }
+            return false; // definitely composite
+        }
+        true
+    }
+}
+
 /// Binary GCD on two machine words.
 pub fn u64_gcd(mut u: u64, mut v: u64) -> u64 {
     if u == 0 {

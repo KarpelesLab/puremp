@@ -256,3 +256,17 @@ fn more_transcendentals_match_f64() {
     let half = Float::from_rational(&Rational::new(Int::ONE, Int::from_i64(2)), p, n);
     assert!((approx(two.pow(&half, p, n)) - core::f64::consts::SQRT_2).abs() < 1e-15);
 }
+
+#[test]
+fn inverse_hyperbolics_match_f64() {
+    let p = 60;
+    let n = RoundingMode::Nearest;
+    let a = |f: Float| f.to_f64();
+    let x = Float::from_rational(&Rational::new(Int::from_i64(3), Int::from_i64(5)), p, n); // 0.6
+    assert!((a(x.asinh(p, n)) - 0.6f64.asinh()).abs() < 1e-15);
+    assert!((a(x.atanh(p, n)) - 0.6f64.atanh()).abs() < 1e-15);
+    let two = from_i64(2, p);
+    assert!((a(two.acosh(p, n)) - 2.0f64.acosh()).abs() < 1e-15);
+    // Domain errors.
+    assert!(from_i64(0, p).acosh(p, n).is_nan()); // acosh(0) undefined
+}

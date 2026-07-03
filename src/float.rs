@@ -1129,6 +1129,51 @@ impl Float {
         })
     }
 
+    /// Returns `asinh(self) = ln(self + √(self² + 1))`, correctly rounded.
+    pub fn asinh(&self, precision: u64, mode: RoundingMode) -> Float {
+        if !self.is_finite() {
+            return self.clone().round(precision, mode);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| {
+            let one = Float::from_int(&Int::ONE, w, NEAR);
+            let xr = x.round(w, NEAR);
+            let root = xr.mul(&xr, w, NEAR).add(&one, w, NEAR).sqrt(w, NEAR);
+            xr.add(&root, w, NEAR).ln(w, NEAR)
+        })
+    }
+
+    /// Returns `acosh(self) = ln(self + √(self² − 1))` for `self ≥ 1` (else
+    /// `NaN`), correctly rounded.
+    pub fn acosh(&self, precision: u64, mode: RoundingMode) -> Float {
+        if self.is_nan() {
+            return Float::nan(precision);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| {
+            let one = Float::from_int(&Int::ONE, w, NEAR);
+            let xr = x.round(w, NEAR);
+            // √(x²−1) is NaN for x < 1, so the result is NaN there.
+            let root = xr.mul(&xr, w, NEAR).sub(&one, w, NEAR).sqrt(w, NEAR);
+            xr.add(&root, w, NEAR).ln(w, NEAR)
+        })
+    }
+
+    /// Returns `atanh(self) = ½·ln((1 + self)/(1 − self))` for `|self| < 1`
+    /// (else `±∞`/`NaN`), correctly rounded.
+    pub fn atanh(&self, precision: u64, mode: RoundingMode) -> Float {
+        if !self.is_finite() {
+            return Float::nan(precision);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| {
+            let one = Float::from_int(&Int::ONE, w, NEAR);
+            let xr = x.round(w, NEAR);
+            let ratio = one.add(&xr, w, NEAR).div(&one.sub(&xr, w, NEAR), w, NEAR);
+            ratio.ln(w, NEAR).scale_pow2(-1)
+        })
+    }
+
     /// Sign as `i64` (`-1`/`0`/`1`), for internal use.
     fn signum_i(&self) -> i64 {
         match self.sign() {

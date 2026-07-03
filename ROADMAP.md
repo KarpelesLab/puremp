@@ -257,10 +257,11 @@ Outside the core contract (§1); behind the `float` feature.
   with the MPFR ternary flag (`*_ternary`).
 - ✅ `from_f64`/`from_f32`/`to_f64`/`to_f32`, `from_rational`/`to_rational`,
   `FromStr`, `to_decimal_string`, and an exact `to`/`from_exact_string` codec.
-- ✅ Transcendentals via Ziv's strategy: `pi`/`e`/`ln2`, `exp`, `ln`, `sin`,
-  `cos`, `tan`, `atan`.
-- ▫ Further: correct-rounding proofs / hard-to-round vectors, decimal shortest
-  round-trip, and the remaining elementary functions (`asin`/`acosh`/…).
+- ✅ Elementary functions via Ziv's strategy: `pi`/`e`/`ln2`, `exp`/`ln`/`pow`,
+  `sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`, `sinh`/`cosh`/`tanh`, and
+  `asinh`/`acosh`/`atanh`.
+- ▫ Further: formal correct-rounding proofs / hard-to-round vectors, and decimal
+  shortest round-trip formatting.
 
 ### M9 — Polish, interop & release
 - ✅ `core::ops` coverage (value/ref/`i64`/assign) for `Int`; value/ref/assign for

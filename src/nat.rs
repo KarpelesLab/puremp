@@ -20,23 +20,25 @@ use alloc::vec::Vec;
 use crate::error::{Error, Result};
 use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 
-/// Operands with fewer than this many limbs use schoolbook multiplication;
-/// larger ones recurse via Karatsuba. Chosen conservatively; a tuned crossover
-/// is a later milestone (see `ROADMAP.md`).
-const KARATSUBA_THRESHOLD: usize = 32;
+// Multiplication crossovers, tuned from `measure_mul_crossovers` (see the test
+// module). The schoolbook loop is fast, so Karatsuba only pays off past ~160
+// limbs, and the NTT's `u128 % p` reduction keeps it slower than Toom-4 until
+// several thousand limbs. Re-measure per platform to retune.
 
-/// Operands with at least this many limbs use Toom-3 (above Karatsuba). Chosen
-/// conservatively; a tuned crossover is a later milestone.
-const TOOM3_THRESHOLD: usize = 128;
+/// Operands with fewer than this many limbs use schoolbook multiplication.
+const KARATSUBA_THRESHOLD: usize = 160;
+
+/// Operands with at least this many limbs use Toom-3 (above Karatsuba).
+const TOOM3_THRESHOLD: usize = 256;
 
 /// Operands with at least this many limbs use Toom-4 (above Toom-3).
-const TOOM4_THRESHOLD: usize = 320;
+const TOOM4_THRESHOLD: usize = 448;
 
 /// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
 const LEHMER_THRESHOLD: usize = 16;
 
 /// Operands with at least this many limbs use NTT multiplication (above Toom-4).
-const NTT_THRESHOLD: usize = 1600;
+const NTT_THRESHOLD: usize = 6000;
 
 // --- Number-theoretic transform over the Goldilocks field 2^64 − 2^32 + 1 ---
 //
@@ -1919,6 +1921,71 @@ mod tests {
             assert_eq!(q_bz.mul(&b).add(&r_bz), a);
             assert!(r_bz.cmp_ref(&b) == Ordering::Less);
         }
+    }
+
+    #[test]
+    #[ignore = "measurement only: cargo test -- --ignored --nocapture measure_mul"]
+    fn measure_mul_crossovers() {
+        use std::time::Instant;
+        let mkbig = |limbs: usize| -> Nat {
+            let bytes: Vec<u8> = (0..limbs * 8)
+                .map(|i| (i * 2654435761usize) as u8)
+                .collect();
+            Nat::from_bytes_le(&bytes)
+        };
+        let bench = |f: &dyn Fn() -> Nat| {
+            let mut r = f();
+            let t = Instant::now();
+            for _ in 0..7 {
+                r = f();
+            }
+            let _ = r.limbs.len();
+            t.elapsed() / 7
+        };
+        for &sz in &[
+            48usize, 96, 160, 224, 320, 448, 640, 1024, 1600, 4000, 8000, 16000,
+        ] {
+            let a = mkbig(sz);
+            let b = mkbig(sz + 1);
+            let school = if sz <= 2000 {
+                bench(&|| a.mul_schoolbook(&b))
+            } else {
+                Default::default()
+            };
+            let kara = bench(&|| a.mul_karatsuba(&b));
+            let t3 = bench(&|| a.mul_toom3(&b));
+            let t4 = bench(&|| a.mul_toom4(&b));
+            let ntt = bench(&|| mul_ntt(&a, &b));
+            std::println!(
+                "sz={sz:<6} school={school:>11?} kara={kara:>11?} toom3={t3:>11?} toom4={t4:>11?} ntt={ntt:>11?}"
+            );
+        }
+    }
+
+    #[test]
+    fn toom_direct_matches_schoolbook() {
+        // Exercise the Toom-3 and Toom-4 code paths directly (independent of the
+        // dispatch thresholds), differentially against schoolbook.
+        let mk = |limbs: usize, seed: u64| {
+            let mut s = seed;
+            let bytes: Vec<u8> = (0..limbs * 8)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s as u8
+                })
+                .collect();
+            Nat::from_bytes_le(&bytes)
+        };
+        let (a3, b3) = (mk(300, 1), mk(280, 2));
+        assert_eq!(a3.mul_toom3(&b3), a3.mul_schoolbook(&b3));
+        let (a4, b4) = (mk(500, 3), mk(470, 4));
+        assert_eq!(a4.mul_toom4(&b4), a4.mul_schoolbook(&b4));
+        // Odd/unbalanced sizes.
+        let (a5, b5) = (mk(457, 5), mk(451, 6));
+        assert_eq!(a5.mul_toom4(&b5), a5.mul_schoolbook(&b5));
+        assert_eq!(a5.mul_toom3(&b5), a5.mul_schoolbook(&b5));
     }
 
     #[test]

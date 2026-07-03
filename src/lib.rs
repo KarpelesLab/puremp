@@ -60,6 +60,9 @@ pub mod float;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
+#[cfg(feature = "serde")]
+mod serde_impls;
+
 pub use error::{Error, Result};
 
 #[cfg(feature = "int")]

@@ -9,7 +9,7 @@ name = "puremp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A pure-Rust arbitrary-precision arithmetic library — integers, rationals and MPFR-class floats — with no foreign-code dependencies, plus a C ABI and a CLI."
+description = "A pure-Rust arbitrary-precision arithmetic library — integers, rationals and MPFR-class floats — with a dependency-free clean-room core (optional serde/rand bridges), plus a C ABI and a CLI."
 repository = "https://github.com/KarpelesLab/puremp"
 license = "MIT"
 keywords = ["bignum", "bigint", "arbitrary-precision", "rational", "no-std"]
@@ -57,11 +57,21 @@ cli = ["std", "rational"]
 # `RandomSource` trait itself needs no dependency; this only adds the bridge.
 rand = ["dep:rand_core", "int"]
 
+# Optional serde support: hand-written (no `serde_derive`) Serialize/Deserialize
+# for the number types, round-tripping via their exact string forms.
+serde = ["dep:serde", "int"]
+
 # The arithmetic core is a clean-room, dependency-free implementation (see
 # ROADMAP.md "License & provenance"); the only dependencies are optional,
 # opt-in ecosystem bridges that the default build never pulls in.
 [dependencies]
 rand_core = { version = "0.6", optional = true, default-features = false }
+serde = { version = "1", optional = true, default-features = false, features = ["alloc"] }
+
+# Test-only: exercise the `serde` impls through a real format. Not shipped to
+# consumers, and only used by the `serde`-gated tests.
+[dev-dependencies]
+serde_json = "1"
 
 [[bin]]
 name = "puremp"

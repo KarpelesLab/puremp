@@ -623,6 +623,49 @@ impl Float {
         self.to_f64() as f32
     }
 
+    /// Returns an exact, losslessly round-trippable string encoding
+    /// (`[-]<significand>p<exp>@<precision>`, or `nan@p`/`[-]inf@p`/`[-]0@p`).
+    /// See [`Float::from_exact_string`].
+    pub fn to_exact_string(&self) -> String {
+        match &self.repr {
+            Repr::NaN => alloc::format!("nan@{}", self.precision),
+            Repr::Inf(neg) => {
+                alloc::format!("{}inf@{}", if *neg { "-" } else { "" }, self.precision)
+            }
+            Repr::Zero(neg) => {
+                alloc::format!("{}0@{}", if *neg { "-" } else { "" }, self.precision)
+            }
+            Repr::Normal { neg, sig, exp } => alloc::format!(
+                "{}{sig}p{exp}@{}",
+                if *neg { "-" } else { "" },
+                self.precision
+            ),
+        }
+    }
+
+    /// Parses the exact encoding produced by [`Float::to_exact_string`].
+    pub fn from_exact_string(s: &str) -> Result<Float> {
+        let (body, prec_s) = s.rsplit_once('@').ok_or(Error::Parse)?;
+        let precision: u64 = prec_s.parse().map_err(|_| Error::Parse)?;
+        let (neg, rest) = match body.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, body),
+        };
+        if rest.eq_ignore_ascii_case("nan") {
+            return Ok(Float::nan(precision));
+        }
+        if rest.eq_ignore_ascii_case("inf") {
+            return Ok(Float::inf_signed(neg, precision));
+        }
+        if rest == "0" {
+            return Ok(Float::zero_signed(neg, precision));
+        }
+        let (sig_s, exp_s) = rest.split_once('p').ok_or(Error::Parse)?;
+        let sig = Nat::from_str(sig_s)?;
+        let exp: i64 = exp_s.parse().map_err(|_| Error::Parse)?;
+        Ok(Float::round_raw(neg, sig, exp, precision, RoundingMode::Nearest).0)
+    }
+
     /// Formats the value as a fixed-point decimal string with `frac_digits`
     /// digits after the point, rounded half-up. NaN/`±∞` render as `"NaN"`,
     /// `"inf"`, `"-inf"`.

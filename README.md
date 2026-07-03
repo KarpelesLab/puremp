@@ -134,10 +134,22 @@ harness, a trusted reference — never a runtime dependency.
 (for constant-time crypto see the sibling `purecrypto` crate); drop-in GMP/MPFR
 C-header compatibility (puremp ships its own cleaner C ABI).
 
-**Known future optimizations** (correct today, just not maximally fast): a
-half-GCD for asymptotically faster `Rational` reduction; allocation-reducing
-scratch buffers in the recursive multiply/divide code; and a subresultant PRS to
-tame Sturm-sequence coefficient growth for high-degree `Algebraic` operations.
+Run `cargo run --release --example bench` for a throughput harness across the
+core operations and the derived types.
+
+**Known future optimizations** (correct today, just not maximally fast):
+
+- **`isqrt` / `nth_root_floor`** use full-precision Newton (resp. bitwise search),
+  so they perform `O(log n)` full-width divisions; a recursive *Karatsuba square
+  root* (Zimmermann's `SqrtRem`) would bring integer roots to `O(M(n))`.
+- **Burnikel–Ziegler division** bails to Knuth's Algorithm D whenever the block
+  count is odd, so a divisor whose limb count has a large odd factor bottoms out
+  on a larger-than-intended quadratic base; padding the block size to a power of
+  two would keep the recursion balanced.
+- A **half-GCD** for asymptotically faster `Rational` reduction; allocation-
+  reducing **scratch buffers** in the recursive multiply/divide code; and a
+  **subresultant PRS** to tame Sturm-sequence coefficient growth for high-degree
+  `Algebraic` operations.
 
 ## License
 

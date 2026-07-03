@@ -71,6 +71,9 @@ pub mod random;
 #[cfg(feature = "rational")]
 pub mod rational;
 
+#[cfg(feature = "rational")]
+pub mod inf_rational;
+
 #[cfg(feature = "dyadic")]
 pub mod dyadic;
 
@@ -95,6 +98,8 @@ pub use nat::{Nat, Reciprocal, u_gcd, u64_gcd};
 #[cfg(feature = "int")]
 pub use random::RandomSource;
 
+#[cfg(feature = "rational")]
+pub use inf_rational::InfRational;
 #[cfg(feature = "rational")]
 pub use rational::Rational;
 

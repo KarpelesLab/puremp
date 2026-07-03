@@ -492,6 +492,34 @@ impl Nat {
         n
     }
 
+    /// Builds a natural from little-endian bytes.
+    pub fn from_bytes_le(bytes: &[u8]) -> Nat {
+        let mut limbs = Vec::with_capacity(bytes.len() / 8 + 1);
+        for chunk in bytes.chunks(8) {
+            let mut limb: Limb = 0;
+            for (i, &b) in chunk.iter().enumerate() {
+                limb |= (b as Limb) << (8 * i);
+            }
+            limbs.push(limb);
+        }
+        let mut n = Nat { limbs };
+        n.normalize();
+        n
+    }
+
+    /// Returns the magnitude as little-endian bytes (no trailing zero bytes;
+    /// empty for zero).
+    pub fn to_bytes_le(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.limbs.len() * 8);
+        for &limb in &self.limbs {
+            out.extend_from_slice(&limb.to_le_bytes());
+        }
+        while matches!(out.last(), Some(&0)) {
+            out.pop();
+        }
+        out
+    }
+
     /// Returns the low `k` bits of this value, i.e. `self mod 2^k`.
     pub fn low_bits(&self, k: u64) -> Nat {
         if k == 0 {

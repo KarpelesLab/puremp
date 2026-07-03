@@ -530,3 +530,48 @@ fn sum_and_product_iterators() {
     let p: Int = (1..=10i64).map(Int::from_i64).product();
     assert_eq!(p.to_string(), "3628800"); // 10!
 }
+
+#[test]
+fn random_generation() {
+    use puremp::RandomSource;
+    // A tiny deterministic xorshift RNG implementing the in-house trait.
+    struct Xorshift(u64);
+    impl RandomSource for Xorshift {
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for b in dest.iter_mut() {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                *b = x as u8;
+            }
+        }
+    }
+    let mut rng = Xorshift(0x9e3779b97f4a7c15);
+
+    // random_bits stays within range.
+    for _ in 0..200 {
+        let n = Nat::random_bits(100, &mut rng);
+        assert!(n.bit_len() <= 100);
+    }
+    // random_below stays below the bound and (statistically) exercises it.
+    let bound = int("1000000000000000000000");
+    let mut max_seen = Int::ZERO;
+    for _ in 0..500 {
+        let r = Int::random_below(&bound, &mut rng).unwrap();
+        assert!(r >= Int::ZERO && r < bound);
+        if r > max_seen {
+            max_seen = r;
+        }
+    }
+    assert!(
+        max_seen > bound.div_trunc(&int("2")),
+        "distribution looks skewed"
+    );
+    assert!(Int::random_below(&Int::ZERO, &mut rng).is_none());
+
+    // byte round-trip.
+    let x = nat("123456789012345678901234567890");
+    assert_eq!(Nat::from_bytes_le(&x.to_bytes_le()), x);
+}

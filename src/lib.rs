@@ -48,6 +48,9 @@ pub mod int;
 #[cfg(feature = "int")]
 pub mod nat;
 
+#[cfg(feature = "int")]
+pub mod random;
+
 #[cfg(feature = "rational")]
 pub mod rational;
 
@@ -63,6 +66,8 @@ pub use error::{Error, Result};
 pub use int::{Int, Sign};
 #[cfg(feature = "int")]
 pub use nat::{Nat, u_gcd, u64_gcd};
+#[cfg(feature = "int")]
+pub use random::RandomSource;
 
 #[cfg(feature = "rational")]
 pub use rational::Rational;

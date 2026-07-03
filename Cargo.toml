@@ -52,10 +52,16 @@ ffi = ["std", "rational"]
 # The `puremp` command-line calculator/REPL (gates the binary target below).
 cli = ["std", "rational"]
 
-# This crate ships no foreign code: the arithmetic critical path stays in-house
-# and auditable, and it is a clean-room implementation (see ROADMAP.md
-# "License & provenance"). There are consequently no runtime dependencies.
+# Optional ecosystem glue: a blanket `RandomSource` impl for `rand_core::RngCore`
+# so `rand` generators can drive `Nat`/`Int` random generation. The in-house
+# `RandomSource` trait itself needs no dependency; this only adds the bridge.
+rand = ["dep:rand_core", "int"]
+
+# The arithmetic core is a clean-room, dependency-free implementation (see
+# ROADMAP.md "License & provenance"); the only dependencies are optional,
+# opt-in ecosystem bridges that the default build never pulls in.
 [dependencies]
+rand_core = { version = "0.6", optional = true, default-features = false }
 
 [[bin]]
 name = "puremp"

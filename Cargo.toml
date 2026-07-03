@@ -1,0 +1,77 @@
+# Exclude the cargo-fuzz workspace at `fuzz/` from the implicit single-crate
+# workspace this package forms. The fuzz crate uses `libfuzzer-sys` (nightly +
+# libFuzzer) and is built separately via `cargo +nightly fuzz run <target>`.
+[workspace]
+exclude = ["fuzz"]
+
+[package]
+name = "puremp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A pure-Rust arbitrary-precision arithmetic library — integers, rationals and MPFR-class floats — with no foreign-code dependencies, plus a C ABI and a CLI."
+repository = "https://github.com/KarpelesLab/puremp"
+license = "MIT"
+keywords = ["bignum", "bigint", "arbitrary-precision", "rational", "no-std"]
+categories = ["mathematics", "no-std", "algorithms"]
+
+[lib]
+name = "puremp"
+
+[features]
+# `std` is the convenient default; it implies `alloc`. Disable default features
+# for a bare `no_std` build (`--no-default-features`), optionally re-enabling
+# `alloc` (or a specific type layer) for heap-backed arbitrary-precision types.
+#
+# The type layers stack bottom-up: `int` (naturals + signed integers) is the
+# foundation; `rational` and `float` build on it.
+default = ["std", "rational", "float", "cli"]
+std = ["alloc"]
+alloc = []
+
+# --- type layers (each pulls in the ones below it) ---
+# Arbitrary-precision naturals (`Nat`) and signed integers (`Int`). Requires a
+# heap allocator (`alloc`).
+int = ["alloc"]
+# Arbitrary-precision rationals (`Rational`) built on `Int`.
+rational = ["int"]
+# Arbitrary-precision binary floats (`Float`) with directed rounding, aiming at
+# MPFR-class correct rounding. Built on `Int`.
+float = ["int"]
+
+# C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
+# C library with `cargo rustc --lib --features ffi --crate-type staticlib`
+# (or `--crate-type cdylib`). The generated symbols are declared in
+# `include/puremp.h`.
+ffi = ["std", "rational", "float"]
+
+# The `puremp` command-line calculator/REPL (gates the binary target below).
+cli = ["std", "rational", "float"]
+
+# This crate ships no foreign code: the arithmetic critical path stays in-house
+# and auditable, and it is a clean-room implementation (see ROADMAP.md
+# "License & provenance"). There are consequently no runtime dependencies.
+[dependencies]
+
+[[bin]]
+name = "puremp"
+path = "src/bin/puremp/main.rs"
+required-features = ["cli"]
+
+# Ad-hoc throughput harness (`cargo run --release --example bench`). Gated so
+# `--no-default-features` (bare no_std) builds don't try to compile it.
+[[example]]
+name = "bench"
+required-features = ["std", "int"]
+
+[lints.rust]
+# Keep the public surface documented and the internal/external boundary honest.
+missing_docs = "warn"
+unreachable_pub = "warn"
+# Deny (not forbid) so the `ffi` module can opt back in locally with a scoped
+# `#[allow(unsafe_code)]`; the entire arithmetic core stays safe.
+unsafe_code = "deny"
+
+[profile.release]
+# The small limb primitives benefit from aggressive cross-function inlining.
+lto = "thin"

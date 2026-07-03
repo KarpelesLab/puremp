@@ -1,0 +1,35 @@
+[package]
+name = "puremp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.puremp]
+path = ".."
+
+[[bin]]
+name = "nat_roundtrip"
+path = "fuzz_targets/nat_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "int_div_rem"
+path = "fuzz_targets/int_div_rem.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rational_reduce"
+path = "fuzz_targets/rational_reduce.rs"
+test = false
+doc = false
+bench = false

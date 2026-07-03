@@ -1035,26 +1035,6 @@ impl Nat {
         n.normalize();
         (n, rem as Limb)
     }
-
-    /// Computes `self · mul + add`, where `mul` and `add` are single limbs.
-    ///
-    /// This is the primitive behind decimal parsing (`n·10 + digit`).
-    fn mul_add_small(&self, mul: Limb, add: Limb) -> Nat {
-        let mut out = Vec::with_capacity(self.limbs.len() + 1);
-        let mut carry = add as u128;
-        for &l in &self.limbs {
-            let t = l as u128 * mul as u128 + carry;
-            out.push(t as Limb);
-            carry = t >> LIMB_BITS;
-        }
-        while carry != 0 {
-            out.push(carry as Limb);
-            carry >>= LIMB_BITS;
-        }
-        let mut n = Nat { limbs: out };
-        n.normalize();
-        n
-    }
 }
 
 impl Nat {
@@ -1224,31 +1204,46 @@ impl Nat {
         if self.limbs.len() <= RADIX_RECURSION_LIMBS {
             return simple_radix_string(self, radix);
         }
-        // Build `p = radix^(2^k)` up to ≈ √self (largest with p·p ≤ self).
-        let mut p = Nat::from_u64(radix as u64);
-        let mut len: usize = 1;
+        // Build the ladder `[radix^1, radix^2, radix^4, …]` once (largest entry
+        // ≤ self), then share it across the whole recursion instead of
+        // re-squaring it at every node.
+        let mut powers = alloc::vec![Nat::from_u64(radix as u64)];
         loop {
-            let sq = p.mul(&p);
+            let sq = powers.last().unwrap().square();
             if sq.cmp_ref(self) == Ordering::Greater {
                 break;
             }
-            p = sq;
-            len *= 2;
+            powers.push(sq);
         }
-        let (q, r) = self.div_rem(&p).expect("p is non-zero");
-        let mut s = q.to_radix_string(radix);
-        let r_str = if r.is_zero() {
-            String::new()
-        } else {
-            r.to_radix_string(radix)
-        };
-        // Zero-pad the low part to exactly `len` digits.
-        for _ in 0..len - r_str.len() {
-            s.push('0');
-        }
-        s.push_str(&r_str);
-        s
+        to_radix_recursive(self, &powers, radix)
     }
+}
+
+/// Recursive base-`radix` conversion sharing a precomputed power ladder
+/// (`powers[k] == radix^(2^k)`, ascending).
+fn to_radix_recursive(v: &Nat, powers: &[Nat], radix: u32) -> String {
+    if v.limbs.len() <= RADIX_RECURSION_LIMBS {
+        return simple_radix_string(v, radix);
+    }
+    // Split by the largest ladder entry `p = radix^(2^k) ≤ v`.
+    let k = powers
+        .iter()
+        .rposition(|p| p.cmp_ref(v) != Ordering::Greater)
+        .expect("v is large, so radix <= v");
+    let len = 1usize << k;
+    let (q, r) = v.div_rem(&powers[k]).expect("p is non-zero");
+    let mut s = to_radix_recursive(&q, powers, radix);
+    let r_str = if r.is_zero() {
+        String::new()
+    } else {
+        to_radix_recursive(&r, powers, radix)
+    };
+    // Zero-pad the low part to exactly `len` digits.
+    for _ in 0..len - r_str.len() {
+        s.push('0');
+    }
+    s.push_str(&r_str);
+    s
 }
 
 /// Number of limbs at or below which radix conversion uses the simple
@@ -1883,17 +1878,12 @@ impl FromStr for Nat {
     /// Parses a non-negative decimal integer. An empty string, or any character
     /// that is not an ASCII digit, is a [`Error::Parse`].
     fn from_str(s: &str) -> Result<Self> {
-        if s.is_empty() {
+        // Reject a leading sign here (base-10 naturals only), then use the
+        // shared sub-quadratic radix parser.
+        if s.starts_with(['+', '-']) {
             return Err(Error::Parse);
         }
-        let mut n = Nat::zero();
-        for b in s.bytes() {
-            if !b.is_ascii_digit() {
-                return Err(Error::Parse);
-            }
-            n = n.mul_add_small(10, (b - b'0') as Limb);
-        }
-        Ok(n)
+        parse_radix(s, 10)
     }
 }
 

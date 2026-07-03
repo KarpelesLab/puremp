@@ -28,7 +28,7 @@ name = "puremp"
 # `float` is a separable layer (not part of the core contract, see ROADMAP.md
 # §1) but is enabled by default for convenience; disable it with
 # `--no-default-features` (optionally re-enabling `rational`/`cli`).
-default = ["std", "rational", "float", "cli"]
+default = ["std", "rational", "float", "dyadic", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -36,8 +36,11 @@ alloc = []
 # Arbitrary-precision naturals (`Nat`) and signed integers (`Int`). Requires a
 # heap allocator (`alloc`).
 int = ["alloc"]
-# Arbitrary-precision rationals (`Rational`) built on `Int`.
+# Arbitrary-precision rationals (`Rational`) built on `Int`. Also enables the
+# `InfRational` extended-rational type (±∞ / NaN).
 rational = ["int"]
+# Exact dyadic rationals (`Dyadic`, i.e. `n·2^-k`) built on `Int`.
+dyadic = ["int"]
 # Optional arbitrary-precision binary floats (`Float`) with directed rounding,
 # aiming at MPFR-class correct rounding. Built on `Int`/`Rational` (decimal I/O
 # reuses exact rationals), but NOT part of the integer/rational core contract.

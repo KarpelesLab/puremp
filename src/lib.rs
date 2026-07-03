@@ -71,6 +71,9 @@ pub mod random;
 #[cfg(feature = "rational")]
 pub mod rational;
 
+#[cfg(feature = "dyadic")]
+pub mod dyadic;
+
 #[cfg(feature = "float")]
 pub mod float;
 
@@ -91,6 +94,9 @@ pub use random::RandomSource;
 
 #[cfg(feature = "rational")]
 pub use rational::Rational;
+
+#[cfg(feature = "dyadic")]
+pub use dyadic::Dyadic;
 
 #[cfg(feature = "float")]
 pub use float::{Float, RoundingMode};

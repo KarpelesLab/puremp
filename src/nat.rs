@@ -15,6 +15,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::str::FromStr;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
@@ -604,16 +605,64 @@ impl Nat {
         if self.is_zero() {
             return out.write_str("0");
         }
-        let mut n = self.clone();
-        let mut buf = Vec::new();
-        while !n.is_zero() {
-            let (q, r) = n.divmod_small(radix as Limb);
-            buf.push(digit_char(r as u32));
-            n = q;
-        }
-        buf.reverse();
-        out.write_str(core::str::from_utf8(&buf).unwrap_or("<nan>"))
+        out.write_str(&self.to_radix_string(radix))
     }
+
+    /// Returns the minimal (no leading zeros) base-`radix` digit string, using
+    /// divide-and-conquer: split off a divisor `radix^len ≈ √self`, recurse on
+    /// the quotient and remainder, and zero-pad the remainder to `len` digits.
+    /// With sub-quadratic multiplication/division this is `O(M(n)·log n)`.
+    fn to_radix_string(&self, radix: u32) -> String {
+        // Base case: a few limbs go straight through single-limb division.
+        if self.limbs.len() <= RADIX_RECURSION_LIMBS {
+            return simple_radix_string(self, radix);
+        }
+        // Build `p = radix^(2^k)` up to ≈ √self (largest with p·p ≤ self).
+        let mut p = Nat::from_u64(radix as u64);
+        let mut len: usize = 1;
+        loop {
+            let sq = p.mul(&p);
+            if sq.cmp_ref(self) == Ordering::Greater {
+                break;
+            }
+            p = sq;
+            len *= 2;
+        }
+        let (q, r) = self.div_rem(&p).expect("p is non-zero");
+        let mut s = q.to_radix_string(radix);
+        let r_str = if r.is_zero() {
+            String::new()
+        } else {
+            r.to_radix_string(radix)
+        };
+        // Zero-pad the low part to exactly `len` digits.
+        for _ in 0..len - r_str.len() {
+            s.push('0');
+        }
+        s.push_str(&r_str);
+        s
+    }
+}
+
+/// Number of limbs at or below which radix conversion uses the simple
+/// single-limb-division loop rather than recursing.
+const RADIX_RECURSION_LIMBS: usize = 3;
+
+/// Minimal base-`radix` digit string via repeated single-limb division (for
+/// small values / the recursion base case).
+fn simple_radix_string(n: &Nat, radix: u32) -> String {
+    if n.is_zero() {
+        return String::new();
+    }
+    let mut n = n.clone();
+    let mut buf = Vec::new();
+    while !n.is_zero() {
+        let (q, d) = n.divmod_small(radix as Limb);
+        buf.push(digit_char(d as u32));
+        n = q;
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap_or_default()
 }
 
 /// Maps a digit value `0..36` to its ASCII character (`0-9`, then `a-z`).
@@ -721,18 +770,7 @@ impl fmt::Display for Nat {
         if self.is_zero() {
             return f.write_str("0");
         }
-        // Repeated single-limb division by ten. Chunking by 10^19 is a later
-        // performance milestone; correctness first.
-        let mut n = self.clone();
-        let mut buf = Vec::new();
-        while !n.is_zero() {
-            let (q, r) = n.divmod_small(10);
-            buf.push(b'0' + r as u8);
-            n = q;
-        }
-        buf.reverse();
-        // Every byte is an ASCII digit, so this is valid UTF-8.
-        f.write_str(core::str::from_utf8(&buf).unwrap_or("<nan>"))
+        f.write_str(&self.to_radix_string(10))
     }
 }
 

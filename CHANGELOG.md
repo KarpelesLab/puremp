@@ -7,6 +7,12 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/KarpelesLab/puremp/compare/v0.1.3...v0.1.4) - 2026-07-03
+
+### Other
+
+- use the n·2^-k convention (fix inverted exponent sign)
+
 ## [0.1.3](https://github.com/KarpelesLab/puremp/compare/v0.1.2...v0.1.3) - 2026-07-03
 
 ### Other

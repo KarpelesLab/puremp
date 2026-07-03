@@ -527,6 +527,38 @@ impl Int {
         !self.is_negative() && self.magnitude().is_prime_bpsw()
     }
 
+    /// Returns the prime factorization of `|self|` as a sorted list of prime
+    /// factors with multiplicity (empty for `0`/`±1`; the sign is ignored).
+    pub fn factorize(&self) -> alloc::vec::Vec<Int> {
+        self.magnitude()
+            .factorize()
+            .into_iter()
+            .map(Int::from)
+            .collect()
+    }
+
+    /// Generates a uniformly random prime with exactly `bits` bits (`bits >= 2`),
+    /// verified with Baillie–PSW.
+    pub fn random_prime(bits: u32, rng: &mut impl crate::random::RandomSource) -> Int {
+        assert!(bits >= 2, "random_prime: need at least 2 bits");
+        let high = Int::ONE.mul_2k(bits - 1); // top bit set
+        let limit = Int::ONE.mul_2k(bits);
+        loop {
+            // Random odd candidate with the high bit set.
+            let base = Int::from(Nat::random_bits(bits as u64, rng))
+                .bitor(&high)
+                .bitor(&Int::ONE);
+            let mut c = base;
+            while c < limit {
+                if c.is_prime_bpsw() {
+                    return c;
+                }
+                c = c.add(&Int::from_i64(2));
+            }
+            // Ran past 2^bits without a prime; draw a fresh candidate.
+        }
+    }
+
     /// Returns the smallest prime strictly greater than `self` (at least 2).
     pub fn next_prime(&self, rng: &mut impl crate::random::RandomSource) -> Int {
         if self < &Int::from_i64(2) {

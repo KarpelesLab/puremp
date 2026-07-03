@@ -1450,6 +1450,60 @@ impl Nat {
         miller_rabin_witness(&two, self) && lucas_strong(self)
     }
 
+    /// Returns the prime factorization of `self` as a sorted list of prime
+    /// factors *with multiplicity* (empty for `0` and `1`).
+    ///
+    /// Small factors are removed by trial division; the rest are split with
+    /// Pollard's rho and confirmed prime with Baillie–PSW. Practical for numbers
+    /// with factors up to ~20 digits; genuinely hard semiprimes are, as always,
+    /// hard.
+    pub fn factorize(&self) -> Vec<Nat> {
+        let mut factors = Vec::new();
+        if self.is_zero() || self.is_one() {
+            return factors;
+        }
+        let mut n = self.clone();
+        // Factor out 2, then odd trial divisors up to a small bound.
+        while n.is_even() {
+            factors.push(Nat::from_u64(2));
+            n = n.shr(1);
+        }
+        let mut d = 3u64;
+        while d <= 4096 {
+            let dn = Nat::from_u64(d);
+            if dn.mul(&dn).cmp_ref(&n) == Ordering::Greater {
+                break;
+            }
+            loop {
+                let (q, r) = n.div_rem(&dn).expect("non-zero");
+                if r.is_zero() {
+                    factors.push(dn.clone());
+                    n = q;
+                } else {
+                    break;
+                }
+            }
+            d += 2;
+        }
+        // Split whatever remains with Pollard's rho.
+        let mut stack = Vec::new();
+        if !n.is_one() {
+            stack.push(n);
+        }
+        while let Some(m) = stack.pop() {
+            if m.is_prime_bpsw() {
+                factors.push(m);
+                continue;
+            }
+            let factor = pollard_rho(&m);
+            let cofactor = m.div_rem(&factor).expect("non-zero").0;
+            stack.push(factor);
+            stack.push(cofactor);
+        }
+        factors.sort();
+        factors
+    }
+
     /// Miller–Rabin probable-primality test with `rounds` random witnesses.
     ///
     /// Deterministic for the tiny cases; for larger `self` the probability of a
@@ -1555,6 +1609,40 @@ impl Reciprocal {
             r = r.checked_sub(m).unwrap();
         }
         r
+    }
+}
+
+/// Pollard's rho: returns a non-trivial factor of the odd composite `n > 1`
+/// (Floyd cycle detection over `f(x) = x² + c mod n`, retrying with larger `c`).
+fn pollard_rho(n: &Nat) -> Nat {
+    if n.is_even() {
+        return Nat::from_u64(2);
+    }
+    let one = Nat::one();
+    let recip = Reciprocal::new(n);
+    let mut c = 1u64;
+    loop {
+        let f = |x: &Nat| recip.reduce(&x.square().add(&Nat::from_u64(c)));
+        let (mut x, mut y) = (Nat::from_u64(2), Nat::from_u64(2));
+        let mut d = one.clone();
+        while d == one {
+            x = f(&x);
+            y = f(&f(&y));
+            let diff = if x.cmp_ref(&y) != Ordering::Less {
+                x.checked_sub(&y).unwrap()
+            } else {
+                y.checked_sub(&x).unwrap()
+            };
+            d = if diff.is_zero() {
+                n.clone()
+            } else {
+                diff.gcd(n)
+            };
+        }
+        if d != *n {
+            return d;
+        }
+        c += 1; // cycle without a factor: try a different polynomial
     }
 }
 

@@ -848,3 +848,48 @@ fn jacobi_sqrt_mod_crt() {
     // Non-coprime moduli → None.
     assert!(Int::crt(&[int("1"), int("2")], &[int("4"), int("6")]).is_none());
 }
+
+#[test]
+fn factorization_and_random_prime() {
+    use puremp::RandomSource;
+    // Helper to render a factorization compactly.
+    let facs = |s: &str| -> String {
+        int(s)
+            .factorize()
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join("*")
+    };
+    assert_eq!(facs("1"), "");
+    assert_eq!(facs("2"), "2");
+    assert_eq!(facs("360"), "2*2*2*3*3*5");
+    assert_eq!(facs("1000000007"), "1000000007"); // prime
+    assert_eq!(facs("600851475143"), "71*839*1471*6857"); // Project Euler #3
+    // A product of two ~10-digit primes.
+    let semiprime = int("32416190071").mul(&int("32416187567"));
+    let f = semiprime.factorize();
+    assert_eq!(f.len(), 2);
+    assert_eq!(f[0].mul(&f[1]), semiprime);
+    // Product of all factors reconstructs the input.
+    let n = int("123456789012345678");
+    let prod = n.factorize().iter().fold(Int::ONE, |a, p| a.mul(p));
+    assert_eq!(prod, n);
+
+    // random_prime
+    struct Lcg(u64);
+    impl RandomSource for Lcg {
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for b in dest.iter_mut() {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (self.0 >> 33) as u8;
+            }
+        }
+    }
+    let mut rng = Lcg(999);
+    for bits in [16u32, 32, 64, 128] {
+        let p = Int::random_prime(bits, &mut rng);
+        assert!(p.is_prime_bpsw(), "{p} not prime");
+        assert_eq!(p.bit_len(), bits, "wrong bit length for {p}");
+    }
+}

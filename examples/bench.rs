@@ -1,43 +1,71 @@
-//! Ad-hoc throughput harness used to spot optimization choke points while the
-//! sub-quadratic algorithms in `ROADMAP.md` land.
+//! Ad-hoc throughput harness for spotting optimization choke points.
 //!
 //! Run with `cargo run --release --example bench`. These are wall-clock timings,
-//! not statistical benchmarks — the numbers are only meaningful in `--release`.
+//! not statistical benchmarks — meaningful only in `--release`.
 
 use std::time::Instant;
 
-use puremp::Int;
+use puremp::{Float, Int, Nat, Rational, RoundingMode};
 
-/// Computes `n!` by an ascending product.
-fn factorial(n: u64) -> Int {
-    let mut acc = Int::one();
-    for k in 2..=n {
-        acc = acc.mul(&Int::from_i64(k as i64));
-    }
-    acc
-}
-
-fn bench<F, R>(label: &str, f: F) -> R
+fn bench<F, R>(label: &str, iters: u32, f: F) -> R
 where
-    F: FnOnce() -> R,
+    F: Fn() -> R,
 {
+    // Warm up, then time `iters` runs and report the per-iteration average.
+    let mut out = f();
     let start = Instant::now();
-    let out = f();
-    println!("{label:<28} {:?}", start.elapsed());
+    for _ in 0..iters {
+        out = f();
+    }
+    let per = start.elapsed() / iters;
+    println!("{label:<34} {per:?}/iter");
     out
 }
 
+fn factorial(n: u64) -> Int {
+    (2..=n).fold(Int::one(), |acc, k| acc.mul(&Int::from_i64(k as i64)))
+}
+
 fn main() {
-    let f2000 = bench("factorial(2000)", || factorial(2000));
-    println!("  digits: {}", f2000.to_string().len());
+    // A big operand well past the Karatsuba threshold (~10^5 bits).
+    let big = factorial(20000);
+    let big2 = factorial(20001);
+    println!(
+        "operands: factorial(20000) has {} bits",
+        big.magnitude().bit_len()
+    );
 
-    let big = bench("factorial(20000)", || factorial(20000));
-    println!("  digits: {}", big.to_string().len());
+    // Multiplication (schoolbook below the threshold, Karatsuba above).
+    let a1000 = Int::from_i64(7).pow(1000);
+    let b1000 = Int::from_i64(3).pow(1010);
+    bench("mul ~1k-bit", 200, || a1000.mul(&b1000));
+    bench("mul factorial(20000)^2", 5, || big.mul(&big2));
 
-    bench("2^1000000", || Int::from_i64(2).pow(1_000_000));
+    // Division (Knuth Algorithm D).
+    let prod = big.mul(&big2);
+    bench("div (Knuth-D) large/large", 5, || prod.div_rem(&big));
 
-    // Multiply two large integers (schoolbook, for now).
-    let a = factorial(5000);
-    let b = factorial(5001);
-    bench("mul(5000!, 5001!)", || a.mul(&b));
+    // GCD (binary), on coprime-ish large operands.
+    bench("gcd ~large", 20, || big.gcd(&big2));
+
+    // Base-10 formatting (repeated single-limb division).
+    bench("to_string factorial(20000)", 10, || big.to_string().len());
+
+    // Rational arithmetic with reduction.
+    let r = Rational::new(Int::from_i64(355), Int::from_i64(113));
+    bench("rational add+reduce", 5000, || r.add(&r).mul(&r));
+
+    // Integer square root.
+    bench("isqrt of factorial(20000)", 20, || big.magnitude().isqrt());
+
+    // Float transcendentals at moderate precision.
+    let n = RoundingMode::Nearest;
+    bench("pi @ 1000 bits", 20, || Float::pi(1000, n));
+    let two = Float::from_int(&Int::from_i64(2), 1000, n);
+    bench("sqrt(2) @ 1000 bits", 200, || two.sqrt(1000, n));
+    bench("exp(1) @ 1000 bits", 20, || Float::e(1000, n));
+
+    // Sanity check: a known Nat identity so the compiler can't elide everything.
+    let check = Nat::from_u64(2).pow(64);
+    println!("2^64 = {check}");
 }

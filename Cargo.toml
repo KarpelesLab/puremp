@@ -82,7 +82,7 @@ required-features = ["cli"]
 # `--no-default-features` (bare no_std) builds don't try to compile it.
 [[example]]
 name = "bench"
-required-features = ["std", "int"]
+required-features = ["std", "float"]
 
 [lints.rust]
 # Keep the public surface documented and the internal/external boundary honest.

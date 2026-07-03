@@ -316,6 +316,11 @@ impl Int {
         Int::from_sign_magnitude(sign, a.mul(&b))
     }
 
+    /// Returns `self²` (always non-negative), via the fast squaring path.
+    pub fn square(&self) -> Int {
+        Int::from(self.magnitude().square())
+    }
+
     /// Returns `self` raised to `exp` (`self^0 == 1`), by square-and-multiply.
     pub fn pow(&self, exp: u32) -> Int {
         let mut result = Int::ONE;
@@ -327,7 +332,7 @@ impl Int {
             }
             e >>= 1;
             if e > 0 {
-                base = base.mul(&base);
+                base = base.square();
             }
         }
         result

@@ -575,3 +575,19 @@ fn random_generation() {
     let x = nat("123456789012345678901234567890");
     assert_eq!(Nat::from_bytes_le(&x.to_bytes_le()), x);
 }
+
+#[test]
+fn square_matches_mul() {
+    // Squaring must agree with the general multiply across sizes (schoolbook and
+    // Karatsuba squaring paths), including a value that crosses the threshold.
+    for e in [1u32, 5, 50, 400, 900] {
+        let x = Int::from_i64(7).pow(e).add(&Int::from_i64(123456789));
+        assert_eq!(x.square(), x.mul(&x), "7^{e}+c squared");
+        let nx = x.neg();
+        assert_eq!(nx.square(), nx.mul(&nx), "negative squared is positive");
+    }
+    assert_eq!(Int::ZERO.square(), Int::ZERO);
+    // Nat-level too.
+    let n = nat("123456789012345678901234567890").pow(20);
+    assert_eq!(n.square(), n.mul(&n));
+}

@@ -175,6 +175,9 @@ impl Nat {
         if self.is_zero() || rhs.is_zero() {
             return Nat::zero();
         }
+        if self.limbs == rhs.limbs {
+            return self.square();
+        }
         if self.limbs.len().min(rhs.limbs.len()) < KARATSUBA_THRESHOLD {
             self.mul_schoolbook(rhs)
         } else {
@@ -197,6 +200,82 @@ impl Nat {
         let mut n = Nat { limbs: out };
         n.normalize();
         n
+    }
+
+    /// Returns `self²`, using a symmetric schoolbook or Karatsuba squaring
+    /// (roughly half the limb multiplications of the general `mul`).
+    pub fn square(&self) -> Nat {
+        if self.is_zero() {
+            return Nat::zero();
+        }
+        if self.limbs.len() < KARATSUBA_THRESHOLD {
+            self.square_schoolbook()
+        } else {
+            self.square_karatsuba()
+        }
+    }
+
+    /// Symmetric schoolbook squaring: accumulate the strictly-upper triangle of
+    /// cross products once, double it, then add the diagonal `aᵢ²` terms.
+    fn square_schoolbook(&self) -> Nat {
+        let n = self.limbs.len();
+        let mut cross = alloc::vec![0 as Limb; 2 * n];
+        for i in 0..n {
+            let mut carry = 0;
+            for j in (i + 1)..n {
+                let (lo, hi) = mac(cross[i + j], self.limbs[i], self.limbs[j], carry);
+                cross[i + j] = lo;
+                carry = hi;
+            }
+            cross[i + n] = carry;
+        }
+        let mut result = {
+            let mut c = Nat { limbs: cross };
+            c.normalize();
+            c.shl(1) // 2·(sum of cross products)
+        };
+
+        // Add the diagonal squares aᵢ² at position 2i.
+        let mut diag = alloc::vec![0 as Limb; 2 * n];
+        for i in 0..n {
+            let sq = self.limbs[i] as u128 * self.limbs[i] as u128;
+            let (lo, hi) = (sq as Limb, (sq >> LIMB_BITS) as Limb);
+            let (s0, c0) = adc(diag[2 * i], lo, 0);
+            diag[2 * i] = s0;
+            let (s1, mut carry) = adc(diag[2 * i + 1], hi, c0);
+            diag[2 * i + 1] = s1;
+            let mut k = 2 * i + 2;
+            while carry != 0 && k < 2 * n {
+                let (s, c) = adc(diag[k], 0, carry);
+                diag[k] = s;
+                carry = c;
+                k += 1;
+            }
+        }
+        let mut diag = Nat { limbs: diag };
+        diag.normalize();
+        result = result.add(&diag);
+        result
+    }
+
+    /// Karatsuba squaring: three half-size squarings.
+    fn square_karatsuba(&self) -> Nat {
+        let n = self.limbs.len();
+        if n < KARATSUBA_THRESHOLD {
+            return self.square_schoolbook();
+        }
+        let half = n / 2;
+        let (a0, a1) = self.split_at_limb(half);
+        let z0 = a0.square();
+        let z2 = a1.square();
+        let z1 = a0
+            .add(&a1)
+            .square()
+            .checked_sub(&z0)
+            .and_then(|t| t.checked_sub(&z2))
+            .expect("karatsuba square middle term is non-negative");
+        let bits = (half * LIMB_BITS as usize) as u64;
+        z2.shl(2 * bits).add(&z1.shl(bits)).add(&z0)
     }
 
     /// Returns `(low, high)` where `self == low + high·2^(64·at)`.
@@ -552,7 +631,7 @@ impl Nat {
             }
             e >>= 1;
             if e > 0 {
-                base = base.mul(&base);
+                base = base.square();
             }
         }
         result

@@ -254,7 +254,8 @@ land before performance tuning and the optional float layer.
 Explicitly outside the core contract (§1). The existing `Float`/`RoundingMode`
 scaffold grows into correctly-rounded (MPFR-class) `add`/`sub`/`mul`/`div`/`sqrt`
 in all rounding modes, `f32`/`f64` round-trips, decimal I/O, and (stretch)
-transcendentals. Kept behind the `float` feature (**off by default**) so the
+transcendentals. Kept behind the `float` feature — enabled by default for
+convenience but fully separable (`--no-default-features` drops it) so the
 integer/rational core never depends on it.
 
 ### M9 — Polish, interop & release

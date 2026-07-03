@@ -25,9 +25,10 @@ name = "puremp"
 #
 # The type layers stack bottom-up: `int` (naturals + signed integers) is the
 # foundation and `rational` builds on it — together they are the core contract.
-# `float` is an optional, separable layer and is deliberately OFF by default
-# (see ROADMAP.md §1).
-default = ["std", "rational", "cli"]
+# `float` is a separable layer (not part of the core contract, see ROADMAP.md
+# §1) but is enabled by default for convenience; disable it with
+# `--no-default-features` (optionally re-enabling `rational`/`cli`).
+default = ["std", "rational", "float", "cli"]
 std = ["alloc"]
 alloc = []
 

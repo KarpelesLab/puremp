@@ -169,15 +169,16 @@ Bottom-up layers; each builds only on the ones below it.
 ## 5. Current status
 
 The **integer/rational core contract (§1–§2) is fully implemented and tested**,
-along with sub-quadratic multiplication/division and a correctly-rounded float
-arithmetic core. Remaining work is performance tuning and the optional
-float/interop extensions (§6).
+the sub-quadratic algorithm ladder is in place, and the optional float layer is
+complete through the transcendentals. The only open items are further
+performance tuning and a pre-`1.0` review (§6).
 
 - `limb`: `adc`, `sbb`, `mac`.
-- `Nat`: normalize/compare, `add`, `checked_sub`, `mul` (schoolbook + Karatsuba),
-  `div_rem` (single-limb + **Knuth Algorithm D**), `shl`/`shr`, `bit`/`bit_len`/
-  `trailing_zeros`/`low_bits`, binary (Stein) GCD, `pow`, `isqrt`,
-  `nth_root_floor`, `as_limbs`/`from_limbs`/`to_u64`, radix + decimal I/O, `Hash`.
+- `Nat`: normalize/compare, `add`, `checked_sub`, `mul` (schoolbook → Karatsuba
+  → Toom-3 → NTT) and `square`, `div_rem` (single-limb, Knuth Algorithm D,
+  Burnikel–Ziegler), `shl`/`shr`, `bit`/`bit_len`/`trailing_zeros`/`low_bits`,
+  GCD (binary → Lehmer), `pow`, `isqrt`, `nth_root_floor`, byte/limb interop,
+  random generation, sub-quadratic radix + decimal I/O, `Hash`.
 - `Int`: tagged `Small{neg,mag:u64} | Large{sign,mag}` inline representation with
   demotion; all primitive-int `From`; `ZERO`/`ONE`/`MINUS_ONE`; predicates,
   `signum`, `abs`; `add`/`sub`/`mul`/`pow`; fused `addmul`/`submul`; **all three
@@ -190,16 +191,20 @@ float/interop extensions (§6).
   `signum`; `neg`/`abs`/`recip`/`pow`; arithmetic + fused `addmul`/`submul`;
   `floor`/`ceil`/`trunc`/`to_integer`; `div_floor`/`div_trunc`/`rem_euclid`;
   bounded conversions; `write_decimal`; `Hash`; operators.
-- `Float` *(optional)*: normalized representation; correctly-rounded
-  `add`/`sub`/`mul`/`div`/`sqrt` in all five `RoundingMode`s; `from_int`/`round`/
-  `neg`/`abs`/`to_f64`; value-based ordering.
-- Free `u_gcd`/`u64_gcd`; C ABI over `Int`; `puremp` REPL.
+- `Float` *(optional)*: IEEE special values; correctly-rounded
+  `add`/`sub`/`mul`/`div`/`sqrt` (with ternary flag) in all five `RoundingMode`s;
+  `f64`/`f32`/rational/decimal conversions; transcendentals (`pi`/`e`/`ln2`,
+  `exp`/`ln`/`sin`/`cos`/`tan`/`atan`) via Ziv's strategy.
+- Free `u_gcd`/`u64_gcd`; in-house `RandomSource` (+ optional `rand`/`serde`);
+  C ABI over `Int`/`Rational`/`Float`; a `puremp` REPL with rationals, functions,
+  and radices.
 
 ## 6. Milestones
 
-The contract milestones **M1–M6 are complete**; **M7** (fast algorithms) and
-**M8** (float) are complete for their core, with the extensions below still
-open. ✅ = done, ▫ = remaining.
+Milestones **M1–M8 are complete** and **M9** is complete except for
+allocation-tuning and the pre-`1.0` review. The remaining ▫ items are
+performance refinements and process, not missing functionality. ✅ = done,
+▫ = remaining.
 
 ### M1 — Representation, inlining & core `Int` surface ✅
 Tagged `Small/Large` inline representation with demotion; all primitive-int
@@ -224,8 +229,8 @@ Truncated, Euclidean, and floored `div_*`/`rem_*`/`div_rem_*`; `div_exact`;
 
 ### M5 — Radix & string I/O, bounded conversions ✅
 `from_str_radix`/`write_radix`; decimal `FromStr`/`Display`; `fits_i64`/
-`fits_u64`/`to_i64`/`to_u64`/`to_f64`.
-- ▫ Later: sub-quadratic decimal via `10^(2^k)` chunking (perf only).
+`fits_u64`/`to_i64`/`to_u64`/`to_f64`; sub-quadratic (divide-and-conquer) radix
+conversion.
 
 ### M6 — `Rational` full surface ✅
 Constructors/consts/`power_of_two`; `From`/`FromStr` incl. decimals; predicates/
@@ -234,31 +239,39 @@ Constructors/consts/`power_of_two`; `From`/`FromStr` incl. decimals; predicates/
 `Hash`; operators.
 
 ### M7 — Fast algorithms (behind the same API)
-- ✅ Karatsuba multiplication (schoolbook below a 32-limb threshold).
-- ✅ Knuth Algorithm D division (replacing the bit-at-a-time core), differentially
-  tested against a bit-at-a-time reference.
-- ▫ Toom-3/Toom-4 and FFT/NTT multiplication; a squaring fast path.
-- ▫ Möller–Granlund invariant-divisor and Burnikel–Ziegler recursive division.
-- ▫ Subquadratic GCD (Lehmer → half-GCD); a threshold-tuning bench harness.
+- ✅ Multiplication ladder: schoolbook → Karatsuba (32 limbs) → Toom-3 (128
+  limbs) → NTT over the Goldilocks field (1600 limbs), plus a dedicated
+  squaring fast path — all differentially tested.
+- ✅ Division: Knuth Algorithm D, then Burnikel–Ziegler recursive division above
+  64 limbs (differentially tested against Knuth-D).
+- ✅ Sub-quadratic GCD: Lehmer's algorithm above 16 limbs (differentially tested
+  against binary GCD).
+- ✅ Benchmark harness (`examples/bench.rs`) exercising the fast paths.
+- ▫ Further tuning: Toom-4, Möller–Granlund invariant-divisor, half-GCD (HGCD),
+  multi-prime NTT for extreme sizes, and measured crossover thresholds.
 
-### M8 — Optional floating-point layer (separable)
+### M8 — Optional floating-point layer (separable) ✅
 Outside the core contract (§1); behind the `float` feature.
-- ✅ Normalized representation; correctly-rounded `add`/`sub`/`mul`/`div`/`sqrt`
-  in all five rounding modes; `from_int`/`round`; `to_f64`; value-based ordering.
-- ▫ `f32`/`f64` `from_*` with correct rounding; decimal string I/O.
-- ▫ Special values (signed zeros, ±∞, NaN) and the ternary (inexact) flag.
-- ▫ Transcendentals (`exp`/`log`/`sin`/`cos`/`atan`/…, constants) via Ziv's
-  strategy for correct rounding.
+- ✅ Tagged representation with the IEEE special values (signed zeros, ±∞, NaN).
+- ✅ Correctly-rounded `add`/`sub`/`mul`/`div`/`sqrt` in all five rounding modes,
+  with the MPFR ternary flag (`*_ternary`).
+- ✅ `from_f64`/`from_f32`/`to_f64`/`to_f32`, `from_rational`/`to_rational`,
+  `FromStr`, `to_decimal_string`, and an exact `to`/`from_exact_string` codec.
+- ✅ Transcendentals via Ziv's strategy: `pi`/`e`/`ln2`, `exp`, `ln`, `sin`,
+  `cos`, `tan`, `atan`.
+- ▫ Further: correct-rounding proofs / hard-to-round vectors, decimal shortest
+  round-trip, and the remaining elementary functions (`asin`/`acosh`/…).
 
 ### M9 — Polish, interop & release
 - ✅ `core::ops` coverage (value/ref/`i64`/assign) for `Int`; value/ref/assign for
-  `Rational`.
-- ✅ `Sum`/`Product` for `Int` and `Rational`.
-- ✅ C ABI over `Rational` (`puremp_rat_*`), alongside `Int`.
-- ▫ Optional in-house `serde` (no derive dep); optional `rand` glue.
-- ▫ C ABI over `Float`; expand the CLI (rationals, radices, number theory).
-- ▫ Allocation-reducing scratch buffers; benchmark suite; `1.0` API review and
-  semver commitment.
+  `Rational`; `Sum`/`Product` for both.
+- ✅ Optional in-house `serde` (no `serde_derive`); optional `rand` glue
+  (in-house `RandomSource` + `rand_core` bridge) with random `Nat`/`Int`.
+- ✅ C ABI over `Int`, `Rational`, and `Float`; a `puremp` REPL with exact
+  rationals, functions, and radices.
+- ✅ Benchmark harness.
+- ▫ Allocation-reducing scratch buffers; a `1.0` API review and semver
+  commitment.
 
 ## 7. Specification coverage checklist
 

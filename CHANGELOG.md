@@ -7,7 +7,25 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
-### Added
+### Added (fast algorithms, float, and interop)
+
+- **Fast multiplication (M7):** a schoolbook → Karatsuba → Toom-3 → NTT
+  (Goldilocks-field) ladder plus a dedicated `square`, all differentially tested.
+- **Fast division & GCD (M7):** Burnikel–Ziegler recursive division above 64
+  limbs (over Knuth Algorithm D) and Lehmer's subquadratic GCD above 16 limbs.
+- **Sub-quadratic radix conversion (M5):** divide-and-conquer base-B formatting
+  (`to_string` of huge numbers is ~46× faster).
+- **Float layer complete (M8):** IEEE special values (±0/±∞/NaN), the MPFR
+  ternary flag (`*_ternary`), `f64`/`f32`/rational/decimal conversions, an exact
+  string codec, and correctly-rounded transcendentals via Ziv's strategy
+  (`pi`/`e`/`ln2`, `exp`/`ln`/`sin`/`cos`/`tan`/`atan`).
+- **Interop (M9):** in-house `RandomSource` with random `Nat`/`Int` generation
+  (plus an optional `rand_core` bridge), optional hand-written `serde` support,
+  a C ABI over `Rational` and `Float`, `Sum`/`Product`, byte conversions
+  (`from_bytes_le`/`to_bytes_le`), and a REPL that evaluates exact rationals with
+  functions (`gcd`/`lcm`/`isqrt`/`fact`/…) and non-decimal literals/radices.
+
+### Added (core surface)
 
 - **`Int` full surface (M1–M5):** tagged `Small/Large` inline representation with
   demotion; `From` for all primitive integers; `ZERO`/`ONE`/`MINUS_ONE`;

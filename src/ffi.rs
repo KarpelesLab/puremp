@@ -416,3 +416,204 @@ pub unsafe extern "C" fn puremp_rat_to_string(r: *const PurempRat) -> *mut c_cha
         _ => ptr::null_mut(),
     }
 }
+
+// --- Float C ABI ---
+
+use crate::float::{Float, RoundingMode};
+
+/// Opaque handle wrapping an arbitrary-precision float.
+pub struct PurempFloat(Float);
+
+#[inline]
+fn flt_handle(f: Float) -> *mut PurempFloat {
+    Box::into_raw(Box::new(PurempFloat(f)))
+}
+
+/// Maps a C rounding code to a [`RoundingMode`] (0=nearest, 1=toward-zero,
+/// 2=toward-+∞, 3=toward-−∞, 4=away-from-zero; anything else = nearest).
+fn rounding_from_c(mode: c_int) -> RoundingMode {
+    match mode {
+        1 => RoundingMode::TowardZero,
+        2 => RoundingMode::TowardPositive,
+        3 => RoundingMode::TowardNegative,
+        4 => RoundingMode::AwayFromZero,
+        _ => RoundingMode::Nearest,
+    }
+}
+
+/// Creates a float from a C `double` at `precision` bits.
+#[unsafe(no_mangle)]
+pub extern "C" fn puremp_float_from_double(x: f64, precision: u64) -> *mut PurempFloat {
+    flt_handle(Float::from_f64(x, precision, RoundingMode::Nearest))
+}
+
+/// Creates a float from an integer handle, rounded to `precision` bits.
+///
+/// # Safety
+/// `n` must be `NULL` or a valid live [`PurempInt`] handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_float_from_int(
+    n: *const PurempInt,
+    precision: u64,
+    rounding: c_int,
+) -> *mut PurempFloat {
+    if n.is_null() {
+        return ptr::null_mut();
+    }
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let x = unsafe { &(*n).0 };
+        flt_handle(Float::from_int(x, precision, rounding_from_c(rounding)))
+    }));
+    r.unwrap_or(ptr::null_mut())
+}
+
+/// Returns π rounded to `precision` bits.
+#[unsafe(no_mangle)]
+pub extern "C" fn puremp_float_pi(precision: u64, rounding: c_int) -> *mut PurempFloat {
+    flt_handle(Float::pi(precision, rounding_from_c(rounding)))
+}
+
+/// Frees a float handle. A `NULL` argument is ignored.
+///
+/// # Safety
+/// `h` must be `NULL` or a handle returned by this library and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_float_free(h: *mut PurempFloat) {
+    if !h.is_null() {
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live [`PurempFloat`] handle.
+unsafe fn flt_binop<F>(
+    a: *const PurempFloat,
+    b: *const PurempFloat,
+    precision: u64,
+    rounding: c_int,
+    f: F,
+) -> *mut PurempFloat
+where
+    F: Fn(&Float, &Float, u64, RoundingMode) -> Float,
+{
+    if a.is_null() || b.is_null() {
+        return ptr::null_mut();
+    }
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let x = unsafe { &(*a).0 };
+        let y = unsafe { &(*b).0 };
+        flt_handle(f(x, y, precision, rounding_from_c(rounding)))
+    }));
+    r.unwrap_or(ptr::null_mut())
+}
+
+/// Returns `a + b` at `precision` bits. `NULL` on a null argument.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_float_add(
+    a: *const PurempFloat,
+    b: *const PurempFloat,
+    precision: u64,
+    rounding: c_int,
+) -> *mut PurempFloat {
+    unsafe { flt_binop(a, b, precision, rounding, Float::add) }
+}
+
+/// Returns `a - b`. `NULL` on a null argument.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_float_sub(
+    a: *const PurempFloat,
+    b: *const PurempFloat,
+    precision: u64,
+    rounding: c_int,
+) -> *mut PurempFloat {
+    unsafe { flt_binop(a, b, precision, rounding, Float::sub) }
+}
+
+/// Returns `a · b`. `NULL` on a null argument.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_float_mul(
+    a: *const PurempFloat,
+    b: *const PurempFloat,
+    precision: u64,
+    rounding: c_int,
+) -> *mut PurempFloat {
+    unsafe { flt_binop(a, b, precision, rounding, Float::mul) }
+}
+
+/// Returns `a / b` (`x/0` is signed infinity, `0/0` is NaN). `NULL` on a null
+/// argument.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_float_div(
+    a: *const PurempFloat,
+    b: *const PurempFloat,
+    precision: u64,
+    rounding: c_int,
+) -> *mut PurempFloat {
+    unsafe { flt_binop(a, b, precision, rounding, Float::div) }
+}
+
+/// Returns `√a`. `NULL` on a null argument.
+///
+/// # Safety
+/// `a` must be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_float_sqrt(
+    a: *const PurempFloat,
+    precision: u64,
+    rounding: c_int,
+) -> *mut PurempFloat {
+    if a.is_null() {
+        return ptr::null_mut();
+    }
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let x = unsafe { &(*a).0 };
+        flt_handle(x.sqrt(precision, rounding_from_c(rounding)))
+    }));
+    r.unwrap_or(ptr::null_mut())
+}
+
+/// Returns the value as a C `double`. Returns NaN if `a` is `NULL`.
+///
+/// # Safety
+/// `a` must be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_float_to_double(a: *const PurempFloat) -> f64 {
+    if a.is_null() {
+        return f64::NAN;
+    }
+    catch_unwind(AssertUnwindSafe(|| unsafe { &(*a).0 }.to_f64())).unwrap_or(f64::NAN)
+}
+
+/// Formats `a` as a fixed-point decimal string with `frac_digits` fractional
+/// digits (caller frees with [`puremp_string_free`]). `NULL` on a null argument.
+///
+/// # Safety
+/// `a` must be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_float_to_string(
+    a: *const PurempFloat,
+    frac_digits: u32,
+) -> *mut c_char {
+    if a.is_null() {
+        return ptr::null_mut();
+    }
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        CString::new(unsafe { &(*a).0 }.to_decimal_string(frac_digits)).ok()
+    }));
+    match r {
+        Ok(Some(c)) => c.into_raw(),
+        _ => ptr::null_mut(),
+    }
+}

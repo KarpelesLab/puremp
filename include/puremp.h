@@ -92,6 +92,39 @@ int puremp_rat_cmp(const PurempRat *a, const PurempRat *b);
 /* "n" or "n/d" string (caller frees with puremp_string_free). NULL on error. */
 char *puremp_rat_to_string(const PurempRat *r);
 
+/* --- Float: opaque arbitrary-precision binary float --- */
+
+typedef struct PurempFloat PurempFloat;
+
+/*
+ * Rounding modes for the float operations:
+ *   0 = to nearest (ties to even), 1 = toward zero, 2 = toward +inf,
+ *   3 = toward -inf, 4 = away from zero. Other values are treated as nearest.
+ */
+
+/* Construct from a C double / from an integer handle (rounded to `precision`). */
+PurempFloat *puremp_float_from_double(double x, uint64_t precision);
+PurempFloat *puremp_float_from_int(const PurempInt *n, uint64_t precision, int rounding);
+
+/* Pi rounded to `precision` bits. */
+PurempFloat *puremp_float_pi(uint64_t precision, int rounding);
+
+/* Release a float handle. NULL is ignored. */
+void puremp_float_free(PurempFloat *h);
+
+/* Arithmetic at `precision` bits (each returns a fresh handle, NULL on NULL). */
+PurempFloat *puremp_float_add(const PurempFloat *a, const PurempFloat *b, uint64_t precision, int rounding);
+PurempFloat *puremp_float_sub(const PurempFloat *a, const PurempFloat *b, uint64_t precision, int rounding);
+PurempFloat *puremp_float_mul(const PurempFloat *a, const PurempFloat *b, uint64_t precision, int rounding);
+PurempFloat *puremp_float_div(const PurempFloat *a, const PurempFloat *b, uint64_t precision, int rounding);
+PurempFloat *puremp_float_sqrt(const PurempFloat *a, uint64_t precision, int rounding);
+
+/* Convert to a C double (NaN if the handle is NULL). */
+double puremp_float_to_double(const PurempFloat *a);
+
+/* Fixed-point decimal string (caller frees with puremp_string_free). */
+char *puremp_float_to_string(const PurempFloat *a, uint32_t frac_digits);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

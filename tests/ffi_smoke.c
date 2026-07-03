@@ -86,6 +86,19 @@ int main(void) {
         failures++;
     }
 
+    /* Float: sqrt(2) ≈ 1.4142, and π to 5 places. */
+    PurempFloat *ftwo = puremp_float_from_double(2.0, 200);
+    PurempFloat *root2 = puremp_float_sqrt(ftwo, 200, 0);
+    double r2 = puremp_float_to_double(root2);
+    if (r2 < 1.41421 || r2 > 1.41422) {
+        fprintf(stderr, "FAIL sqrt(2) double = %.10f\n", r2);
+        failures++;
+    } else {
+        printf("ok   sqrt(2) = %.10f\n", r2);
+    }
+    PurempFloat *pi = puremp_float_pi(200, 0);
+    check_str("pi (5 dp)", puremp_float_to_string(pi, 5), "3.14159");
+
     puremp_int_free(two);
     puremp_int_free(acc);
     puremp_int_free(big);
@@ -98,6 +111,9 @@ int main(void) {
     puremp_rat_free(sum);
     puremp_rat_free(onefive);
     puremp_rat_free(zero);
+    puremp_float_free(ftwo);
+    puremp_float_free(root2);
+    puremp_float_free(pi);
 
     if (failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);

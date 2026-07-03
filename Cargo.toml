@@ -47,7 +47,7 @@ float = ["int", "rational"]
 # C library with `cargo rustc --lib --features ffi --crate-type staticlib`
 # (or `--crate-type cdylib`). The generated symbols are declared in
 # `include/puremp.h`.
-ffi = ["std", "rational"]
+ffi = ["std", "rational", "float"]
 
 # The `puremp` command-line calculator/REPL (gates the binary target below).
 cli = ["std", "rational"]

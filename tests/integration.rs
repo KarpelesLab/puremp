@@ -577,6 +577,32 @@ fn random_generation() {
 }
 
 #[test]
+fn toom3_matches_reference() {
+    // Operands large enough to cross the Toom-3 threshold (>128 limbs, ~8200
+    // bits). Check against a value computed a different way: (10^m)·(10^m') is
+    // 10^(m+m'), plus algebraic laws.
+    let p = Int::from_i64(10).pow(3000); // ~9966 bits
+    let q = Int::from_i64(10).pow(3100);
+    let prod = p.mul(&q);
+    let mut expected = String::from("1");
+    expected.push_str(&"0".repeat(6100));
+    assert_eq!(prod.to_string(), expected);
+
+    // Commutativity and distributivity on Toom-3-sized operands.
+    let a = Int::from_i64(7).pow(3500);
+    let b = Int::from_i64(3).pow(3600);
+    let c = Int::from_i64(11).pow(3400);
+    assert_eq!(a.mul(&b), b.mul(&a));
+    assert_eq!(a.mul(&b.add(&c)), a.mul(&b).add(&a.mul(&c)));
+    // (a+b)^2 == a^2 + 2ab + b^2 cross-checks Toom-3 vs the squaring path.
+    let ab = a.add(&b);
+    assert_eq!(
+        ab.square(),
+        a.square().add(&a.mul(&b).mul_2k(1)).add(&b.square())
+    );
+}
+
+#[test]
 fn square_matches_mul() {
     // Squaring must agree with the general multiply across sizes (schoolbook and
     // Karatsuba squaring paths), including a value that crosses the threshold.

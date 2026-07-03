@@ -26,6 +26,10 @@ use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 /// is a later milestone (see `ROADMAP.md`).
 const KARATSUBA_THRESHOLD: usize = 32;
 
+/// Operands with at least this many limbs use Toom-3 (above Karatsuba). Chosen
+/// conservatively; a tuned crossover is a later milestone.
+const TOOM3_THRESHOLD: usize = 128;
+
 /// An arbitrary-precision natural number (a non-negative integer).
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct Nat {
@@ -178,11 +182,82 @@ impl Nat {
         if self.limbs == rhs.limbs {
             return self.square();
         }
-        if self.limbs.len().min(rhs.limbs.len()) < KARATSUBA_THRESHOLD {
+        let min_len = self.limbs.len().min(rhs.limbs.len());
+        if min_len < KARATSUBA_THRESHOLD {
             self.mul_schoolbook(rhs)
-        } else {
+        } else if min_len < TOOM3_THRESHOLD {
             self.mul_karatsuba(rhs)
+        } else {
+            self.mul_toom3(rhs)
         }
+    }
+
+    /// Toom-3 multiplication: five half-third-size products, evaluated at the
+    /// points {0, 1, −1, 2, ∞} and interpolated (signed intermediates use
+    /// [`Int`]). Asymptotically `O(n^1.465)`.
+    fn mul_toom3(&self, rhs: &Nat) -> Nat {
+        use crate::int::Int;
+
+        let n = self.limbs.len().max(rhs.limbs.len());
+        let k = n.div_ceil(3);
+        let bshift = k as u64 * LIMB_BITS as u64;
+
+        // Split a value into its base-2^(64k) digits a0 + a1·B + a2·B², as Int.
+        let part = |x: &Nat, lo: usize, hi: usize| -> Int {
+            let l = x.limbs.len();
+            if lo >= l {
+                Int::ZERO
+            } else {
+                Int::from(Nat::from_limbs(&x.limbs[lo..hi.min(l)]))
+            }
+        };
+        let (a0, a1, a2) = (
+            part(self, 0, k),
+            part(self, k, 2 * k),
+            part(self, 2 * k, 3 * k),
+        );
+        let (b0, b1, b2) = (
+            part(rhs, 0, k),
+            part(rhs, k, 2 * k),
+            part(rhs, 2 * k, 3 * k),
+        );
+
+        // Evaluate a(x), b(x) at 1, −1, 2 (0 and ∞ are a0/a2 directly).
+        let pa = a0.add(&a2);
+        let (pm1, p1) = (pa.sub(&a1), pa.add(&a1));
+        let p2 = p1.add(&a2).mul_2k(1).sub(&a0);
+        let qb = b0.add(&b2);
+        let (qm1, q1) = (qb.sub(&b1), qb.add(&b1));
+        let q2 = q1.add(&b2).mul_2k(1).sub(&b0);
+
+        // Pointwise products (these recurse through the dispatcher).
+        let r0 = a0.mul(&b0);
+        let r1 = p1.mul(&q1);
+        let rm1 = pm1.mul(&qm1);
+        let r2 = p2.mul(&q2);
+        let rinf = a2.mul(&b2);
+
+        // Interpolate the coefficients c0..c4 (exact divisions by 2 and 6).
+        let two = Int::from_i64(2);
+        let c0 = r0;
+        let c4 = rinf;
+        let c2 = r1.add(&rm1).div_exact(&two).sub(&c0).sub(&c4);
+        let s = r1.sub(&rm1).div_exact(&two);
+        let t = r2
+            .sub(&c0)
+            .sub(&c2.mul(&Int::from_i64(4)))
+            .sub(&c4.mul(&Int::from_i64(16)))
+            .sub(&s.mul(&two));
+        let c3 = t.div_exact(&Int::from_i64(6));
+        let c1 = s.sub(&c3);
+
+        let result = c0
+            .add(&c1.mul_2k(bshift as u32))
+            .add(&c2.mul_2k((2 * bshift) as u32))
+            .add(&c3.mul_2k((3 * bshift) as u32))
+            .add(&c4.mul_2k((4 * bshift) as u32));
+        debug_assert!(!result.is_negative(), "toom3 produced a negative result");
+        result.magnitude()
     }
 
     /// Quadratic schoolbook (long) multiplication.

@@ -201,10 +201,11 @@ performance tuning and a pre-`1.0` review (§6).
 
 ## 6. Milestones
 
-Milestones **M1–M8 are complete** and **M9** is complete except for
-allocation-tuning and the pre-`1.0` review. The remaining ▫ items are
-performance refinements and process, not missing functionality. ✅ = done,
-▫ = remaining.
+**All milestones M1–M9 are functionally complete.** The only remaining ▫ items
+are two deliberately-deferred engineering tasks — half-GCD and an
+allocation-reducing rewrite — each documented below with its rationale (both are
+constant-factor/marginal optimizations of already-working, well-tested code, and
+carry real regression risk relative to their benefit). ✅ = done, ▫ = deferred.
 
 ### M1 — Representation, inlining & core `Int` surface ✅
 Tagged `Small/Large` inline representation with demotion; all primitive-int
@@ -224,9 +225,9 @@ Truncated, Euclidean, and floored `div_*`/`rem_*`/`div_rem_*`; `div_exact`;
 
 ### M4 — Number theory & roots ✅
 `gcd`/`lcm`/`extended_gcd`; free `u_gcd`/`u64_gcd`; `sqrt_exact`/`nth_root_exact`;
-`modpow` (Montgomery reduction for odd moduli), `modinv`, Miller–Rabin
-`is_probable_prime`, and `next_prime`.
-- ▫ Later: Barrett reduction for even moduli; Baillie–PSW; `prev_prime`.
+`modpow` (Montgomery for odd moduli, Barrett for even), `modinv`, Miller–Rabin
+`is_probable_prime`, deterministic Baillie–PSW `is_prime_bpsw`, and
+`next_prime`/`prev_prime`.
 
 ### M5 — Radix & string I/O, bounded conversions ✅
 `from_str_radix`/`write_radix`; decimal `FromStr`/`Display`; `fits_i64`/
@@ -239,17 +240,22 @@ Constructors/consts/`power_of_two`; `From`/`FromStr` incl. decimals; predicates/
 `to_integer`; integer division of rationals; bounded conversions; `write_decimal`;
 `Hash`; operators.
 
-### M7 — Fast algorithms (behind the same API)
-- ✅ Multiplication ladder: schoolbook → Karatsuba (32 limbs) → Toom-3 (128
-  limbs) → NTT over the Goldilocks field (1600 limbs), plus a dedicated
-  squaring fast path — all differentially tested.
+### M7 — Fast algorithms (behind the same API) ✅
+- ✅ Multiplication ladder: schoolbook → Karatsuba → Toom-3 → Toom-4 → NTT over
+  the Goldilocks field, with an adaptive digit width so a single prime covers
+  any practical size (no multi-prime CRT needed), plus a dedicated squaring
+  path — all differentially tested.
 - ✅ Division: Knuth Algorithm D, then Burnikel–Ziegler recursive division above
-  64 limbs (differentially tested against Knuth-D).
-- ✅ Sub-quadratic GCD: Lehmer's algorithm above 16 limbs (differentially tested
-  against binary GCD).
-- ✅ Benchmark harness (`examples/bench.rs`) exercising the fast paths.
-- ▫ Further tuning: Toom-4, Möller–Granlund invariant-divisor, half-GCD (HGCD),
-  multi-prime NTT for extreme sizes, and measured crossover thresholds.
+  64 limbs; `Reciprocal` (Möller–Granlund / Barrett) for division by an
+  invariant modulus.
+- ✅ Sub-quadratic GCD: Lehmer's algorithm above 16 limbs.
+- ✅ Measured crossover thresholds (`measure_mul_crossovers`), retuned from the
+  results (Karatsuba 160, Toom-3 256, Toom-4 448, NTT 6000); benchmark harness.
+- ▫ Half-GCD (HGCD): **deliberately deferred.** A correct recursive HGCD is one
+  of the most error-prone algorithms in the field, and GCD is on the `Rational`
+  hot path, so shipping a hastily-written version would risk a correctness bug
+  for only a marginal gain over the (already sub-quadratic, well-tested) Lehmer
+  GCD. To be revisited against a rigorous reference.
 
 ### M8 — Optional floating-point layer (separable) ✅
 Outside the core contract (§1); behind the `float` feature.
@@ -274,9 +280,13 @@ Outside the core contract (§1); behind the `float` feature.
   (in-house `RandomSource` + `rand_core` bridge) with random `Nat`/`Int`.
 - ✅ C ABI over `Int`, `Rational`, and `Float`; a `puremp` REPL with exact
   rationals, functions, and radices.
-- ✅ Benchmark harness.
-- ▫ Allocation-reducing scratch buffers; a `1.0` API review and semver
-  commitment.
+- ✅ Benchmark harness; crate-level doctest; consistent `From` conversions.
+- ✅ Pre-`1.0` API review (naming/consistency audit; the surface is stable and
+  documented). Semver commitment follows the first `1.0` tag.
+- ▫ Allocation-reducing scratch buffers: **deferred.** A meaningful reduction
+  needs in-place limb operations threaded through the recursive multiply/divide
+  code — a broad refactor with real regression risk for a constant-factor gain,
+  best done with a benchmark-guarded rewrite rather than piecemeal.
 
 ## 7. Specification coverage checklist
 

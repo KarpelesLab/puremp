@@ -21,6 +21,23 @@
 //! `ROADMAP.md` for the design, the algorithm references, and the milestone
 //! plan.
 //!
+//! # Example
+//!
+//! ```
+//! use puremp::{Int, Rational};
+//!
+//! // Arbitrary-precision integers.
+//! let big = Int::from(2).pow(128);
+//! assert_eq!(big.to_string(), "340282366920938463463374607431768211456");
+//! assert_eq!(Int::from(1071).gcd(&Int::from(462)).to_string(), "21");
+//! assert_eq!(Int::from(2).modpow(&Int::from(10), &Int::from(1000)).to_string(), "24");
+//!
+//! // Exact rationals, always in lowest terms.
+//! let third = Rational::new(Int::from(1), Int::from(3));
+//! let sum = &(&third + &third) + &third;
+//! assert_eq!(sum.to_string(), "1");
+//! ```
+//!
 //! # `no_std`
 //!
 //! The crate is `#![no_std]` at its core. Arbitrary-precision types are

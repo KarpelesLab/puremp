@@ -1716,12 +1716,15 @@ impl Ord for Nat {
     }
 }
 
-impl From<u64> for Nat {
-    #[inline]
-    fn from(v: u64) -> Self {
-        Nat::from_u64(v)
-    }
+macro_rules! nat_from_small_unsigned {
+    ($($t:ty)*) => {$(
+        impl From<$t> for Nat {
+            #[inline]
+            fn from(v: $t) -> Self { Nat::from_u64(v as u64) }
+        }
+    )*};
 }
+nat_from_small_unsigned!(u8 u16 u32 u64 usize);
 
 impl From<u128> for Nat {
     #[inline]

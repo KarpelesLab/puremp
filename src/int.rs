@@ -522,6 +522,14 @@ impl Int {
         Some(x.rem_euclid(modulus))
     }
 
+    /// Returns the smallest prime strictly greater than `self` (at least 2).
+    pub fn next_prime(&self, rng: &mut impl crate::random::RandomSource) -> Int {
+        if self < &Int::from_i64(2) {
+            return Int::from_i64(2);
+        }
+        Int::from(self.magnitude().next_prime(rng))
+    }
+
     /// Extended GCD: returns `(g, x, y)` with `g == self·x + b·y` and `g ≥ 0`.
     pub fn extended_gcd(&self, b: &Int) -> (Int, Int, Int) {
         let (mut old_r, mut r) = (self.clone(), b.clone());

@@ -680,3 +680,26 @@ fn primality_testing() {
     // A Carmichael number (561 = 3·11·17) must be caught by Miller–Rabin.
     assert!(!nat("561").is_probable_prime(40, &mut rng));
 }
+
+#[test]
+fn next_prime_works() {
+    use puremp::RandomSource;
+    struct Lcg(u64);
+    impl RandomSource for Lcg {
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for b in dest.iter_mut() {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (self.0 >> 33) as u8;
+            }
+        }
+    }
+    let mut rng = Lcg(12345);
+    assert_eq!(int("0").next_prime(&mut rng).to_string(), "2");
+    assert_eq!(int("2").next_prime(&mut rng).to_string(), "3");
+    assert_eq!(int("7").next_prime(&mut rng).to_string(), "11");
+    assert_eq!(int("100").next_prime(&mut rng).to_string(), "101");
+    // Next prime after a large power of ten (10^30 + 57 is the known answer).
+    let p = int("1000000000000000000000000000000").next_prime(&mut rng);
+    assert_eq!(p.to_string(), "1000000000000000000000000000057");
+    assert!(p.magnitude().is_probable_prime(40, &mut rng));
+}

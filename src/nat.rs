@@ -1189,15 +1189,24 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
 }
 
 impl Nat {
-    /// Returns `self^exp mod modulus` by square-and-multiply with reduction
-    /// after each step. Panics if `modulus` is zero.
+    /// Returns `self^exp mod modulus`. Panics if `modulus` is zero.
     ///
-    /// (Barrett/Montgomery reduction would speed this up; see `ROADMAP.md`.)
+    /// Odd moduli use Montgomery reduction; others fall back to
+    /// square-and-multiply with a division-based reduction.
     pub fn modpow(&self, exp: &Nat, modulus: &Nat) -> Nat {
         assert!(!modulus.is_zero(), "modpow: zero modulus");
         if modulus.is_one() {
             return Nat::zero();
         }
+        if !modulus.is_even() && modulus.limbs.len() >= 2 {
+            self.modpow_montgomery(exp, modulus)
+        } else {
+            self.modpow_simple(exp, modulus)
+        }
+    }
+
+    /// Square-and-multiply with a division-based reduction after each step.
+    fn modpow_simple(&self, exp: &Nat, modulus: &Nat) -> Nat {
         let mut result = Nat::one();
         let mut base = self.div_rem(modulus).expect("non-zero modulus").1;
         let bits = exp.bit_len();
@@ -1210,6 +1219,66 @@ impl Nat {
             }
         }
         result
+    }
+
+    /// Montgomery-reduction modpow for an odd `modulus > 1`.
+    fn modpow_montgomery(&self, exp: &Nat, modulus: &Nat) -> Nat {
+        use crate::int::Int;
+
+        let k = modulus.limbs.len();
+        let rbits = k as u64 * LIMB_BITS as u64;
+        // R = 2^(64k); m' = −m^{-1} mod R; R² mod m for conversion into the domain.
+        let r = Nat::one().shl(rbits);
+        let minv = Int::from(modulus.clone())
+            .modinv(&Int::from(r.clone()))
+            .expect("odd modulus is invertible mod 2^k")
+            .magnitude();
+        let m_prime = r.checked_sub(&minv).unwrap_or_else(Nat::zero);
+        let r2 = r.mul(&r).div_rem(modulus).expect("non-zero").1;
+
+        // REDC(t) = (t + ((t mod R)·m' mod R)·m) / R, conditionally reduced.
+        let redc = |t: &Nat| -> Nat {
+            let u = t.low_bits(rbits).mul(&m_prime).low_bits(rbits);
+            let s = t.add(&u.mul(modulus)).shr(rbits);
+            if s.cmp_ref(modulus) != Ordering::Less {
+                s.checked_sub(modulus).expect("s >= m")
+            } else {
+                s
+            }
+        };
+
+        let base_mod = self.div_rem(modulus).expect("non-zero").1;
+        let mut base = redc(&base_mod.mul(&r2)); // into Montgomery form
+        let mut result = r.div_rem(modulus).expect("non-zero").1; // 1 in Montgomery form
+        let bits = exp.bit_len();
+        for i in 0..bits {
+            if exp.bit(i) {
+                result = redc(&result.mul(&base));
+            }
+            if i + 1 < bits {
+                base = redc(&base.square());
+            }
+        }
+        redc(&result) // back out of Montgomery form
+    }
+
+    /// Returns the smallest prime strictly greater than `self`, found by
+    /// scanning odd candidates with the Miller–Rabin test.
+    pub fn next_prime(&self, rng: &mut impl crate::random::RandomSource) -> Nat {
+        let two = Nat::from_u64(2);
+        if self.cmp_ref(&two) == Ordering::Less {
+            return two; // next prime after 0 or 1
+        }
+        let mut c = self.add(&Nat::one());
+        if c.is_even() {
+            c = c.add(&Nat::one()); // start at an odd candidate ≥ 3
+        }
+        loop {
+            if c.is_probable_prime(40, rng) {
+                return c;
+            }
+            c = c.add(&two);
+        }
     }
 
     /// Miller–Rabin probable-primality test with `rounds` random witnesses.
@@ -1503,6 +1572,39 @@ mod tests {
             assert_eq!(r_bz, r_kn, "BZ remainder mismatch");
             assert_eq!(q_bz.mul(&b).add(&r_bz), a);
             assert!(r_bz.cmp_ref(&b) == Ordering::Less);
+        }
+    }
+
+    #[test]
+    fn montgomery_matches_simple_modpow() {
+        // Montgomery-reduction modpow must match the division-based version for
+        // random bases/exponents and odd moduli of assorted sizes.
+        let mut state = 0xabcd_1234_5678_9999u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let build = |cnt: usize, f: &mut dyn FnMut() -> u64| {
+            let bytes: Vec<u8> = (0..cnt * 8).map(|_| f() as u8).collect();
+            Nat::from_bytes_le(&bytes)
+        };
+        for _ in 0..20 {
+            let base = build(2 + (next() % 8) as usize, &mut next);
+            let exp = build(1 + (next() % 4) as usize, &mut next);
+            let mut m = build(2 + (next() % 6) as usize, &mut next);
+            if m.is_even() {
+                m = m.add(&Nat::one()); // make odd
+            }
+            if m.limbs.len() < 2 {
+                continue;
+            }
+            assert_eq!(
+                base.modpow_montgomery(&exp, &m),
+                base.modpow_simple(&exp, &m),
+                "montgomery vs simple modpow"
+            );
         }
     }
 

@@ -224,8 +224,9 @@ Truncated, Euclidean, and floored `div_*`/`rem_*`/`div_rem_*`; `div_exact`;
 
 ### M4 — Number theory & roots ✅
 `gcd`/`lcm`/`extended_gcd`; free `u_gcd`/`u64_gcd`; `sqrt_exact`/`nth_root_exact`;
-`modpow`, `modinv`, and Miller–Rabin `is_probable_prime`.
-- ▫ Later: Barrett/Montgomery reduction to speed up `modpow`; `next_prime`.
+`modpow` (Montgomery reduction for odd moduli), `modinv`, Miller–Rabin
+`is_probable_prime`, and `next_prime`.
+- ▫ Later: Barrett reduction for even moduli; Baillie–PSW; `prev_prime`.
 
 ### M5 — Radix & string I/O, bounded conversions ✅
 `from_str_radix`/`write_radix`; decimal `FromStr`/`Display`; `fits_i64`/

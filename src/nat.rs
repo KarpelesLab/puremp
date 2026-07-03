@@ -1287,12 +1287,61 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
     if !(2..=36).contains(&radix) || s.is_empty() {
         return Err(Error::Parse);
     }
-    let mut n = Nat::zero();
-    for ch in s.chars() {
-        let d = ch.to_digit(radix).ok_or(Error::Parse)?;
-        n = n.mul_add_small(radix as Limb, d as Limb);
+    // Largest `d` with `radix^d` fitting a `u64`, and that base `B = radix^d`.
+    let (chunk, base) = {
+        let (mut d, mut p) = (0u32, 1u64);
+        while let Some(next) = p.checked_mul(radix as u64) {
+            p = next;
+            d += 1;
+        }
+        (d as usize, p)
+    };
+
+    // Validate and collect the digit values (big-endian).
+    let digits: Vec<u32> = s
+        .chars()
+        .map(|c| c.to_digit(radix).ok_or(Error::Parse))
+        .collect::<Result<_>>()?;
+
+    // Fast path for small inputs: a single base-`B` limb.
+    if digits.len() <= chunk {
+        let mut val: u64 = 0;
+        for &dg in &digits {
+            val = val * radix as u64 + dg as u64;
+        }
+        return Ok(Nat::from_u64(val));
     }
-    Ok(n)
+
+    // Pack `chunk` digits at a time into base-`B` limbs, least-significant first.
+    let mut level: Vec<Nat> = Vec::with_capacity(digits.len() / chunk + 1);
+    let mut end = digits.len();
+    while end > 0 {
+        let start = end.saturating_sub(chunk);
+        let mut val: u64 = 0;
+        for &dg in &digits[start..end] {
+            val = val * radix as u64 + dg as u64;
+        }
+        level.push(Nat::from_u64(val));
+        end = start;
+    }
+
+    // Merge adjacent limbs up a balanced tree: `pair.0 + pair.1 · B^(2^k)`.
+    // `power` starts at `B` and squares each level, so the work is
+    // `O(M(n)·log n)` with sub-quadratic multiplication.
+    let mut power = Nat::from_u64(base);
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            if pair.len() == 2 {
+                next.push(pair[0].add(&pair[1].mul(&power)));
+            } else {
+                next.push(pair[0].clone());
+            }
+        }
+        level = next;
+        power = power.mul(&power);
+    }
+    Ok(level.pop().unwrap_or_else(Nat::zero))
 }
 
 impl Nat {

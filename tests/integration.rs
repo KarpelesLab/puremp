@@ -950,3 +950,30 @@ fn tryfrom_primitive_conversions() {
         u64::MAX
     );
 }
+
+#[test]
+fn large_parse_roundtrip_multi_radix() {
+    // A large, irregular value (not all one digit).
+    let n = int("7")
+        .pow(4000)
+        .mul(&int("11").pow(2000))
+        .add(&int("123456789"));
+    for radix in [2u32, 8, 10, 16, 36] {
+        let mut s = String::new();
+        n.write_radix(&mut s, radix).unwrap();
+        let back = Int::from_str_radix(&s, radix).unwrap();
+        assert_eq!(back, n, "radix {radix} round-trip");
+    }
+    // Leading-zero and boundary strings.
+    assert_eq!(nat("000123").to_string(), "123");
+    assert_eq!(nat(&"9".repeat(500)).to_string(), "9".repeat(500));
+    // Exactly one base-10^19 chunk boundary (19 and 20 digit values).
+    assert_eq!(
+        nat("9999999999999999999").to_string(),
+        "9999999999999999999"
+    );
+    assert_eq!(
+        nat("10000000000000000000").to_string(),
+        "10000000000000000000"
+    );
+}

@@ -360,6 +360,20 @@ Aligned to the spec's test list; property tests run randomized, many iterations:
   bit-at-a-time ↔ Knuth-D ↔ Burnikel–Ziegler must agree).
 - **C ABI smoke tests** (`tests/ffi_smoke.c`) compiled and run in CI.
 
+## 8a. Extended numeric types ✅
+
+Beyond the core `Int`/`Rational` contract and the optional `Float`, the crate
+ships a small family of exact/convenience types layered on the same foundation:
+
+- **`Dyadic`** (`dyadic` feature) — exact dyadic rationals `n·2^-k` (denominator
+  a power of two): exact `+`/`-`/`*`/`pow`/`mul_2k`, a terminating-decimal
+  `Display`, and conversions to/from `Rational`/`Float`.
+- **`InfRational`** (`rational` feature) — `Rational` extended with `±∞`/`NaN`
+  and IEEE-style arithmetic, exact on the finite part.
+- **`FixedFloat`** (`float` feature) — a fixed-precision wrapper over `Float`
+  that bakes in the precision and rounding mode so it supports the ordinary
+  `+ - * /` operators and method-style transcendentals.
+
 ## 9. Non-goals
 
 - Floating point as part of the core contract — it is a separable optional layer

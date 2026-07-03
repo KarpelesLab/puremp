@@ -1,16 +1,18 @@
 //! `puremp` — arbitrary-precision arithmetic written entirely in Rust, depending
 //! on no foreign code.
 //!
-//! It provides three families of numbers, built bottom-up:
+//! It provides a family of numeric types, built bottom-up:
 //!
 //! 1. **Integers** — unsigned [`Nat`] and signed [`Int`], the workhorse layer
 //!    that carries the hard limb-level algorithms (multiplication, division,
 //!    GCD, modular arithmetic, …). Enabled by the `int` feature.
-//! 2. **Rationals** — [`Rational`], exact `p/q` fractions kept in lowest terms.
-//!    Enabled by the `rational` feature.
-//! 3. **Floats** — [`Float`], binary floating-point with a caller-chosen
+//! 2. **Rationals** — [`Rational`], exact `p/q` fractions kept in lowest terms;
+//!    plus [`InfRational`], the same extended with `±∞`/`NaN`. `rational` feature.
+//! 3. **Dyadics** — [`Dyadic`], exact `n·2^-k` binary fractions. `dyadic` feature.
+//! 4. **Floats** — [`Float`], binary floating-point with a caller-chosen
 //!    precision and directed [`RoundingMode`], aiming at MPFR-class correct
-//!    rounding. Enabled by the `float` feature.
+//!    rounding, plus [`FixedFloat`], a fixed-precision wrapper with operators.
+//!    `float` feature.
 //!
 //! `puremp` is usable as a Rust library, a C library (the `ffi` feature; see
 //! `include/puremp.h`), and a standalone command-line calculator (the `cli`

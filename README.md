@@ -96,8 +96,9 @@ int main(void) {
 | `std` | ✔ | `std::error::Error`, the CLI, system I/O (implies `alloc`) |
 | `alloc` | ✔ | Heap-backed arbitrary-precision types (required by every layer) |
 | `int` | ✔ | `Nat` and `Int` |
-| `rational` | ✔ | `Rational` (implies `int`) |
-| `float` | ✔ | Separable `Float` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
+| `rational` | ✔ | `Rational` and `InfRational` (implies `int`) |
+| `dyadic` | ✔ | `Dyadic` — exact `n·2⁻ᵏ` binary fractions (implies `int`) |
+| `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
 | `ffi` | | The C ABI module (`include/puremp.h`) |
 | `cli` | ✔ | The `puremp` binary |
 

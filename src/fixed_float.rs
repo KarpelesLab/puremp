@@ -1,5 +1,5 @@
 //! Fixed-precision floating point — a `mpfx`-style convenience wrapper over
-//! [`Float`](crate::float::Float).
+//! [`Float`].
 //!
 //! [`Float`] takes an explicit output precision and [`RoundingMode`] on *every*
 //! operation (the flexible MPFR-style interface). [`FixedFloat`] instead bakes a

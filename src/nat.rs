@@ -6,10 +6,9 @@
 //! lets the derived [`PartialEq`]/[`Eq`] be correct.
 //!
 //! This is the layer that carries the heavy limb-level algorithms: addition,
-//! subtraction, multiplication (schoolbook with a Karatsuba path), division
-//! (single-limb plus Knuth Algorithm D), shifts, binary GCD, roots, and radix
-//! I/O. Further sub-quadratic work (Toom/FFT multiplication, Burnikel–Ziegler
-//! division) is future performance work — see `ROADMAP.md`.
+//! subtraction, multiplication (schoolbook → Karatsuba → Toom-3 → NTT),
+//! squaring, division (single-limb, Knuth Algorithm D, and Burnikel–Ziegler),
+//! shifts, GCD (binary → Lehmer), roots, and sub-quadratic radix I/O.
 
 use core::cmp::Ordering;
 use core::fmt;
@@ -32,6 +31,167 @@ const TOOM3_THRESHOLD: usize = 128;
 
 /// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
 const LEHMER_THRESHOLD: usize = 16;
+
+/// Operands with at least this many limbs use NTT multiplication (above Toom-3),
+/// provided the transform length stays within [`NTT_MAX_LEN`].
+const NTT_THRESHOLD: usize = 1600;
+
+/// Largest NTT transform length used; beyond this the convolution coefficients
+/// could exceed the modulus, so multiplication falls back to Toom-3.
+const NTT_MAX_LEN: usize = 1 << 28;
+
+// --- Number-theoretic transform over the Goldilocks field 2^64 − 2^32 + 1 ---
+//
+// This prime has `p − 1 = 2^32·(2^32 − 1)`, so it supports NTTs of any power-of-
+// two length up to 2^32, and 7 is a primitive root. Modular reduction uses the
+// portable `u128 % p` (correct, if not the fastest possible).
+
+/// The Goldilocks prime `2^64 − 2^32 + 1`.
+const GOLDILOCKS: u64 = 0xFFFF_FFFF_0000_0001;
+/// A primitive root of the Goldilocks multiplicative group.
+const GOLDILOCKS_ROOT: u64 = 7;
+
+#[inline]
+fn gf_mul(a: u64, b: u64) -> u64 {
+    ((a as u128 * b as u128) % GOLDILOCKS as u128) as u64
+}
+
+#[inline]
+fn gf_add(a: u64, b: u64) -> u64 {
+    let s = a as u128 + b as u128;
+    (if s >= GOLDILOCKS as u128 {
+        s - GOLDILOCKS as u128
+    } else {
+        s
+    }) as u64
+}
+
+#[inline]
+fn gf_sub(a: u64, b: u64) -> u64 {
+    if a >= b {
+        a - b
+    } else {
+        (a as u128 + GOLDILOCKS as u128 - b as u128) as u64
+    }
+}
+
+fn gf_pow(mut base: u64, mut exp: u64) -> u64 {
+    let mut r = 1u64;
+    base %= GOLDILOCKS;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            r = gf_mul(r, base);
+        }
+        base = gf_mul(base, base);
+        exp >>= 1;
+    }
+    r
+}
+
+/// In-place iterative NTT (or its inverse) over the Goldilocks field.
+fn ntt(a: &mut [u64], inverse: bool) {
+    let n = a.len();
+    // Bit-reversal permutation.
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            a.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let mut wlen = gf_pow(GOLDILOCKS_ROOT, (GOLDILOCKS - 1) / len as u64);
+        if inverse {
+            wlen = gf_pow(wlen, GOLDILOCKS - 2);
+        }
+        let mut i = 0;
+        while i < n {
+            let mut w = 1u64;
+            for k in 0..len / 2 {
+                let u = a[i + k];
+                let v = gf_mul(a[i + k + len / 2], w);
+                a[i + k] = gf_add(u, v);
+                a[i + k + len / 2] = gf_sub(u, v);
+                w = gf_mul(w, wlen);
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+    if inverse {
+        let n_inv = gf_pow(n as u64, GOLDILOCKS - 2);
+        for x in a.iter_mut() {
+            *x = gf_mul(*x, n_inv);
+        }
+    }
+}
+
+/// Splits `x` into little-endian 16-bit digits (at least one).
+fn to_digits16(x: &Nat) -> Vec<u64> {
+    let bytes = x.to_bytes_le();
+    let mut d = Vec::with_capacity(bytes.len() / 2 + 1);
+    let mut i = 0;
+    while i < bytes.len() {
+        let lo = bytes[i] as u64;
+        let hi = if i + 1 < bytes.len() {
+            bytes[i + 1] as u64
+        } else {
+            0
+        };
+        d.push(lo | (hi << 8));
+        i += 2;
+    }
+    if d.is_empty() {
+        d.push(0);
+    }
+    d
+}
+
+/// NTT-based multiplication (falls back to Toom-3 if the transform would be too
+/// long for a single Goldilocks prime).
+fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
+    let da = to_digits16(a);
+    let db = to_digits16(b);
+    let need = da.len() + db.len();
+    let mut n = 1usize;
+    while n < need {
+        n <<= 1;
+    }
+    if n > NTT_MAX_LEN {
+        return a.mul_toom3(b);
+    }
+    let mut fa = alloc::vec![0u64; n];
+    let mut fb = alloc::vec![0u64; n];
+    fa[..da.len()].copy_from_slice(&da);
+    fb[..db.len()].copy_from_slice(&db);
+    ntt(&mut fa, false);
+    ntt(&mut fb, false);
+    for (x, y) in fa.iter_mut().zip(&fb) {
+        *x = gf_mul(*x, *y);
+    }
+    ntt(&mut fa, true);
+    // Carry-propagate the convolution coefficients in base 2^16.
+    let mut bytes: Vec<u8> = Vec::with_capacity(2 * n + 8);
+    let mut carry: u128 = 0;
+    for &coef in &fa {
+        carry += coef as u128;
+        bytes.push((carry & 0xFF) as u8);
+        bytes.push(((carry >> 8) & 0xFF) as u8);
+        carry >>= 16;
+    }
+    while carry != 0 {
+        bytes.push((carry & 0xFF) as u8);
+        bytes.push(((carry >> 8) & 0xFF) as u8);
+        carry >>= 16;
+    }
+    Nat::from_bytes_le(&bytes)
+}
 
 /// Divisors with at least this many limbs use Burnikel–Ziegler recursive
 /// division; smaller ones use Knuth Algorithm D directly.
@@ -299,8 +459,10 @@ impl Nat {
             self.mul_schoolbook(rhs)
         } else if min_len < TOOM3_THRESHOLD {
             self.mul_karatsuba(rhs)
-        } else {
+        } else if min_len < NTT_THRESHOLD {
             self.mul_toom3(rhs)
+        } else {
+            mul_ntt(self, rhs)
         }
     }
 
@@ -1213,6 +1375,34 @@ mod tests {
             // Reconstruction and range.
             assert_eq!(q.mul(&b).add(&r), a);
             assert!(r.cmp_ref(&b) == Ordering::Less);
+        }
+    }
+
+    #[test]
+    fn ntt_matches_toom3() {
+        // NTT multiplication must agree with the (verified) Toom-3 path, and
+        // with a value computed a different way.
+        let p = Nat::from_u64(10).pow(4000); // ~13k bits, ~208 limbs
+        let q = Nat::from_u64(10).pow(4100);
+        let mut expected = String::from("1");
+        expected.push_str(&"0".repeat(8100));
+        assert_eq!(mul_ntt(&p, &q), Nat::from_str(&expected).unwrap());
+
+        let mut state = 0x0f0f_1234_dead_beefu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let build = |cnt: usize, f: &mut dyn FnMut() -> u64| {
+            let bytes: Vec<u8> = (0..cnt * 8).map(|_| f() as u8).collect();
+            Nat::from_bytes_le(&bytes)
+        };
+        for _ in 0..8 {
+            let a = build(200 + (next() % 400) as usize, &mut next);
+            let b = build(200 + (next() % 400) as usize, &mut next);
+            assert_eq!(mul_ntt(&a, &b), a.mul_toom3(&b), "NTT vs Toom-3 mismatch");
         }
     }
 

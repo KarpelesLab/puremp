@@ -634,15 +634,18 @@ impl Nat {
 
     /// Quadratic schoolbook (long) multiplication.
     fn mul_schoolbook(&self, rhs: &Nat) -> Nat {
-        let mut out = alloc::vec![0 as Limb; self.limbs.len() + rhs.limbs.len()];
+        let rn = rhs.limbs.len();
+        let mut out = alloc::vec![0 as Limb; self.limbs.len() + rn];
         for (i, &a) in self.limbs.iter().enumerate() {
             let mut carry = 0;
-            for (j, &b) in rhs.limbs.iter().enumerate() {
-                let (lo, hi) = mac(out[i + j], a, b, carry);
-                out[i + j] = lo;
+            // A single bounds check on the row slice, then none per limb.
+            let row = &mut out[i..i + rn];
+            for (o, &b) in row.iter_mut().zip(&rhs.limbs) {
+                let (lo, hi) = mac(*o, a, b, carry);
+                *o = lo;
                 carry = hi;
             }
-            out[i + rhs.limbs.len()] = carry;
+            out[i + rn] = carry;
         }
         let mut n = Nat { limbs: out };
         n.normalize();
@@ -669,9 +672,12 @@ impl Nat {
         let mut cross = alloc::vec![0 as Limb; 2 * n];
         for i in 0..n {
             let mut carry = 0;
-            for j in (i + 1)..n {
-                let (lo, hi) = mac(cross[i + j], self.limbs[i], self.limbs[j], carry);
-                cross[i + j] = lo;
+            let ai = self.limbs[i];
+            // Row `cross[2i+1 .. i+n]` zips with the tail `self.limbs[i+1..]`.
+            let row = &mut cross[2 * i + 1..i + n];
+            for (o, &b) in row.iter_mut().zip(&self.limbs[i + 1..]) {
+                let (lo, hi) = mac(*o, ai, b, carry);
+                *o = lo;
                 carry = hi;
             }
             cross[i + n] = carry;

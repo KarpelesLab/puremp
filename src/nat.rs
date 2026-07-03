@@ -30,6 +30,15 @@ const KARATSUBA_THRESHOLD: usize = 32;
 /// conservatively; a tuned crossover is a later milestone.
 const TOOM3_THRESHOLD: usize = 128;
 
+/// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
+const LEHMER_THRESHOLD: usize = 16;
+
+/// `s·a + t·b` as an [`Int`], for the Lehmer cofactor combination.
+fn lincomb(s: i128, a: &crate::int::Int, t: i128, b: &crate::int::Int) -> crate::int::Int {
+    use crate::int::Int;
+    Int::from_i128(s).mul(a).add(&Int::from_i128(t).mul(b))
+}
+
 /// An arbitrary-precision natural number (a non-negative integer).
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct Nat {
@@ -440,9 +449,10 @@ impl Nat {
         n
     }
 
-    /// Returns the greatest common divisor of `self` and `rhs`, via Stein's
-    /// binary GCD (no division required).
+    /// Returns the greatest common divisor of `self` and `rhs`.
     ///
+    /// Small operands use Stein's binary GCD; large ones use Lehmer's algorithm,
+    /// which advances several Euclidean steps per multi-precision operation.
     /// `gcd(0, n) == gcd(n, 0) == n`, and `gcd(0, 0) == 0`.
     pub fn gcd(&self, rhs: &Nat) -> Nat {
         if self.is_zero() {
@@ -451,19 +461,25 @@ impl Nat {
         if rhs.is_zero() {
             return self.clone();
         }
+        if self.limbs.len().max(rhs.limbs.len()) < LEHMER_THRESHOLD {
+            self.gcd_binary(rhs)
+        } else {
+            self.gcd_lehmer(rhs)
+        }
+    }
+
+    /// Stein's binary GCD (no division). Precondition: both operands non-zero.
+    fn gcd_binary(&self, rhs: &Nat) -> Nat {
         let mut u = self.clone();
         let mut v = rhs.clone();
         let shift = u.trailing_zeros().min(v.trailing_zeros());
         u = u.shr(u.trailing_zeros());
         v = v.shr(v.trailing_zeros());
-        // Invariant: `u` is odd at the top of every iteration.
         loop {
             v = v.shr(v.trailing_zeros());
-            // Both odd here; keep the smaller in `u`.
             if u.cmp_ref(&v) == Ordering::Greater {
                 core::mem::swap(&mut u, &mut v);
             }
-            // v >= u, so this subtraction never underflows.
             v = v
                 .checked_sub(&u)
                 .expect("binary gcd: v >= u by construction");
@@ -472,6 +488,68 @@ impl Nat {
             }
         }
         u.shl(shift)
+    }
+
+    /// Lehmer's GCD (Knuth TAOCP §4.5.2, Algorithm L): use the leading words to
+    /// derive a 2×2 cofactor matrix in single precision, then apply it to the
+    /// full operands, doing far fewer multi-precision divisions than plain
+    /// Euclid. Precondition: both operands non-zero.
+    fn gcd_lehmer(&self, rhs: &Nat) -> Nat {
+        use crate::int::Int;
+
+        let mut u = self.clone();
+        let mut v = rhs.clone();
+        if u.cmp_ref(&v) == Ordering::Less {
+            core::mem::swap(&mut u, &mut v);
+        }
+        while v.limbs.len() > 1 {
+            // Leading ~63 bits of u, and of v at the same alignment.
+            let shift = u.bit_len().saturating_sub(63);
+            let mut x = u.shr(shift).to_u64().unwrap_or(0);
+            let mut y = v.shr(shift).to_u64().unwrap_or(0);
+
+            // Single-precision partial Euclid, accumulating [[a,b],[c,d]].
+            let (mut a, mut b, mut c, mut d) = (1i128, 0i128, 0i128, 1i128);
+            loop {
+                let (yc, yd) = (y as i128 + c, y as i128 + d);
+                if yc == 0 || yd == 0 {
+                    break;
+                }
+                let q = (x as i128 + a) / yc;
+                if q != (x as i128 + b) / yd {
+                    break; // Lehmer's exactness test failed
+                }
+                let (na, nb) = (c, d);
+                (c, d) = (a - q * c, b - q * d);
+                (a, b) = (na, nb);
+                let ny = x as i128 - q * y as i128;
+                x = y;
+                y = ny as u64;
+            }
+
+            if b == 0 {
+                // No single-precision progress: one full division step.
+                let (_, r) = u.div_rem(&v).expect("v is non-zero");
+                u = core::mem::replace(&mut v, r);
+            } else {
+                // Apply the matrix to the full operands (result stays positive).
+                let (ui, vi) = (Int::from(u.clone()), Int::from(v.clone()));
+                let nu = lincomb(a, &ui, b, &vi);
+                let nv = lincomb(c, &ui, d, &vi);
+                u = nu.magnitude();
+                v = nv.magnitude();
+                if u.cmp_ref(&v) == Ordering::Less {
+                    core::mem::swap(&mut u, &mut v);
+                }
+            }
+        }
+        // v now fits a single limb: finish in machine words.
+        if v.is_zero() {
+            return u;
+        }
+        let vr = v.limbs[0];
+        let ur = u.divmod_small(vr).1;
+        Nat::from_u64(u64_gcd(vr, ur))
     }
 
     /// Returns bit `i` (0 = least significant), or `false` past the top.
@@ -1030,6 +1108,41 @@ mod tests {
             assert_eq!(q.mul(&b).add(&r), a);
             assert!(r.cmp_ref(&b) == Ordering::Less);
         }
+    }
+
+    #[test]
+    fn lehmer_matches_binary_gcd() {
+        // Deterministic pseudo-random large pairs; Lehmer must match binary GCD.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..40 {
+            // Build multi-limb operands (20–40 limbs) so Lehmer is exercised.
+            let build = |cnt: usize, f: &mut dyn FnMut() -> u64| {
+                let bytes: Vec<u8> = (0..cnt * 8).map(|_| f() as u8).collect();
+                Nat::from_bytes_le(&bytes)
+            };
+            let a = build(20 + (next() % 20) as usize, &mut next);
+            let b = build(20 + (next() % 20) as usize, &mut next);
+            if a.is_zero() || b.is_zero() {
+                continue;
+            }
+            let g_lehmer = a.gcd_lehmer(&b);
+            let g_binary = a.gcd_binary(&b);
+            assert_eq!(g_lehmer, g_binary, "gcd mismatch");
+            // g divides both.
+            assert!(a.div_rem(&g_lehmer).unwrap().1.is_zero());
+            assert!(b.div_rem(&g_lehmer).unwrap().1.is_zero());
+        }
+        // A case with a large known common factor.
+        let common = Nat::from_u64(10).pow(50);
+        let a = common.mul(&Nat::from_u64(7).pow(30));
+        let b = common.mul(&Nat::from_u64(11).pow(25));
+        assert_eq!(a.gcd_lehmer(&b), common);
     }
 
     #[test]

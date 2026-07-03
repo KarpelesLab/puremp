@@ -48,3 +48,32 @@ fn generic_num_traits() {
     let r = <Rational as Num>::from_str_radix("7/2", 10).unwrap();
     assert!((r % Rational::from(1i64)).to_string() == "1/2");
 }
+
+#[cfg(feature = "decimal")]
+#[test]
+fn decimal_num_traits() {
+    use num_traits::{One, Zero};
+    use puremp::Decimal;
+    assert!(<Decimal as Zero>::zero().is_zero());
+    assert!(<Decimal as One>::one().is_one());
+    // usable in a generic Zero-based sum
+    fn total<T: Zero + Clone + core::ops::Add<Output = T>>(xs: &[T]) -> T {
+        xs.iter().fold(T::zero(), |a, x| a + x.clone())
+    }
+    let d = |s: &str| -> Decimal { s.parse().unwrap() };
+    assert_eq!(total(&[d("0.1"), d("0.2"), d("0.3")]).to_string(), "0.6");
+}
+
+#[cfg(feature = "complex")]
+#[test]
+fn complex_num_traits() {
+    use num_traits::{One, Zero};
+    use puremp::{Complex, Int};
+    let z = <Complex<Int> as Zero>::zero();
+    assert!(z.is_zero());
+    let o = <Complex<Int> as One>::one();
+    assert_eq!(o, Complex::new(Int::ONE, Int::ZERO));
+    // i * i = -1  built from the One/Zero identities
+    let i = Complex::new(Int::ZERO, Int::ONE);
+    assert_eq!(&i * &i, Complex::new(-Int::ONE, Int::ZERO));
+}

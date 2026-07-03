@@ -84,6 +84,12 @@ impl<T: Clone + Default> Matrix<T> {
         self.data[row * self.cols + col] = value;
     }
 
+    /// Returns the entries in row-major order.
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        &self.data
+    }
+
     /// Returns the transpose.
     pub fn transpose(&self) -> Matrix<T> {
         let mut out = Matrix::zeros(self.cols, self.rows);

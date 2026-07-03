@@ -77,8 +77,9 @@ rand = ["dep:rand_core", "int"]
 serde = ["dep:serde", "int"]
 
 # Optional `num-traits` bridge: implements Zero/One/Num/Signed/ToPrimitive/
-# FromPrimitive for `Int`/`Rational` (and Zero/One/Unsigned for `Nat`) so the
-# types slot into generic numeric code.
+# FromPrimitive for `Int`/`Rational`, and Zero/One for `Nat`/`Decimal`/`Complex`,
+# so the types slot into generic numeric code (impls activate for whichever type
+# features are also enabled).
 num-traits = ["dep:num-traits", "int", "rational"]
 
 # The arithmetic core is a clean-room, dependency-free implementation (see the

@@ -182,3 +182,62 @@ impl One for Nat {
         Nat::is_one(self)
     }
 }
+
+// ---- Decimal (Zero / One; no Num — division needs a precision) ----
+
+#[cfg(feature = "decimal")]
+impl Zero for crate::decimal::Decimal {
+    #[inline]
+    fn zero() -> Self {
+        crate::decimal::Decimal::zero()
+    }
+    #[inline]
+    fn is_zero(&self) -> bool {
+        crate::decimal::Decimal::is_zero(self)
+    }
+}
+
+#[cfg(feature = "decimal")]
+impl One for crate::decimal::Decimal {
+    #[inline]
+    fn one() -> Self {
+        crate::decimal::Decimal::one()
+    }
+}
+
+// ---- Complex<T> (Zero / One over a Zero/One component) ----
+
+#[cfg(feature = "complex")]
+impl<T> Zero for crate::complex::Complex<T>
+where
+    T: Clone
+        + Zero
+        + core::ops::Add<Output = T>
+        + core::ops::Sub<Output = T>
+        + core::ops::Mul<Output = T>,
+{
+    #[inline]
+    fn zero() -> Self {
+        crate::complex::Complex::new(T::zero(), T::zero())
+    }
+    #[inline]
+    fn is_zero(&self) -> bool {
+        self.re.is_zero() && self.im.is_zero()
+    }
+}
+
+#[cfg(feature = "complex")]
+impl<T> One for crate::complex::Complex<T>
+where
+    T: Clone
+        + Zero
+        + One
+        + core::ops::Add<Output = T>
+        + core::ops::Sub<Output = T>
+        + core::ops::Mul<Output = T>,
+{
+    #[inline]
+    fn one() -> Self {
+        crate::complex::Complex::new(T::one(), T::zero())
+    }
+}

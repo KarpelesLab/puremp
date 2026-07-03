@@ -253,10 +253,10 @@ Outside the core contract (§1); behind the `float` feature.
 ### M9 — Polish, interop & release
 - ✅ `core::ops` coverage (value/ref/`i64`/assign) for `Int`; value/ref/assign for
   `Rational`.
-- ▫ `Sum`/`Product`; optional in-house `serde` (no derive dep); optional `rand`
-  glue.
-- ▫ Expand the C ABI over `Rational`/`Float`; expand the CLI (rationals, radices,
-  number theory).
+- ✅ `Sum`/`Product` for `Int` and `Rational`.
+- ✅ C ABI over `Rational` (`puremp_rat_*`), alongside `Int`.
+- ▫ Optional in-house `serde` (no derive dep); optional `rand` glue.
+- ▫ C ABI over `Float`; expand the CLI (rationals, radices, number theory).
 - ▫ Allocation-reducing scratch buffers; benchmark suite; `1.0` API review and
   semver commitment.
 

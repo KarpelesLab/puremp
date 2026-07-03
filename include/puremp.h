@@ -67,6 +67,31 @@ char *puremp_int_to_string(const PurempInt *a);
 /* Release a string returned by the library. NULL is ignored. */
 void puremp_string_free(char *s);
 
+/* --- Rational: opaque exact fraction (always in lowest terms) --- */
+
+typedef struct PurempRat PurempRat;
+
+/* Build num/den from two integer handles (reduced). NULL if den is zero. */
+PurempRat *puremp_rat_new(const PurempInt *num, const PurempInt *den);
+
+/* Parse "3", "-3/4", or a decimal like "1.5". NULL on error. */
+PurempRat *puremp_rat_from_str(const char *s);
+
+/* Release a rational handle. NULL is ignored. */
+void puremp_rat_free(PurempRat *h);
+
+/* Arithmetic (each returns a fresh handle, NULL on a NULL argument). */
+PurempRat *puremp_rat_add(const PurempRat *a, const PurempRat *b);
+PurempRat *puremp_rat_sub(const PurempRat *a, const PurempRat *b);
+PurempRat *puremp_rat_mul(const PurempRat *a, const PurempRat *b);
+PurempRat *puremp_rat_div(const PurempRat *a, const PurempRat *b); /* NULL if b==0 */
+
+/* Compare: -1, 0, 1; returns -2 if either argument is NULL. */
+int puremp_rat_cmp(const PurempRat *a, const PurempRat *b);
+
+/* "n" or "n/d" string (caller frees with puremp_string_free). NULL on error. */
+char *puremp_rat_to_string(const PurempRat *r);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

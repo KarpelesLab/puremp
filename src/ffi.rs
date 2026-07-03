@@ -33,9 +33,13 @@ use alloc::string::ToString;
 use std::ffi::{CStr, CString};
 
 use crate::int::{Int, Sign};
+use crate::rational::Rational;
 
 /// Opaque handle wrapping an arbitrary-precision signed integer.
 pub struct PurempInt(Int);
+
+/// Opaque handle wrapping an exact rational number.
+pub struct PurempRat(Rational);
 
 #[inline]
 fn to_handle(i: Int) -> *mut PurempInt {
@@ -244,5 +248,171 @@ pub unsafe extern "C" fn puremp_int_to_string(a: *const PurempInt) -> *mut c_cha
 pub unsafe extern "C" fn puremp_string_free(s: *mut c_char) {
     if !s.is_null() {
         drop(unsafe { CString::from_raw(s) });
+    }
+}
+
+// --- Rational C ABI ---
+
+#[inline]
+fn rat_handle(r: Rational) -> *mut PurempRat {
+    Box::into_raw(Box::new(PurempRat(r)))
+}
+
+/// Builds a rational `num/den` from two integer handles, reduced to lowest
+/// terms. Returns `NULL` on a null argument or a zero denominator.
+///
+/// # Safety
+/// `num` and `den` must each be `NULL` or a valid live [`PurempInt`] handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_rat_new(
+    num: *const PurempInt,
+    den: *const PurempInt,
+) -> *mut PurempRat {
+    if num.is_null() || den.is_null() {
+        return ptr::null_mut();
+    }
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let n = unsafe { &(*num).0 };
+        let d = unsafe { &(*den).0 };
+        Rational::checked_new(n.clone(), d.clone()).map(rat_handle)
+    }));
+    r.ok().flatten().unwrap_or(ptr::null_mut())
+}
+
+/// Parses a rational from a NUL-terminated C string (`"3"`, `"-3/4"`, `"1.5"`).
+/// Returns `NULL` on a null pointer, invalid UTF-8, or a parse error.
+///
+/// # Safety
+/// `s` must be `NULL` or a valid pointer to a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_rat_from_str(s: *const c_char) -> *mut PurempRat {
+    if s.is_null() {
+        return ptr::null_mut();
+    }
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let text = unsafe { CStr::from_ptr(s) }.to_str().ok()?;
+        text.parse::<Rational>().ok()
+    }));
+    match r {
+        Ok(Some(rat)) => rat_handle(rat),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Frees a rational handle. A `NULL` argument is ignored.
+///
+/// # Safety
+/// `h` must be `NULL` or a handle returned by this library and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_rat_free(h: *mut PurempRat) {
+    if !h.is_null() {
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+/// Applies a binary operation to two rational handles.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live [`PurempRat`] handle.
+unsafe fn rat_binop<F>(a: *const PurempRat, b: *const PurempRat, f: F) -> *mut PurempRat
+where
+    F: Fn(&Rational, &Rational) -> Option<Rational>,
+{
+    if a.is_null() || b.is_null() {
+        return ptr::null_mut();
+    }
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let x = unsafe { &(*a).0 };
+        let y = unsafe { &(*b).0 };
+        f(x, y).map(rat_handle)
+    }));
+    r.ok().flatten().unwrap_or(ptr::null_mut())
+}
+
+/// Returns `a + b`, or `NULL` on a null argument.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_rat_add(
+    a: *const PurempRat,
+    b: *const PurempRat,
+) -> *mut PurempRat {
+    unsafe { rat_binop(a, b, |x, y| Some(x.add(y))) }
+}
+
+/// Returns `a - b`, or `NULL` on a null argument.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_rat_sub(
+    a: *const PurempRat,
+    b: *const PurempRat,
+) -> *mut PurempRat {
+    unsafe { rat_binop(a, b, |x, y| Some(x.sub(y))) }
+}
+
+/// Returns `a · b`, or `NULL` on a null argument.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_rat_mul(
+    a: *const PurempRat,
+    b: *const PurempRat,
+) -> *mut PurempRat {
+    unsafe { rat_binop(a, b, |x, y| Some(x.mul(y))) }
+}
+
+/// Returns `a / b`, or `NULL` on a null argument or division by zero.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_rat_div(
+    a: *const PurempRat,
+    b: *const PurempRat,
+) -> *mut PurempRat {
+    unsafe { rat_binop(a, b, |x, y| if y.is_zero() { None } else { Some(x.div(y)) }) }
+}
+
+/// Compares two rationals, returning `-1`, `0`, or `1`. Returns `-2` if either
+/// argument is `NULL`.
+///
+/// # Safety
+/// `a` and `b` must each be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_rat_cmp(a: *const PurempRat, b: *const PurempRat) -> c_int {
+    if a.is_null() || b.is_null() {
+        return -2;
+    }
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        match unsafe { &(*a).0 }.cmp(unsafe { &(*b).0 }) {
+            core::cmp::Ordering::Less => -1,
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Greater => 1,
+        }
+    }));
+    r.unwrap_or(-2)
+}
+
+/// Formats `r` as `"n"` or `"n/d"`. The result is a heap-allocated C string the
+/// caller must release with [`puremp_string_free`]. Returns `NULL` on a null
+/// argument or allocation failure.
+///
+/// # Safety
+/// `r` must be `NULL` or a valid live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn puremp_rat_to_string(r: *const PurempRat) -> *mut c_char {
+    if r.is_null() {
+        return ptr::null_mut();
+    }
+    let out = catch_unwind(AssertUnwindSafe(|| {
+        CString::new(unsafe { &(*r).0 }.to_string()).ok()
+    }));
+    match out {
+        Ok(Some(c)) => c.into_raw(),
+        _ => ptr::null_mut(),
     }
 }

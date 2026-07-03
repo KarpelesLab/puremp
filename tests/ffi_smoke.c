@@ -72,6 +72,20 @@ int main(void) {
         failures++;
     }
 
+    /* Rational: 1/2 + 1/3 == 5/6, and parse "1.5" == 3/2. */
+    PurempRat *half = puremp_rat_from_str("1/2");
+    PurempRat *third = puremp_rat_from_str("1/3");
+    PurempRat *sum = puremp_rat_add(half, third);
+    check_str("1/2 + 1/3", puremp_rat_to_string(sum), "5/6");
+    PurempRat *onefive = puremp_rat_from_str("1.5");
+    check_str("parse 1.5", puremp_rat_to_string(onefive), "3/2");
+    /* Division-by-zero rational returns NULL rather than trapping. */
+    PurempRat *zero = puremp_rat_from_str("0");
+    if (puremp_rat_div(half, zero) != NULL) {
+        fprintf(stderr, "FAIL rat_div by zero returned non-NULL\n");
+        failures++;
+    }
+
     puremp_int_free(two);
     puremp_int_free(acc);
     puremp_int_free(big);
@@ -79,6 +93,11 @@ int main(void) {
     puremp_int_free(three);
     puremp_int_free(five);
     puremp_int_free(diff);
+    puremp_rat_free(half);
+    puremp_rat_free(third);
+    puremp_rat_free(sum);
+    puremp_rat_free(onefive);
+    puremp_rat_free(zero);
 
     if (failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);

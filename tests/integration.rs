@@ -125,37 +125,116 @@ fn int_truncated_div_rem() {
 
 #[test]
 fn rational_reduces_and_computes() {
-    let half = Rational::new(int("2"), int("4")).unwrap();
+    let half = Rational::new(int("2"), int("4"));
     assert_eq!(half.to_string(), "1/2");
 
     // 1/2 + 1/3 == 5/6
-    let a = Rational::new(int("1"), int("2")).unwrap();
-    let b = Rational::new(int("1"), int("3")).unwrap();
+    let a = Rational::new(int("1"), int("2"));
+    let b = Rational::new(int("1"), int("3"));
     assert_eq!(a.add(&b).to_string(), "5/6");
 
     // 2/3 * 3/4 == 1/2
-    let c = Rational::new(int("2"), int("3")).unwrap();
-    let d = Rational::new(int("3"), int("4")).unwrap();
+    let c = Rational::new(int("2"), int("3"));
+    let d = Rational::new(int("3"), int("4"));
     assert_eq!(c.mul(&d).to_string(), "1/2");
 
     // 6/3 is the integer 2
-    let e = Rational::new(int("6"), int("3")).unwrap();
+    let e = Rational::new(int("6"), int("3"));
     assert!(e.is_integer());
     assert_eq!(e.to_string(), "2");
 
     // ordering: 1/3 < 1/2
     assert!(a > b);
-    assert!(Rational::new(int("0"), int("5")).unwrap().is_zero());
-    assert!(Rational::new(int("1"), int("0")).is_err());
+    assert!(Rational::new(int("0"), int("5")).is_zero());
+    assert!(Rational::checked_new(int("1"), int("0")).is_none());
 }
 
 #[test]
 fn rational_sign_is_canonical() {
     // Negative denominator moves the sign to the numerator.
-    let r = Rational::new(int("1"), int("-2")).unwrap();
+    let r = Rational::new(int("1"), int("-2"));
     assert_eq!(r.to_string(), "-1/2");
     assert_eq!(r.numerator().to_string(), "-1");
     assert_eq!(r.denominator().to_string(), "2");
+}
+
+#[test]
+fn rational_full_surface() {
+    // Constructors and consts.
+    assert_eq!(Rational::ZERO.to_string(), "0");
+    assert_eq!(Rational::MINUS_ONE.to_string(), "-1");
+    assert_eq!(Rational::power_of_two(-3).to_string(), "1/8");
+    assert_eq!(Rational::power_of_two(4).to_string(), "16");
+    assert_eq!(Rational::from(3i64).to_string(), "3");
+
+    // FromStr: integer, fraction, decimal.
+    assert_eq!("3".parse::<Rational>().unwrap().to_string(), "3");
+    assert_eq!("-3/4".parse::<Rational>().unwrap().to_string(), "-3/4");
+    assert_eq!("1.5".parse::<Rational>().unwrap().to_string(), "3/2");
+    assert_eq!("-0.125".parse::<Rational>().unwrap().to_string(), "-1/8");
+
+    // recip / abs / pow (incl. negative exponent).
+    let r = Rational::new(int("2"), int("3"));
+    assert_eq!(r.recip().to_string(), "3/2");
+    assert_eq!(r.neg().abs().to_string(), "2/3");
+    assert_eq!(r.pow(3).to_string(), "8/27");
+    assert_eq!(r.pow(-2).to_string(), "9/4");
+
+    // rounding to Int.
+    let s = Rational::new(int("-7"), int("2")); // -3.5
+    assert_eq!(s.floor().to_string(), "-4");
+    assert_eq!(s.ceil().to_string(), "-3");
+    assert_eq!(s.trunc().to_string(), "-3");
+    assert!(Rational::new(int("6"), int("3")).to_integer().is_some());
+    assert!(Rational::new(int("7"), int("3")).to_integer().is_none());
+
+    // integer division of rationals.
+    let a = Rational::new(int("7"), int("2")); // 3.5
+    let b = Rational::new(int("1"), int("2")); // 0.5
+    assert_eq!(a.div_floor(&b).to_string(), "7");
+    assert_eq!(a.div_trunc(&b).to_string(), "7");
+
+    // bounded conversions.
+    assert_eq!(Rational::from(42i64).to_i64(), Some(42));
+    assert_eq!(Rational::new(int("1"), int("2")).to_i64(), None);
+    assert!((Rational::new(int("1"), int("4")).to_f64() - 0.25).abs() < 1e-12);
+
+    // Canonical form after ops: gcd(num,den)==1, den>0.
+    let x = Rational::new(int("6"), int("-8")); // -3/4
+    assert_eq!(x.numerator().to_string(), "-3");
+    assert_eq!(x.denominator().to_string(), "4");
+}
+
+#[test]
+fn rational_write_decimal() {
+    let mut out = String::new();
+    // 1/3 to 5 digits, rounded then truncated.
+    Rational::new(int("1"), int("3"))
+        .write_decimal(&mut out, 5, false)
+        .unwrap();
+    assert_eq!(out, "0.33333");
+    out.clear();
+    // 2/3 rounds up the last digit.
+    Rational::new(int("2"), int("3"))
+        .write_decimal(&mut out, 4, false)
+        .unwrap();
+    assert_eq!(out, "0.6667");
+    out.clear();
+    Rational::new(int("2"), int("3"))
+        .write_decimal(&mut out, 4, true)
+        .unwrap();
+    assert_eq!(out, "0.6666");
+    out.clear();
+    // Negative, and a carry that reaches the integer part (0.999… -> 1.00).
+    Rational::new(int("-1"), int("8"))
+        .write_decimal(&mut out, 3, false)
+        .unwrap();
+    assert_eq!(out, "-0.125");
+    out.clear();
+    Rational::new(int("999"), int("1000"))
+        .write_decimal(&mut out, 2, false)
+        .unwrap();
+    assert_eq!(out, "1.00");
 }
 
 // ---- Int: small/large inline representation ----

@@ -27,15 +27,15 @@ fuzz_target!(|data: &[u8]| {
     let num = to_int(&data[..mid], data[0] & 1 == 1);
     let den = to_int(&data[mid..], data[mid] & 1 == 1);
 
-    match Rational::new(num, den.clone()) {
-        Ok(r) => {
+    match Rational::checked_new(num, den.clone()) {
+        Some(r) => {
             if r.numerator().is_zero() {
-                assert_eq!(r.denominator(), &Nat::one(), "zero is 0/1");
+                assert!(r.denominator().is_one(), "zero is 0/1");
             } else {
-                let g = r.numerator().magnitude().gcd(r.denominator());
+                let g = r.numerator().magnitude().gcd(&r.denominator().magnitude());
                 assert_eq!(g, Nat::one(), "fraction is in lowest terms");
             }
         }
-        Err(_) => assert!(den.is_zero(), "construction only fails on a zero denominator"),
+        None => assert!(den.is_zero(), "construction only fails on a zero denominator"),
     }
 });

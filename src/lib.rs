@@ -76,6 +76,9 @@ pub mod rational;
 #[cfg(feature = "rational")]
 pub mod inf_rational;
 
+#[cfg(feature = "int")]
+pub mod mod_int;
+
 #[cfg(feature = "dyadic")]
 pub mod dyadic;
 
@@ -104,6 +107,9 @@ pub use random::RandomSource;
 pub use inf_rational::InfRational;
 #[cfg(feature = "rational")]
 pub use rational::Rational;
+
+#[cfg(feature = "int")]
+pub use mod_int::ModInt;
 
 #[cfg(feature = "dyadic")]
 pub use dyadic::Dyadic;

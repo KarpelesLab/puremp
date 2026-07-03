@@ -24,29 +24,32 @@ name = "puremp"
 # `alloc` (or a specific type layer) for heap-backed arbitrary-precision types.
 #
 # The type layers stack bottom-up: `int` (naturals + signed integers) is the
-# foundation; `rational` and `float` build on it.
-default = ["std", "rational", "float", "cli"]
+# foundation and `rational` builds on it — together they are the core contract.
+# `float` is an optional, separable layer and is deliberately OFF by default
+# (see ROADMAP.md §1).
+default = ["std", "rational", "cli"]
 std = ["alloc"]
 alloc = []
 
-# --- type layers (each pulls in the ones below it) ---
+# --- type layers ---
 # Arbitrary-precision naturals (`Nat`) and signed integers (`Int`). Requires a
 # heap allocator (`alloc`).
 int = ["alloc"]
 # Arbitrary-precision rationals (`Rational`) built on `Int`.
 rational = ["int"]
-# Arbitrary-precision binary floats (`Float`) with directed rounding, aiming at
-# MPFR-class correct rounding. Built on `Int`.
+# Optional arbitrary-precision binary floats (`Float`) with directed rounding,
+# aiming at MPFR-class correct rounding. Built on `Int`, but NOT part of the
+# integer/rational core contract and not enabled by default.
 float = ["int"]
 
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --lib --features ffi --crate-type staticlib`
 # (or `--crate-type cdylib`). The generated symbols are declared in
 # `include/puremp.h`.
-ffi = ["std", "rational", "float"]
+ffi = ["std", "rational"]
 
 # The `puremp` command-line calculator/REPL (gates the binary target below).
-cli = ["std", "rational", "float"]
+cli = ["std", "rational"]
 
 # This crate ships no foreign code: the arithmetic critical path stays in-house
 # and auditable, and it is a clean-room implementation (see ROADMAP.md

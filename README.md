@@ -92,7 +92,7 @@ int main(void) {
 | `alloc` | ✔ | Heap-backed arbitrary-precision types (required by every layer) |
 | `int` | ✔ | `Nat` and `Int` |
 | `rational` | ✔ | `Rational` (implies `int`) |
-| `float` | ✔ | `Float` (implies `int`) |
+| `float` | | Optional `Float` layer (implies `int`); not part of the core contract |
 | `ffi` | | The C ABI module (`include/puremp.h`) |
 | `cli` | ✔ | The `puremp` binary |
 

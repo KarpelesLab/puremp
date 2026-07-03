@@ -77,6 +77,9 @@ pub mod dyadic;
 #[cfg(feature = "float")]
 pub mod float;
 
+#[cfg(feature = "float")]
+pub mod fixed_float;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
@@ -98,6 +101,8 @@ pub use rational::Rational;
 #[cfg(feature = "dyadic")]
 pub use dyadic::Dyadic;
 
+#[cfg(feature = "float")]
+pub use fixed_float::FixedFloat;
 #[cfg(feature = "float")]
 pub use float::{Float, RoundingMode};
 

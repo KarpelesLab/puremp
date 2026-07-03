@@ -7,6 +7,17 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/KarpelesLab/puremp/compare/v0.1.1...v0.1.2) - 2026-07-03
+
+### Other
+
+- correct-rounding verification tests for div and sqrt
+- prev_prime
+- shortest round-tripping decimal + fix Float::div guard sizing
+- Montgomery-reduction modpow and next_prime
+- modular arithmetic and primality (modpow, modinv, Miller–Rabin)
+- add inverse hyperbolics (asinh/acosh/atanh)
+
 ## [0.1.1](https://github.com/KarpelesLab/puremp/compare/v0.1.0...v0.1.1) - 2026-07-03
 
 ### Other

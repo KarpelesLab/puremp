@@ -181,3 +181,47 @@ fn decimal_and_rational_io() {
     assert_eq!(back.to_string(), "3/4");
     assert!(Float::nan(53).to_rational().is_none());
 }
+
+#[test]
+fn transcendentals_match_f64() {
+    let p = 60;
+    let n = RoundingMode::Nearest;
+    let approx = |f: Float| f.to_f64();
+
+    assert!((approx(Float::pi(p, n)) - core::f64::consts::PI).abs() < 1e-15);
+    assert!((approx(Float::e(p, n)) - core::f64::consts::E).abs() < 1e-15);
+    assert!((approx(Float::ln2(p, n)) - core::f64::consts::LN_2).abs() < 1e-15);
+
+    let two = from_i64(2, p);
+    assert!((approx(two.ln(p, n)) - core::f64::consts::LN_2).abs() < 1e-15);
+    assert!((approx(from_i64(1, p).exp(p, n)) - core::f64::consts::E).abs() < 1e-15);
+    // exp(ln(5)) == 5
+    let five = from_i64(5, p);
+    assert!((approx(five.ln(p, n).exp(p, n)) - 5.0).abs() < 1e-14);
+
+    // sin/cos/tan/atan at x = 1
+    let one = from_i64(1, p);
+    assert!((approx(one.sin(p, n)) - 1.0f64.sin()).abs() < 1e-15);
+    assert!((approx(one.cos(p, n)) - 1.0f64.cos()).abs() < 1e-15);
+    assert!((approx(one.tan(p, n)) - 1.0f64.tan()).abs() < 1e-14);
+    assert!((approx(one.atan(p, n)) - 1.0f64.atan()).abs() < 1e-15);
+
+    // sin²+cos² == 1
+    let x = from_i64(3, p);
+    let s = x.sin(p, n);
+    let c = x.cos(p, n);
+    assert!((approx(s.mul(&s, p, n).add(&c.mul(&c, p, n), p, n)) - 1.0).abs() < 1e-15);
+
+    // atan(∞) = π/2
+    assert!((approx(Float::infinity(p).atan(p, n)) - core::f64::consts::FRAC_PI_2).abs() < 1e-15);
+}
+
+#[test]
+fn pi_high_precision_digits() {
+    // 200-bit π, checked against the known decimal expansion. 15 fractional
+    // digits is a rounding-stable prefix (the 16th digit is 2).
+    let pi = Float::pi(200, RoundingMode::Nearest);
+    assert_eq!(pi.to_decimal_string(15), "3.141592653589793");
+    // A longer prefix, correctly rounded to 20 fractional digits.
+    assert_eq!(pi.to_decimal_string(20), "3.14159265358979323846");
+}

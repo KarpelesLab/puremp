@@ -774,3 +774,410 @@ impl fmt::Debug for Float {
         write!(f, "Float({self} @ {}bit)", self.precision)
     }
 }
+
+// ===========================================================================
+// Transcendental functions (M8).
+//
+// Each public function evaluates at an internal working precision and rounds to
+// the caller's target precision under Ziv's strategy: if the working result is
+// too close to a rounding boundary to round unambiguously, the working
+// precision is increased and the value recomputed. All internal arithmetic uses
+// round-to-nearest; only the final rounding honours the caller's mode.
+// ===========================================================================
+
+const NEAR: RoundingMode = RoundingMode::Nearest;
+
+/// A finite integer Float at working precision `w`.
+fn iflt(k: i64, w: u64) -> Float {
+    Float::from_int(&Int::from_i64(k), w, NEAR)
+}
+
+/// A finite rational Float `num/den` at working precision `w`.
+fn rflt(num: i64, den: i64, w: u64) -> Float {
+    Float::from_rational(
+        &Rational::new(Int::from_i64(num), Int::from_i64(den)),
+        w,
+        NEAR,
+    )
+}
+
+/// True if `term` is negligible relative to `sum` at working precision `w`.
+fn negligible(term: &Float, sum: &Float, w: u64) -> bool {
+    match (term.exponent(), sum.exponent()) {
+        (None, _) => true, // term is zero
+        (Some(te), Some(se)) => te < se - (w as i64) - 4,
+        (Some(_), None) => false,
+    }
+}
+
+impl Float {
+    /// Multiplies by `2^k` exactly (adjusts the exponent).
+    fn scale_pow2(&self, k: i64) -> Float {
+        match &self.repr {
+            Repr::Normal { neg, sig, exp } => Float {
+                repr: Repr::Normal {
+                    neg: *neg,
+                    sig: sig.clone(),
+                    exp: exp + k,
+                },
+                precision: self.precision,
+            },
+            _ => self.clone(),
+        }
+    }
+
+    /// Rounds a finite value to the nearest integer (ties toward +∞ via
+    /// `floor(x + 1/2)`), returned as an [`Int`].
+    fn round_to_int(&self) -> Int {
+        let w = self.precision + 2;
+        let shifted = self.add(&rflt(1, 2, w), w, NEAR);
+        shifted
+            .to_rational()
+            .map(|r| r.floor())
+            .unwrap_or(Int::ZERO)
+    }
+
+    /// Ziv driver: evaluate `f(working_precision)` and round to `prec`,
+    /// growing the working precision until the rounding is unambiguous.
+    fn ziv<F: Fn(u64) -> Float>(prec: u64, mode: RoundingMode, f: F) -> Float {
+        let prec = prec.max(1);
+        let mut guard = 48u64;
+        loop {
+            let val = f(prec + guard);
+            if let Some(r) = round_ziv(&val, prec, mode) {
+                return r;
+            }
+            if guard > prec + 4096 {
+                return val.round(prec, mode); // give up: best effort
+            }
+            guard = guard.saturating_mul(2);
+        }
+    }
+
+    // --- constants ---
+
+    /// Returns π rounded to `precision` bits.
+    pub fn pi(precision: u64, mode: RoundingMode) -> Float {
+        Float::ziv(precision, mode, pi_at)
+    }
+
+    /// Returns ln 2 rounded to `precision` bits.
+    pub fn ln2(precision: u64, mode: RoundingMode) -> Float {
+        Float::ziv(precision, mode, ln2_at)
+    }
+
+    /// Returns Euler's number e rounded to `precision` bits.
+    pub fn e(precision: u64, mode: RoundingMode) -> Float {
+        Float::ziv(precision, mode, |w| exp_at(&iflt(1, w), w))
+    }
+
+    // --- functions ---
+
+    /// Returns `e^self`, correctly rounded. `exp(±∞)`/`exp(0)` handled per IEEE.
+    pub fn exp(&self, precision: u64, mode: RoundingMode) -> Float {
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(true) => Float::zero(precision),
+            Repr::Inf(false) => Float::infinity(precision),
+            Repr::Zero(_) => Float::from_int(&Int::ONE, precision, mode),
+            Repr::Normal { .. } => {
+                let x = self.clone();
+                Float::ziv(precision, mode, move |w| exp_at(&x.round(w, NEAR), w))
+            }
+        }
+    }
+
+    /// Returns the natural logarithm `ln(self)`, correctly rounded. `ln(x<0)` is
+    /// NaN, `ln(0)` is `−∞`, `ln(+∞)` is `+∞`.
+    pub fn ln(&self, precision: u64, mode: RoundingMode) -> Float {
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(false) => Float::infinity(precision),
+            Repr::Inf(true) => Float::nan(precision),
+            Repr::Zero(_) => Float::neg_infinity(precision),
+            Repr::Normal { neg: true, .. } => Float::nan(precision),
+            Repr::Normal { .. } => {
+                let x = self.clone();
+                Float::ziv(precision, mode, move |w| ln_at(&x.round(w, NEAR), w))
+            }
+        }
+    }
+
+    /// Returns `sin(self)`, correctly rounded (finite arguments).
+    pub fn sin(&self, precision: u64, mode: RoundingMode) -> Float {
+        if !self.is_finite() {
+            return Float::nan(precision);
+        }
+        if self.is_zero() {
+            return Float::zero_signed(self.is_sign_negative(), precision);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| sin_cos_at(&x.round(w, NEAR), w).0)
+    }
+
+    /// Returns `cos(self)`, correctly rounded (finite arguments).
+    pub fn cos(&self, precision: u64, mode: RoundingMode) -> Float {
+        if !self.is_finite() {
+            return Float::nan(precision);
+        }
+        if self.is_zero() {
+            return Float::from_int(&Int::ONE, precision, mode);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| sin_cos_at(&x.round(w, NEAR), w).1)
+    }
+
+    /// Returns `tan(self)`, correctly rounded (finite arguments).
+    pub fn tan(&self, precision: u64, mode: RoundingMode) -> Float {
+        if !self.is_finite() {
+            return Float::nan(precision);
+        }
+        if self.is_zero() {
+            return Float::zero_signed(self.is_sign_negative(), precision);
+        }
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| {
+            let (s, c) = sin_cos_at(&x.round(w, NEAR), w);
+            s.div(&c, w, NEAR)
+        })
+    }
+
+    /// Returns `atan(self)`, correctly rounded (finite arguments).
+    pub fn atan(&self, precision: u64, mode: RoundingMode) -> Float {
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(neg) => {
+                // atan(±∞) = ±π/2
+                let half_pi = Float::pi(precision + 8, NEAR).scale_pow2(-1);
+                if *neg { half_pi.neg() } else { half_pi }.round(precision, mode)
+            }
+            Repr::Zero(_) => Float::zero_signed(self.is_sign_negative(), precision),
+            Repr::Normal { .. } => {
+                let x = self.clone();
+                Float::ziv(precision, mode, move |w| atan_at(&x.round(w, NEAR), w))
+            }
+        }
+    }
+}
+
+/// Returns `Some(rounded)` if `val` can be rounded to `prec` bits unambiguously,
+/// else `None` (the caller should recompute at higher precision).
+fn round_ziv(val: &Float, prec: u64, mode: RoundingMode) -> Option<Float> {
+    match &val.repr {
+        Repr::Normal { sig, .. } => {
+            let w = sig.bit_len();
+            if w <= prec {
+                return Some(val.round(prec, mode));
+            }
+            let drop = w - prec;
+            const CHECK: u64 = 24;
+            if drop <= CHECK + 1 {
+                return None;
+            }
+            let low = sig.low_bits(drop);
+            let margin = Nat::one().shl(drop - CHECK);
+            let full = Nat::one().shl(drop);
+            let ambiguous = if mode == RoundingMode::Nearest {
+                let half = Nat::one().shl(drop - 1);
+                let dist = if low >= half {
+                    low.checked_sub(&half).unwrap()
+                } else {
+                    half.checked_sub(&low).unwrap()
+                };
+                dist < margin
+            } else {
+                low < margin || full.checked_sub(&low).unwrap() < margin
+            };
+            if ambiguous {
+                None
+            } else {
+                Some(val.round(prec, mode))
+            }
+        }
+        // NaN / ±∞ / ±0 are exact.
+        _ => Some(val.round(prec, mode)),
+    }
+}
+
+/// `atanh(x) = x + x³/3 + x⁵/5 + …` at working precision `w` (needs `|x| < 1`).
+fn atanh_series(x: &Float, w: u64) -> Float {
+    let x2 = x.mul(x, w, NEAR);
+    let mut pow = x.clone();
+    let mut sum = x.clone();
+    let mut k: i64 = 1;
+    loop {
+        pow = pow.mul(&x2, w, NEAR);
+        let term = pow.div(&iflt(2 * k + 1, w), w, NEAR);
+        sum = sum.add(&term, w, NEAR);
+        if negligible(&term, &sum, w) {
+            break;
+        }
+        k += 1;
+    }
+    sum
+}
+
+/// `atan(x) = x − x³/3 + x⁵/5 − …` at working precision `w` (needs `|x| ≤ 1`).
+fn atan_series(x: &Float, w: u64) -> Float {
+    let x2 = x.mul(x, w, NEAR);
+    let mut pow = x.clone();
+    let mut sum = x.clone();
+    let mut k: i64 = 1;
+    loop {
+        pow = pow.mul(&x2, w, NEAR);
+        let term = pow.div(&iflt(2 * k + 1, w), w, NEAR);
+        sum = if k % 2 == 1 {
+            sum.sub(&term, w, NEAR)
+        } else {
+            sum.add(&term, w, NEAR)
+        };
+        if negligible(&term, &sum, w) {
+            break;
+        }
+        k += 1;
+    }
+    sum
+}
+
+/// π via Machin's formula, `16·atan(1/5) − 4·atan(1/239)`, at precision `w`.
+fn pi_at(w: u64) -> Float {
+    let a1 = atan_series(&rflt(1, 5, w), w);
+    let a2 = atan_series(&rflt(1, 239, w), w);
+    iflt(16, w)
+        .mul(&a1, w, NEAR)
+        .sub(&iflt(4, w).mul(&a2, w, NEAR), w, NEAR)
+}
+
+/// ln 2 via `2·atanh(1/3)` at precision `w`.
+fn ln2_at(w: u64) -> Float {
+    iflt(2, w).mul(&atanh_series(&rflt(1, 3, w), w), w, NEAR)
+}
+
+/// `e^x` at precision `w` via range reduction `x = k·ln2 + r` and a Taylor sum.
+fn exp_at(x: &Float, w: u64) -> Float {
+    let ln2 = ln2_at(w);
+    let k = x.div(&ln2, w, NEAR).round_to_int();
+    let ki = k.to_i64().unwrap_or(0);
+    let r = x.sub(&Float::from_int(&k, w, NEAR).mul(&ln2, w, NEAR), w, NEAR);
+    // exp(r) = Σ rⁿ/n!
+    let mut term = iflt(1, w);
+    let mut sum = iflt(1, w);
+    let mut n: i64 = 1;
+    loop {
+        term = term.mul(&r, w, NEAR).div(&iflt(n, w), w, NEAR);
+        sum = sum.add(&term, w, NEAR);
+        if negligible(&term, &sum, w) {
+            break;
+        }
+        n += 1;
+    }
+    sum.scale_pow2(ki)
+}
+
+/// `ln(x)` for finite `x > 0` at precision `w`.
+fn ln_at(x: &Float, w: u64) -> Float {
+    if x.is_zero() {
+        return Float::neg_infinity(w);
+    }
+    let bits = x.significand().map(|s| s.bit_len() as i64).unwrap_or(0);
+    let e = x.exponent().unwrap_or(0) + bits - 1; // floor(log2 x)
+    let m = x.scale_pow2(-e); // m ∈ [1, 2)
+    // ln(m) = 2·atanh((m−1)/(m+1))
+    let one = iflt(1, w);
+    let y = m.sub(&one, w, NEAR).div(&m.add(&one, w, NEAR), w, NEAR);
+    let ln_m = iflt(2, w).mul(&atanh_series(&y, w), w, NEAR);
+    iflt(e, w).mul(&ln2_at(w), w, NEAR).add(&ln_m, w, NEAR)
+}
+
+/// `(sin x, cos x)` at precision `w`, via reduction to `[-π/4, π/4]`.
+fn sin_cos_at(x: &Float, w: u64) -> (Float, Float) {
+    let pi = pi_at(w);
+    let half_pi = pi.scale_pow2(-1);
+    // q = round(x / (π/2)); r = x − q·(π/2) ∈ [−π/4, π/4].
+    let q = x.div(&half_pi, w, NEAR).round_to_int();
+    let r = x.sub(
+        &Float::from_int(&q, w, NEAR).mul(&half_pi, w, NEAR),
+        w,
+        NEAR,
+    );
+    let (sr, cr) = sin_cos_series(&r, w);
+    // Reconstruct from the quadrant q mod 4.
+    let quad = q.rem_euclid(&Int::from_i64(4)).to_i64().unwrap_or(0);
+    match quad {
+        0 => (sr, cr),
+        1 => (cr, sr.neg()),
+        2 => (sr.neg(), cr.neg()),
+        _ => (cr.neg(), sr),
+    }
+}
+
+/// `(sin r, cos r)` by Taylor series for small `|r|`, at precision `w`.
+fn sin_cos_series(r: &Float, w: u64) -> (Float, Float) {
+    let r2 = r.mul(r, w, NEAR);
+    // sin
+    let mut term = r.clone();
+    let mut sin = r.clone();
+    let mut n: i64 = 1;
+    loop {
+        // term_{k} = -term_{k-1} · r² / ((2k)(2k+1))
+        term = term
+            .mul(&r2, w, NEAR)
+            .div(&iflt(2 * n * (2 * n + 1), w), w, NEAR)
+            .neg();
+        sin = sin.add(&term, w, NEAR);
+        if negligible(&term, &sin, w) {
+            break;
+        }
+        n += 1;
+    }
+    // cos
+    let mut cterm = iflt(1, w);
+    let mut cos = iflt(1, w);
+    let mut m: i64 = 1;
+    loop {
+        cterm = cterm
+            .mul(&r2, w, NEAR)
+            .div(&iflt((2 * m - 1) * (2 * m), w), w, NEAR)
+            .neg();
+        cos = cos.add(&cterm, w, NEAR);
+        if negligible(&cterm, &cos, w) {
+            break;
+        }
+        m += 1;
+    }
+    (sin, cos)
+}
+
+/// `atan(x)` for finite non-zero `x` at precision `w`.
+///
+/// Reduces `|x| > 1` by the complement `atan(x) = π/2 − atan(1/x)`, then halves
+/// the argument via `atan(t) = 2·atan(t/(1+√(1+t²)))` until it is small enough
+/// for the Taylor series to converge quickly (the raw series is linear near 1).
+fn atan_at(x: &Float, w: u64) -> Float {
+    let one = iflt(1, w);
+    let neg = x.is_sign_negative();
+    let ax = x.abs();
+    let complement = ax.partial_cmp(&one) == Some(Ordering::Greater);
+    let mut arg = if complement {
+        one.div(&ax, w, NEAR)
+    } else {
+        ax
+    };
+
+    let quarter = rflt(1, 4, w);
+    let mut halvings = 0u32;
+    while arg.partial_cmp(&quarter) == Some(Ordering::Greater) {
+        let root = one.add(&arg.mul(&arg, w, NEAR), w, NEAR).sqrt(w, NEAR);
+        arg = arg.div(&one.add(&root, w, NEAR), w, NEAR);
+        halvings += 1;
+    }
+
+    let mut result = atan_series(&arg, w);
+    for _ in 0..halvings {
+        result = result.scale_pow2(1); // × 2
+    }
+    if complement {
+        result = pi_at(w).scale_pow2(-1).sub(&result, w, NEAR);
+    }
+    if neg { result.neg() } else { result }
+}

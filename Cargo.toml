@@ -28,7 +28,7 @@ name = "puremp"
 # `float` is a separable layer (not part of the core contract, see ROADMAP.md
 # §1) but is enabled by default for convenience; disable it with
 # `--no-default-features` (optionally re-enabling `rational`/`cli`).
-default = ["std", "rational", "float", "dyadic", "decimal", "complex", "poly", "interval", "matrix", "cli"]
+default = ["std", "rational", "float", "dyadic", "decimal", "complex", "poly", "interval", "matrix", "algebraic", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -55,6 +55,8 @@ matrix = ["alloc"]
 float = ["int", "rational"]
 # Interval arithmetic (`Interval`) with outward-rounded `Float` endpoints.
 interval = ["float"]
+# Algebraic numbers: exact ℚ(√d) (`Quadratic`) and general real `Algebraic`.
+algebraic = ["rational", "poly", "matrix", "float"]
 
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --lib --features ffi --crate-type staticlib`

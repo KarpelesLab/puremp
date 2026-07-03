@@ -7,7 +7,7 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
-## [0.2.0](https://github.com/KarpelesLab/puremp/compare/v0.1.0...v0.2.0) - 2026-07-03
+## [0.1.1](https://github.com/KarpelesLab/puremp/compare/v0.1.0...v0.1.1) - 2026-07-03
 
 ### Other
 

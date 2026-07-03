@@ -131,7 +131,7 @@ fn f64_roundtrip_and_conversion() {
         0.5,
         0.1,
         -123.456,
-        3.141592653589793,
+        core::f64::consts::PI,
         1e300,
         1e-300,
     ] {

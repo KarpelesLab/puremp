@@ -530,6 +530,15 @@ impl Int {
         Int::from(self.magnitude().next_prime(rng))
     }
 
+    /// Returns the largest prime strictly less than `self`, or `None` if there
+    /// is none (`self <= 2`).
+    pub fn prev_prime(&self, rng: &mut impl crate::random::RandomSource) -> Option<Int> {
+        if self <= &Int::from_i64(2) {
+            return None;
+        }
+        self.magnitude().prev_prime(rng).map(Int::from)
+    }
+
     /// Extended GCD: returns `(g, x, y)` with `g == self·x + b·y` and `g ≥ 0`.
     pub fn extended_gcd(&self, b: &Int) -> (Int, Int, Int) {
         let (mut old_r, mut r) = (self.clone(), b.clone());

@@ -1281,6 +1281,31 @@ impl Nat {
         }
     }
 
+    /// Returns the largest prime strictly less than `self`, or `None` if there
+    /// is none (`self <= 2`).
+    pub fn prev_prime(&self, rng: &mut impl crate::random::RandomSource) -> Option<Nat> {
+        let two = Nat::from_u64(2);
+        if self.cmp_ref(&two) != Ordering::Greater {
+            return None;
+        }
+        if self.cmp_ref(&Nat::from_u64(3)) == Ordering::Equal {
+            return Some(two);
+        }
+        let mut c = self.checked_sub(&Nat::one()).unwrap();
+        if c.is_even() {
+            c = c.checked_sub(&Nat::one()).unwrap();
+        }
+        loop {
+            if c.cmp_ref(&two) == Ordering::Less {
+                return Some(two);
+            }
+            if c.is_probable_prime(40, rng) {
+                return Some(c);
+            }
+            c = c.checked_sub(&two).unwrap_or_else(Nat::zero);
+        }
+    }
+
     /// Miller–Rabin probable-primality test with `rounds` random witnesses.
     ///
     /// Deterministic for the tiny cases; for larger `self` the probability of a

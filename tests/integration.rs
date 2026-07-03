@@ -702,4 +702,10 @@ fn next_prime_works() {
     let p = int("1000000000000000000000000000000").next_prime(&mut rng);
     assert_eq!(p.to_string(), "1000000000000000000000000000057");
     assert!(p.magnitude().is_probable_prime(40, &mut rng));
+
+    // prev_prime
+    assert_eq!(int("11").prev_prime(&mut rng).unwrap().to_string(), "7");
+    assert_eq!(int("3").prev_prime(&mut rng).unwrap().to_string(), "2");
+    assert!(int("2").prev_prime(&mut rng).is_none());
+    assert_eq!(int("100").prev_prime(&mut rng).unwrap().to_string(), "97");
 }

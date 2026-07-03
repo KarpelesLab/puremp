@@ -91,6 +91,9 @@ pub mod decimal;
 #[cfg(feature = "complex")]
 pub mod complex;
 
+#[cfg(feature = "poly")]
+pub mod poly;
+
 #[cfg(feature = "float")]
 pub mod float;
 
@@ -128,6 +131,9 @@ pub use decimal::{Decimal, Rounding};
 
 #[cfg(feature = "complex")]
 pub use complex::Complex;
+
+#[cfg(feature = "poly")]
+pub use poly::Poly;
 
 #[cfg(feature = "float")]
 pub use fixed_float::FixedFloat;

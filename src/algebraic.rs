@@ -245,17 +245,24 @@ impl Algebraic {
 
     /// Returns `-1`, `0`, or `1` according to the sign of the value.
     pub fn signum(&self) -> i32 {
-        // Zero only occurs as the exact rational 0 (an irrational value is never
-        // zero); otherwise refine until the interval lies on one side of 0.
-        if self.is_rational() {
-            return self.lo.signum();
+        // The value is exactly zero iff 0 is a root of the polynomial and lies in
+        // the half-open isolating interval `(lo, hi]` — this holds even when the
+        // value 0 arrives with a higher-degree polynomial that did not collapse
+        // (e.g. `a + (-a)`). Otherwise the value is bounded away from 0, so
+        // refinement terminates on one side.
+        let zero = Rational::ZERO;
+        if eval_sign(&self.poly, &zero) == 0 && self.lo < zero && zero <= self.hi {
+            return 0;
         }
         let mut a = self.clone();
         loop {
+            if a.is_rational() {
+                return a.lo.signum();
+            }
             if a.lo.is_positive() {
                 return 1;
             }
-            if a.hi.is_negative() || a.hi.is_zero() {
+            if a.hi.is_negative() {
                 return -1;
             }
             a.refine();

@@ -7,6 +7,34 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/puremp/compare/v0.1.0...v0.2.0) - 2026-07-03
+
+### Other
+
+- Update ROADMAP/README/CHANGELOG: M1–M8 complete, M9 nearly so
+- NTT (FFT) multiplication for very large operands
+- Burnikel–Ziegler recursive division
+- Lehmer's subquadratic GCD
+- Toom-3 multiplication
+- dedicated squaring fast path
+- sub-quadratic (divide-and-conquer) radix conversion
+- expand the benchmark harness
+- expand the CLI — exact rationals, functions, and radices
+- C ABI over Float
+- serde support (hand-written, no serde_derive)
+- randomness — in-house RandomSource trait + rand_core bridge
+- Float transcendentals via Ziv's strategy
+- Fix clippy approx_constant in float test (use core::f64::consts::PI)
+- Float special values, ternary flag, and f64/f32/rational/decimal I/O
+- expand the C ABI over Rational
+- M9 (partial) + docs: Sum/Product, ROADMAP/README/CHANGELOG status
+- Implement M8 (core): correctly-rounded Float arithmetic
+- Implement M7: Karatsuba multiplication and Knuth Algorithm D division
+- Implement M6: full Rational surface
+- Implement M1–M4 for Int: inline representation + full integer surface
+- Re-enable float in the default feature set
+- Expand ROADMAP to cover the Integer/Rational spec; make float opt-in
+
 ### Added (fast algorithms, float, and interop)
 
 - **Fast multiplication (M7):** a schoolbook → Karatsuba → Toom-3 → NTT

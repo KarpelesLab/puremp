@@ -460,10 +460,8 @@ impl Nat {
         Some(n)
     }
 
-    /// Returns `self · rhs`, dispatching to schoolbook or Karatsuba by size.
-    ///
-    /// Toom-Cook and FFT/NTT multiplication for very large operands are later
-    /// milestones; see `ROADMAP.md`.
+    /// Returns `self · rhs`, dispatching by operand size along a
+    /// schoolbook → Karatsuba → Toom-3 → Toom-4 → NTT ladder.
     pub fn mul(&self, rhs: &Nat) -> Nat {
         if self.is_zero() || rhs.is_zero() {
             return Nat::zero();
@@ -931,9 +929,8 @@ impl Nat {
     /// `self == quotient·rhs + remainder` and `remainder < rhs`, or `None` if
     /// `rhs` is zero.
     ///
-    /// Dispatches to single-limb division or Knuth's Algorithm D (TAOCP Vol. 2
-    /// §4.3.1). Sub-quadratic Burnikel–Ziegler recursive division is a later
-    /// milestone; see `ROADMAP.md`.
+    /// Dispatches to single-limb division, Knuth's Algorithm D (TAOCP Vol. 2
+    /// §4.3.1), or sub-quadratic Burnikel–Ziegler recursive division by size.
     pub fn div_rem(&self, rhs: &Nat) -> Option<(Nat, Nat)> {
         if rhs.is_zero() {
             return None;

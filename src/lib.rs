@@ -38,9 +38,9 @@
 //! feature; the `puremp` binary).
 //!
 //! This is a clean-room implementation: it is MIT-licensed and its algorithms
-//! are drawn from the open literature, never from GMP/MPFR source. See
-//! `ROADMAP.md` for the design, the algorithm references, and the milestone
-//! plan.
+//! are drawn from the open literature (Knuth; Brent & Zimmermann's *Modern
+//! Computer Arithmetic*; the HAC), never from GMP/MPFR source. See the README's
+//! "Design & provenance" section for the algorithm references.
 //!
 //! # Example
 //!

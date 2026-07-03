@@ -10,11 +10,12 @@ command-line calculator.
 > rational surface is implemented and tested (small-value inlining, all three
 > division conventions, power-of-two ops, two's-complement bitwise, gcd/lcm/
 > extended-gcd, roots, radix I/O). Multiplication runs a schoolbook → Karatsuba
-> → Toom-3 → NTT ladder; division uses Knuth Algorithm D and Burnikel–Ziegler;
-> GCD uses Lehmer's algorithm. The optional `Float` layer is correctly-rounded
-> through the transcendentals (`exp`/`ln`/`sin`/`cos`/`atan`, `pi`/`e`) with the
-> IEEE special values and the MPFR ternary flag. Remaining work is performance
-> tuning and a pre-`1.0` API review — see [`ROADMAP.md`](ROADMAP.md).
+> → Toom-3 → Toom-4 → NTT ladder; division uses Knuth Algorithm D and
+> Burnikel–Ziegler; GCD uses Lehmer's algorithm. The optional `Float` layer is
+> correctly-rounded through the transcendentals with the IEEE special values and
+> the MPFR ternary flag. On top sit modular integers, decimals, complex numbers,
+> polynomials (with real-root isolation), matrices, intervals, and exact
+> algebraic numbers.
 
 ## Why
 
@@ -118,6 +119,36 @@ Beyond the base types, `Int`/`Rational` provide a number-theory toolkit —
 
 For a bare `no_std` build: `--no-default-features` (add `--features int` for the
 integer types).
+
+## Design & provenance
+
+Bottom-up layers, each building only on the ones below: machine-word carry
+primitives (`adc`/`sbb`/`mac`) → unsigned magnitudes (`Nat`, home of the hard
+algorithms) → tagged signed `Int` → `Rational`, with the optional `Float` and
+the derived types layered on top. Signed integers inline single-limb magnitudes
+(no heap allocation until a value exceeds 64 bits).
+
+The implementation is **clean-room**: GMP and MPFR are LGPL and their source is
+never consulted. Algorithms come from the open literature —
+
+- Knuth, *TAOCP* Vol. 2 §4.3 (schoolbook arithmetic; Algorithm D for division);
+- Brent & Zimmermann, *Modern Computer Arithmetic* (sub-quadratic multiply/
+  divide, GCD, base conversion);
+- Menezes, van Oorschot & Vanstone, *Handbook of Applied Cryptography*;
+- primary papers: Karatsuba; Toom–Cook; Burnikel–Ziegler; Möller–Granlund;
+  Faddeev–LeVerrier (algebraic numbers); Sturm sequences (real-root isolation).
+
+Correctness is checked against published values and, in the dev-only test
+harness, a trusted reference — never a runtime dependency.
+
+**Non-goals:** constant-time / side-channel resistance across the general API
+(for constant-time crypto see the sibling `purecrypto` crate); drop-in GMP/MPFR
+C-header compatibility (puremp ships its own cleaner C ABI).
+
+**Known future optimizations** (correct today, just not maximally fast): a
+half-GCD for asymptotically faster `Rational` reduction; allocation-reducing
+scratch buffers in the recursive multiply/divide code; and a subresultant PRS to
+tame Sturm-sequence coefficient growth for high-degree `Algebraic` operations.
 
 ## License
 

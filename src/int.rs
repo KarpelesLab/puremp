@@ -378,7 +378,7 @@ impl Int {
         *self = self.sub(&a.mul(b));
     }
 
-    // --- division (see the module & ROADMAP for the three conventions) ---
+    // --- division (three conventions: truncated, floor, Euclidean) ---
 
     /// Truncated division, returning `(quotient, remainder)` with the quotient
     /// rounded toward zero and the remainder taking the sign of `self`, or
@@ -738,7 +738,7 @@ impl Int {
         }
     }
 
-    // --- two's-complement bitwise (see ROADMAP §2.4) ---
+    // --- width-aware two's-complement bitwise ops ---
 
     /// Bitwise AND on the two's-complement representation.
     pub fn bitand(&self, b: &Int) -> Int {

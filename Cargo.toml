@@ -25,9 +25,9 @@ name = "puremp"
 #
 # The type layers stack bottom-up: `int` (naturals + signed integers) is the
 # foundation and `rational` builds on it — together they are the core contract.
-# `float` is a separable layer (not part of the core contract, see ROADMAP.md
-# §1) but is enabled by default for convenience; disable it with
-# `--no-default-features` (optionally re-enabling `rational`/`cli`).
+# `float` is a separable layer (not part of the core contract) but is enabled
+# by default for convenience; disable it with `--no-default-features`
+# (optionally re-enabling `rational`/`cli`).
 default = ["std", "rational", "float", "dyadic", "decimal", "complex", "poly", "interval", "matrix", "algebraic", "cli"]
 std = ["alloc"]
 alloc = []
@@ -81,9 +81,9 @@ serde = ["dep:serde", "int"]
 # types slot into generic numeric code.
 num-traits = ["dep:num-traits", "int", "rational"]
 
-# The arithmetic core is a clean-room, dependency-free implementation (see
-# ROADMAP.md "License & provenance"); the only dependencies are optional,
-# opt-in ecosystem bridges that the default build never pulls in.
+# The arithmetic core is a clean-room, dependency-free implementation (see the
+# README's "Design & provenance"); the only dependencies are optional, opt-in
+# ecosystem bridges that the default build never pulls in.
 [dependencies]
 rand_core = { version = "0.6", optional = true, default-features = false }
 serde = { version = "1", optional = true, default-features = false, features = ["alloc"] }

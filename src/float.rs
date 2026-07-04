@@ -1484,6 +1484,136 @@ impl Float {
         }
     }
 
+    /// Returns the gamma function `Γ(self)` for a real argument, correctly
+    /// rounded.
+    ///
+    /// # Algorithm
+    /// Stirling's asymptotic series for `ln Γ(z)` (DLMF 5.11.1)
+    ///
+    /// ```text
+    /// ln Γ(z) = (z − ½) ln z − z + ½ ln(2π) + Σ_{k≥1} B₂ₖ / (2k(2k−1) z^{2k−1})
+    /// ```
+    ///
+    /// with the Bernoulli numbers `B₂ₖ` computed as exact rationals. The argument
+    /// is first shifted upward, `Γ(x) = Γ(x+m)/(x(x+1)···(x+m−1))`, so that
+    /// `z = x+m ≳ precision/4` makes the asymptotic tail fall below the target,
+    /// and `Γ(x)` is recovered by `exp(ln Γ(x))`. For `x < ½` the reflection
+    /// formula `Γ(x) Γ(1−x) = π / sin(πx)` (DLMF 5.5.3) maps the argument into the
+    /// convergent region.
+    ///
+    /// # Domain
+    /// Defined for all real `x` except the poles `x = 0, −1, −2, …`, which return
+    /// NaN. `Γ(+∞) = +∞`; `Γ(−∞)` and NaN return NaN. Integer and half-integer
+    /// arguments come out exact after rounding (`Γ(n) = (n−1)!`). Very large
+    /// negative arguments near a pole demand extra working precision (the
+    /// reflection's `sin(πx)` is tiny there); Ziv supplies it, so accuracy is
+    /// maintained for moderate `|x|`.
+    pub fn gamma(&self, precision: u64, mode: RoundingMode) -> Float {
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(false) => Float::infinity(precision),
+            Repr::Inf(true) => Float::nan(precision),
+            // Γ has a pole at 0.
+            Repr::Zero(_) => Float::nan(precision),
+            Repr::Normal { .. } => {
+                // Poles at the negative integers.
+                if let Some(r) = self.to_rational()
+                    && r.denominator() == &Int::ONE
+                    && r.numerator().is_negative()
+                {
+                    return Float::nan(precision);
+                }
+                let x = self.clone();
+                Float::ziv(precision, mode, move |w| gamma_fn_at(&x.round(w, NEAR), w))
+            }
+        }
+    }
+
+    /// Returns the natural logarithm of the gamma function `ln Γ(self)` for a
+    /// real argument `x > 0`, correctly rounded.
+    ///
+    /// Uses the same Stirling core as [`Float::gamma`] (see there). `ln Γ(1) =
+    /// ln Γ(2) = 0`; `ln Γ(+∞) = +∞`; `x = 0` returns `+∞` (the pole). Arguments
+    /// `x < 0` return NaN — this is the real log-gamma on the positive axis, not
+    /// `ln|Γ|`.
+    pub fn ln_gamma(&self, precision: u64, mode: RoundingMode) -> Float {
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(false) => Float::infinity(precision),
+            Repr::Inf(true) => Float::nan(precision),
+            Repr::Zero(_) => Float::infinity(precision),
+            Repr::Normal { neg: true, .. } => Float::nan(precision),
+            Repr::Normal { .. } => {
+                let x = self.clone();
+                Float::ziv(precision, mode, move |w| ln_gamma_at(&x.round(w, NEAR), w))
+            }
+        }
+    }
+
+    /// Returns the Bessel function of the first kind `Jₙ(self)` for integer order
+    /// `n` and real argument `x`, correctly rounded.
+    ///
+    /// # Algorithm
+    /// The ascending power series (DLMF 10.2.2)
+    ///
+    /// ```text
+    /// Jₙ(x) = Σ_{m≥0} (−1)ᵐ / (m! (m+n)!) · (x/2)^{2m+n}
+    /// ```
+    ///
+    /// with `J₋ₙ(x) = (−1)ⁿ Jₙ(x)`. The common factor `(x/2)ⁿ/n!` is pulled out
+    /// and the remaining sum is accumulated in scaled-integer arithmetic. Because
+    /// the series is alternating it loses about `1.443·|x|` bits to cancellation
+    /// (the partial sums reach `≈ e^{|x|}`), so that many guard bits are added.
+    ///
+    /// # Domain
+    /// Any integer `n` and finite real `x`; `Jₙ(0) = 0` for `n ≠ 0`, `J₀(0) = 1`.
+    /// Correctly rounded for moderate `|x|` (the guard budget grows linearly with
+    /// `|x|`, so very large `|x|` is progressively more expensive). Non-finite `x`
+    /// returns NaN.
+    pub fn bessel_j(&self, n: i64, precision: u64, mode: RoundingMode) -> Float {
+        self.bessel(n, precision, mode, true)
+    }
+
+    /// Returns the modified Bessel function of the first kind `Iₙ(self)` for
+    /// integer order `n` and real argument `x`, correctly rounded.
+    ///
+    /// Same ascending series as [`Float::bessel_j`] but without the `(−1)ᵐ` sign,
+    /// so every term is positive and there is **no** cancellation (DLMF 10.25.2):
+    ///
+    /// ```text
+    /// Iₙ(x) = Σ_{m≥0} 1 / (m! (m+n)!) · (x/2)^{2m+n}
+    /// ```
+    ///
+    /// with `I₋ₙ(x) = Iₙ(x)`. `Iₙ(0) = 0` for `n ≠ 0`, `I₀(0) = 1`. Non-finite `x`
+    /// returns NaN.
+    pub fn bessel_i(&self, n: i64, precision: u64, mode: RoundingMode) -> Float {
+        self.bessel(n, precision, mode, false)
+    }
+
+    /// Shared driver for [`Float::bessel_j`] (`alternating = true`) and
+    /// [`Float::bessel_i`] (`alternating = false`).
+    fn bessel(&self, n: i64, precision: u64, mode: RoundingMode, alternating: bool) -> Float {
+        if !self.is_finite() {
+            return Float::nan(precision);
+        }
+        let order = n.unsigned_abs();
+        // Sign flip for negative order: J₋ₙ = (−1)ⁿ Jₙ, I₋ₙ = Iₙ.
+        let flip = alternating && n < 0 && order % 2 == 1;
+        if self.is_zero() {
+            // Jₙ(0) = Iₙ(0) = 0 for n ≠ 0, and = 1 for n = 0.
+            return if order == 0 {
+                Float::from_int(&Int::ONE, precision, mode)
+            } else {
+                Float::zero(precision)
+            };
+        }
+        let x = self.clone();
+        let res = Float::ziv(precision, mode, move |w| {
+            bessel_series_at(order, &x.round(w, NEAR), w, alternating)
+        });
+        if flip { res.neg() } else { res }
+    }
+
     /// Sign as `i64` (`-1`/`0`/`1`), for internal use.
     fn signum_i(&self) -> i64 {
         match self.sign() {
@@ -2198,4 +2328,211 @@ fn zeta_at(s: &Float, w: u64) -> Float {
     let two_pow = one.sub(s, w, NEAR).mul(&ln2, w, NEAR).exp(w, NEAR);
     let factor = one.sub(&two_pow, w, NEAR);
     eta.div(&factor, w, NEAR)
+}
+
+/// `⌊log₂|x|⌋` for a finite non-zero `x`, or `i64::MIN` for ±0/±∞/NaN.
+fn float_msb(x: &Float) -> i64 {
+    match &x.repr {
+        Repr::Normal { sig, exp, .. } => exp + sig.bit_len() as i64 - 1,
+        _ => i64::MIN,
+    }
+}
+
+/// An incrementally-extended table of Bernoulli numbers `B₀, B₁, B₂, …` as exact
+/// rationals, built via the standard recurrence
+/// `B_m = −1/(m+1) · Σ_{j=0}^{m−1} C(m+1, j) B_j` (clean-room; e.g. MCA §4.7.2).
+struct BernoulliTable {
+    b: alloc::vec::Vec<Rational>,
+}
+
+impl BernoulliTable {
+    fn new() -> Self {
+        BernoulliTable {
+            b: alloc::vec![Rational::from_integer(Int::ONE)], // B₀ = 1
+        }
+    }
+
+    /// Returns `B_{2k}` (`k ≥ 1`), extending the table as needed.
+    fn even(&mut self, k: u64) -> Rational {
+        let idx = (2 * k) as usize;
+        while self.b.len() <= idx {
+            let m = self.b.len() as u64; // index of the value being computed
+            if m > 1 && m % 2 == 1 {
+                // Odd-index Bernoulli numbers (past B₁) vanish.
+                self.b.push(Rational::from_integer(Int::ZERO));
+                continue;
+            }
+            // B_m = −1/(m+1) Σ_{j=0}^{m−1} C(m+1, j) B_j.
+            let mut sum = Rational::from_integer(Int::ZERO);
+            let mut c = Int::ONE; // C(m+1, 0)
+            for j in 0..m as usize {
+                sum = sum.add(&self.b[j].mul(&Rational::from_integer(c.clone())));
+                // C(m+1, j+1) = C(m+1, j) · (m+1−j) / (j+1).
+                c = c
+                    .mul(&Int::from_u64(m + 1 - j as u64))
+                    .div_trunc(&Int::from_u64(j as u64 + 1));
+            }
+            let bm = sum.neg().div(&Rational::from_integer(Int::from_u64(m + 1)));
+            self.b.push(bm);
+        }
+        self.b[idx].clone()
+    }
+}
+
+/// Stirling's asymptotic tail `Σ_{k≥1} B₂ₖ / (2k(2k−1) z^{2k−1})` at working
+/// precision `w`, for a large positive `z`. Terms are added until one falls below
+/// `2^{-w}` (absolute); the series being asymptotic, accumulation also stops if a
+/// term stops shrinking (a safety net — `z ≳ w/4` keeps that from happening
+/// before convergence).
+fn stirling_tail(z: &Float, w: u64) -> Float {
+    let z2 = z.mul(z, w, NEAR);
+    let mut zpow = z.clone(); // z^{2k−1}, starts at z¹ (k = 1)
+    let mut sum = Float::zero(w);
+    let mut table = BernoulliTable::new();
+    let mut prev_msb = i64::MAX;
+    let mut k = 1u64;
+    loop {
+        // coeff = B₂ₖ / (2k(2k−1)).
+        let denom = Int::from_u64(2 * k).mul(&Int::from_u64(2 * k - 1));
+        let coeff = table.even(k).div(&Rational::from_integer(denom));
+        let term = Float::from_rational(&coeff, w, NEAR).div(&zpow, w, NEAR);
+        let msb = float_msb(&term);
+        if msb < -(w as i64) {
+            break;
+        }
+        if msb >= prev_msb {
+            // Asymptotic minimum reached before convergence — stop (safety).
+            break;
+        }
+        prev_msb = msb;
+        sum = sum.add(&term, w, NEAR);
+        zpow = zpow.mul(&z2, w, NEAR); // z^{2k+1}
+        k += 1;
+    }
+    sum
+}
+
+/// `ln Γ(x)` for finite `x > 0` at working precision `w`, via Stirling with an
+/// upward argument shift `Γ(x) = Γ(z)/∏_{j<m}(x+j)`, `z = x+m ≳ w/4`.
+fn ln_gamma_at(x: &Float, w: u64) -> Float {
+    // Guard against the cancellation in ln Γ(z) − ln P (both ≈ z ln z) and the
+    // O(m) rounding of the shift product; both are bounded by a few ·bitlen(w).
+    let bw = 64 - w.leading_zeros() as u64;
+    let n = w + 2 * bw + 48;
+    // Shift so that z = x + m reaches the numeric threshold Z ≈ n/4.
+    let z_thresh = (n / 4 + 8) as i64;
+    let fx = x.floor().and_then(|i| i.to_i64()).unwrap_or(z_thresh);
+    let m = if fx >= z_thresh { 0 } else { z_thresh - fx };
+    let z = x.add(&iflt(m, n), n, NEAR);
+    // P = ∏_{j=0}^{m−1} (x + j); ln Γ(x) = ln Γ(z) − ln P.
+    let mut p = iflt(1, n);
+    for j in 0..m {
+        p = p.mul(&x.add(&iflt(j, n), n, NEAR), n, NEAR);
+    }
+    let ln_p = if m > 0 { p.ln(n, NEAR) } else { Float::zero(n) };
+    // ln Γ(z) = (z − ½) ln z − z + ½ ln(2π) + tail.
+    let ln_z = z.ln(n, NEAR);
+    let half = rflt(1, 2, n);
+    let ln_2pi_half = pi_at(n).scale_pow2(1).ln(n, NEAR).scale_pow2(-1);
+    let ln_gamma_z = z
+        .sub(&half, n, NEAR)
+        .mul(&ln_z, n, NEAR)
+        .sub(&z, n, NEAR)
+        .add(&ln_2pi_half, n, NEAR)
+        .add(&stirling_tail(&z, n), n, NEAR);
+    ln_gamma_z.sub(&ln_p, n, NEAR).round(w, NEAR)
+}
+
+/// `Γ(x)` for finite `x ≥ ½` at working precision `w`, via `exp(ln Γ(x))`.
+fn gamma_pos_at(x: &Float, w: u64) -> Float {
+    // exp needs its argument to ~2^{-w} absolute; ln Γ(x) can be as large as
+    // ≈ x·ln x, so carry log₂|ln Γ(x)| extra bits.
+    let extra = float_msb(x).max(0) as u64 + 40;
+    let ln_g = ln_gamma_at(x, w + extra);
+    ln_g.exp(w, NEAR)
+}
+
+/// `Γ(x)` for finite `x` (not a non-positive integer) at working precision `w`.
+fn gamma_fn_at(x: &Float, w: u64) -> Float {
+    let half = rflt(1, 2, w + 8);
+    if x.partial_cmp(&half) == Some(Ordering::Less) {
+        // Reflection: Γ(x) = π / (sin(πx) · Γ(1−x)), with 1−x > ½.
+        // Extra bits cover the tiny sin(πx) near integer arguments.
+        let n = w + 40 + float_msb(x).max(0) as u64;
+        let one = iflt(1, n);
+        let one_minus_x = one.sub(x, n, NEAR);
+        let g1 = gamma_pos_at(&one_minus_x, n);
+        let sin_pix = pi_at(n).mul(x, n, NEAR).sin(n, NEAR);
+        return pi_at(n)
+            .div(&sin_pix.mul(&g1, n, NEAR), n, NEAR)
+            .round(w, NEAR);
+    }
+    gamma_pos_at(x, w)
+}
+
+/// `Jₙ(x)` (`alternating`) or `Iₙ(x)` at working precision `w`, for finite
+/// non-zero `x` and order `n ≥ 0`. The common factor `(x/2)ⁿ/n!` is pulled out
+/// so the accumulated sum stays anchored near its leading term `1`; the sum runs
+/// in scaled-integer arithmetic like [`exp_at`].
+fn bessel_series_at(n: u64, x: &Float, w: u64, alternating: bool) -> Float {
+    // Cancellation guard for the alternating (J) case: partial sums reach
+    // ≈ e^{|x|}, i.e. ~1.4427·|x| bits (log₂e ≈ 185/128); harmless for I.
+    let ax_floor = x.abs().floor().and_then(|i| i.to_i64()).unwrap_or(i64::MAX);
+    let x_guard = (((ax_floor as u128 + 1) * 185 / 128).min(u64::MAX as u128)) as u64;
+    let ns = w + x_guard + 64;
+    // h2 = (x/2)² scaled by 2^{ns} (always non-negative).
+    let half = x.scale_pow2(-1);
+    let hs = scaled_int(&half, ns as i64);
+    let h2 = hs.square().div_2k_trunc(ns as u32); // (x/2)² · 2^{ns}
+    // U = Σ_{m≥0} (∓1)ᵐ cₘ, c₀ = 1, cₘ = cₘ₋₁ · (x/2)² / (m(m+n)), scaled by 2^{ns}.
+    let scale = Int::ONE.mul_2k(ns as u32);
+    let mut c = scale.clone();
+    let mut sum = scale.clone();
+    let mut m = 1u64;
+    loop {
+        // divisor = m·(m+n).
+        let divisor = Int::from_u128(m as u128 * (m as u128 + n as u128));
+        c = c.mul(&h2).div_2k_trunc(ns as u32).div_trunc(&divisor);
+        if c.is_zero() {
+            break;
+        }
+        if alternating && m % 2 == 1 {
+            sum = sum.sub(&c);
+        } else {
+            sum = sum.add(&c);
+        }
+        m += 1;
+    }
+    let uf = Float::round_raw(sum.is_negative(), sum.magnitude(), -(ns as i64), ns, NEAR).0;
+    // prefactor = (x/2)ⁿ / n!.
+    let pref = float_powi(&half, n, ns).div(&factorial_float(n, ns), ns, NEAR);
+    uf.mul(&pref, ns, NEAR).round(w, NEAR)
+}
+
+/// `base^e` (integer exponent) at working precision `w`, by binary exponentiation.
+fn float_powi(base: &Float, e: u64, w: u64) -> Float {
+    let mut acc = iflt(1, w);
+    let mut b = base.clone();
+    let mut e = e;
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = acc.mul(&b, w, NEAR);
+        }
+        e >>= 1;
+        if e > 0 {
+            b = b.mul(&b, w, NEAR);
+        }
+    }
+    acc
+}
+
+/// `n!` as a [`Float`] at working precision `w`.
+fn factorial_float(n: u64, w: u64) -> Float {
+    let mut f = Int::ONE;
+    let mut k = 2u64;
+    while k <= n {
+        f = f.mul(&Int::from_u64(k));
+        k += 1;
+    }
+    Float::from_int(&f, w, NEAR)
 }

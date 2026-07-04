@@ -116,6 +116,9 @@ pub mod poly;
 #[cfg(feature = "matrix")]
 pub mod matrix;
 
+#[cfg(feature = "lattice")]
+pub mod lattice;
+
 #[cfg(feature = "algebraic")]
 pub mod quadratic;
 
@@ -168,6 +171,9 @@ pub use poly::Poly;
 
 #[cfg(feature = "matrix")]
 pub use matrix::Matrix;
+
+#[cfg(feature = "lattice")]
+pub use lattice::{lll_reduce, lll_reduce_delta};
 
 #[cfg(feature = "algebraic")]
 pub use algebraic::Algebraic;

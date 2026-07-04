@@ -99,6 +99,7 @@ int main(void) {
 | `complex` | ✔ | `Complex<T>` — generic complex / Gaussian integers |
 | `poly` | ✔ | `Poly<T>` — generic univariate polynomials |
 | `matrix` | ✔ | `Matrix<T>` — dense matrices with exact linear algebra |
+| `lattice` | ✔ | `lll_reduce` — exact LLL lattice basis reduction (implies `rational`) |
 | `interval` | ✔ | `Interval` — outward-rounded interval arithmetic (implies `float`) |
 | `algebraic` | ✔ | `Quadratic` (ℚ(√d)) and general real `Algebraic` numbers |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
@@ -185,10 +186,9 @@ freely available drafts) is the umbrella reference for most of this list.
 - **Primality *proving*** — upgrade probabilistic Miller–Rabin to a certificate
   via **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁵)`, fast
   variant `Õ((log N)⁴)`) or the deterministic **APR-CL**.
-- **Lattice reduction (LLL)** — Lenstra–Lenstra–Lovász (*Factoring Polynomials
-  with Rational Coefficients*, Math. Ann. 1982), unlocking integer-relation
-  detection (**PSLQ**), `Algebraic` minimal-polynomial recovery, and Diophantine
-  approximation.
+- **Building on the `lattice` LLL** (now shipped) — integer-relation detection
+  (**PSLQ**), `Algebraic` minimal-polynomial recovery from a numeric approximation,
+  and Diophantine approximation.
 - **Polynomial factorization** over 𝔽ₚ and ℚ — Cantor–Zassenhaus (mod p) lifted
   by **Berlekamp–Zassenhaus** (over ℤ, hence ℚ by Gauss's lemma), with **van
   Hoeij**'s LLL-knapsack recombination replacing the exponential `2ⁿ` step for

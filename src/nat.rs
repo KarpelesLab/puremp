@@ -425,6 +425,32 @@ fn modpow_windowed(base: Nat, one: Nat, exp: &Nat, mulmod: impl Fn(&Nat, &Nat) -
     result.expect("bits > 0 guarantees at least one window")
 }
 
+impl Nat {
+    /// Returns the low `k` limbs of `self · rhs` (i.e. the product mod `2^(64k)`),
+    /// computing only the needed columns. Used by Montgomery reduction, where the
+    /// upper half of the `t·m'` product is discarded anyway.
+    fn mul_low_limbs(&self, rhs: &Nat, k: usize) -> Nat {
+        let mut out = alloc::vec![0 as Limb; k];
+        let a_lim = self.limbs.len().min(k);
+        for i in 0..a_lim {
+            let a = self.limbs[i];
+            let mut carry = 0;
+            let cols = (k - i).min(rhs.limbs.len());
+            let row = &mut out[i..i + cols];
+            for (o, &b) in row.iter_mut().zip(&rhs.limbs[..cols]) {
+                let (lo, hi) = mac(*o, a, b, carry);
+                *o = lo;
+                carry = hi;
+            }
+            // A carry out of the truncated row is discarded (belongs to a higher
+            // limb we don't keep).
+        }
+        let mut n = Nat { limbs: out };
+        n.normalize();
+        n
+    }
+}
+
 /// Adds the limbs of `val` into `out` starting at limb `offset`, propagating the
 /// carry. `out` must be large enough to hold the result (including any carry).
 #[inline]
@@ -1575,7 +1601,8 @@ impl Nat {
 
         // REDC(t) = (t + ((t mod R)·m' mod R)·m) / R, conditionally reduced.
         let redc = |t: &Nat| -> Nat {
-            let u = t.low_bits(rbits).mul(&m_prime).low_bits(rbits);
+            // u = (t mod R)·m' mod R — only the low k limbs are needed.
+            let u = t.mul_low_limbs(&m_prime, k);
             let s = t.add(&u.mul(modulus)).shr(rbits);
             if s.cmp_ref(modulus) != Ordering::Less {
                 s.checked_sub(modulus).expect("s >= m")

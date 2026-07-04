@@ -425,6 +425,26 @@ fn modpow_windowed(base: Nat, one: Nat, exp: &Nat, mulmod: impl Fn(&Nat, &Nat) -
     result.expect("bits > 0 guarantees at least one window")
 }
 
+/// Adds the limbs of `val` into `out` starting at limb `offset`, propagating the
+/// carry. `out` must be large enough to hold the result (including any carry).
+#[inline]
+fn add_at(out: &mut [Limb], offset: usize, val: &[Limb]) {
+    let mut carry = 0u128;
+    let dst = &mut out[offset..offset + val.len()];
+    for (o, &v) in dst.iter_mut().zip(val) {
+        let s = *o as u128 + v as u128 + carry;
+        *o = s as Limb;
+        carry = s >> LIMB_BITS;
+    }
+    let mut i = offset + val.len();
+    while carry != 0 {
+        let s = out[i] as u128 + carry;
+        out[i] = s as Limb;
+        carry = s >> LIMB_BITS;
+        i += 1;
+    }
+}
+
 /// `s·a + t·b` as an [`Int`], for the Lehmer cofactor combination.
 fn lincomb(s: i128, a: &crate::int::Int, t: i128, b: &crate::int::Int) -> crate::int::Int {
     use crate::int::Int;
@@ -894,8 +914,16 @@ impl Nat {
             .checked_sub(&z2)
             .and_then(|t| t.checked_sub(&z0))
             .expect("karatsuba middle term is non-negative");
-        let bits = (half * LIMB_BITS as usize) as u64;
-        z2.shl(2 * bits).add(&z1.shl(bits)).add(&z0)
+        // Recombine z0 + z1·B^half + z2·B^(2·half) directly into one buffer
+        // (the shifts are whole-limb), avoiding per-term shl/add allocations.
+        let total = self.limbs.len() + rhs.limbs.len();
+        let mut out = alloc::vec![0 as Limb; total + 1];
+        add_at(&mut out, 0, &z0.limbs);
+        add_at(&mut out, half, &z1.limbs);
+        add_at(&mut out, 2 * half, &z2.limbs);
+        let mut n = Nat { limbs: out };
+        n.normalize();
+        n
     }
 
     /// Returns `self << bits`.

@@ -208,3 +208,133 @@ where
         Complex::neg(&self)
     }
 }
+
+/// Inexact complex analysis on `Complex<Float>`. Every result uses the working
+/// precision `max(re.precision(), im.precision())`, rounded to nearest, so no
+/// precision argument is needed at the call site.
+#[cfg(feature = "float")]
+impl Complex<crate::float::Float> {
+    fn working_precision(&self) -> u64 {
+        self.re.precision().max(self.im.precision())
+    }
+
+    /// Modulus `|z| = √(re² + im²)`.
+    pub fn abs(&self) -> crate::float::Float {
+        use crate::float::{Float, RoundingMode::Nearest};
+        let p = self.working_precision();
+        let g = p + 16;
+        let re2 = Float::mul(&self.re, &self.re, g, Nearest);
+        let im2 = Float::mul(&self.im, &self.im, g, Nearest);
+        Float::add(&re2, &im2, g, Nearest).sqrt(p, Nearest)
+    }
+
+    fn abs_at(&self, w: u64) -> crate::float::Float {
+        use crate::float::{Float, RoundingMode::Nearest};
+        let re2 = Float::mul(&self.re, &self.re, w, Nearest);
+        let im2 = Float::mul(&self.im, &self.im, w, Nearest);
+        Float::add(&re2, &im2, w, Nearest).sqrt(w, Nearest)
+    }
+
+    /// Argument (phase) `arg(z) = atan2(im, re)`, in `(−π, π]`.
+    pub fn arg(&self) -> crate::float::Float {
+        self.im.atan2(
+            &self.re,
+            self.working_precision(),
+            crate::float::RoundingMode::Nearest,
+        )
+    }
+
+    /// `e^z = e^{re}·(cos(im) + i·sin(im))`.
+    pub fn exp(&self) -> Complex<crate::float::Float> {
+        use crate::float::{Float, RoundingMode::Nearest};
+        let p = self.working_precision();
+        let er = self.re.exp(p, Nearest);
+        Complex {
+            re: Float::mul(&er, &self.im.cos(p, Nearest), p, Nearest),
+            im: Float::mul(&er, &self.im.sin(p, Nearest), p, Nearest),
+        }
+    }
+
+    /// Principal logarithm `ln(z) = ln|z| + i·arg(z)`.
+    pub fn ln(&self) -> Complex<crate::float::Float> {
+        use crate::float::RoundingMode::Nearest;
+        Complex {
+            re: self.abs().ln(self.working_precision(), Nearest),
+            im: self.arg(),
+        }
+    }
+
+    /// Principal square root, `√((|z|+re)/2) + i·sgn(im)·√((|z|−re)/2)`.
+    pub fn sqrt(&self) -> Complex<crate::float::Float> {
+        use crate::float::{Float, RoundingMode::Nearest};
+        use crate::int::{Int, Sign};
+        let p = self.working_precision();
+        let g = p + 16;
+        let modulus = self.abs_at(g);
+        let two = Float::from_int(&Int::from_i64(2), g, Nearest);
+        let re = Float::div(
+            &Float::add(&modulus, &self.re, g, Nearest),
+            &two,
+            g,
+            Nearest,
+        )
+        .sqrt(p, Nearest);
+        let mut im = Float::div(
+            &Float::sub(&modulus, &self.re, g, Nearest),
+            &two,
+            g,
+            Nearest,
+        )
+        .sqrt(p, Nearest);
+        if self.im.sign() == Sign::Negative {
+            im = im.neg();
+        }
+        Complex { re, im }
+    }
+
+    /// `z^w = exp(w·ln z)` (principal branch).
+    pub fn pow(&self, w: &Complex<crate::float::Float>) -> Complex<crate::float::Float> {
+        w.mul(&self.ln()).exp()
+    }
+
+    /// `sin(a+bi) = sin a·cosh b + i·cos a·sinh b`.
+    pub fn sin(&self) -> Complex<crate::float::Float> {
+        use crate::float::{Float, RoundingMode::Nearest};
+        let p = self.working_precision();
+        Complex {
+            re: Float::mul(
+                &self.re.sin(p, Nearest),
+                &self.im.cosh(p, Nearest),
+                p,
+                Nearest,
+            ),
+            im: Float::mul(
+                &self.re.cos(p, Nearest),
+                &self.im.sinh(p, Nearest),
+                p,
+                Nearest,
+            ),
+        }
+    }
+
+    /// `cos(a+bi) = cos a·cosh b − i·sin a·sinh b`.
+    pub fn cos(&self) -> Complex<crate::float::Float> {
+        use crate::float::{Float, RoundingMode::Nearest};
+        let p = self.working_precision();
+        Complex {
+            re: Float::mul(
+                &self.re.cos(p, Nearest),
+                &self.im.cosh(p, Nearest),
+                p,
+                Nearest,
+            ),
+            im: Float::mul(
+                &self.re.sin(p, Nearest),
+                &self.im.sinh(p, Nearest),
+                p,
+                Nearest,
+            )
+            .neg(),
+        }
+    }
+}

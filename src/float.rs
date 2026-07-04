@@ -879,6 +879,49 @@ impl PartialOrd for Float {
     }
 }
 
+// Value-consuming operators for ergonomics (e.g. `Complex<Float>`). Precision
+// policy: the result carries the larger of the two operands' precisions and
+// rounds to nearest. For explicit control use the `add`/`sub`/`mul`/`div` methods.
+macro_rules! float_binop {
+    ($tr:ident, $method:ident, $inherent:ident) => {
+        impl core::ops::$tr for Float {
+            type Output = Float;
+            #[inline]
+            fn $method(self, rhs: Float) -> Float {
+                let p = self.precision().max(rhs.precision());
+                Float::$inherent(&self, &rhs, p, RoundingMode::Nearest)
+            }
+        }
+        impl core::ops::$tr<&Float> for &Float {
+            type Output = Float;
+            #[inline]
+            fn $method(self, rhs: &Float) -> Float {
+                let p = self.precision().max(rhs.precision());
+                Float::$inherent(self, rhs, p, RoundingMode::Nearest)
+            }
+        }
+    };
+}
+float_binop!(Add, add, add);
+float_binop!(Sub, sub, sub);
+float_binop!(Mul, mul, mul);
+float_binop!(Div, div, div);
+
+impl core::ops::Neg for Float {
+    type Output = Float;
+    #[inline]
+    fn neg(self) -> Float {
+        Float::neg(&self)
+    }
+}
+impl core::ops::Neg for &Float {
+    type Output = Float;
+    #[inline]
+    fn neg(self) -> Float {
+        Float::neg(self)
+    }
+}
+
 impl FromStr for Float {
     type Err = Error;
 

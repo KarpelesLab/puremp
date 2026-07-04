@@ -1,0 +1,1 @@
+- [Mathesis consumer](mathesis-consumer.md) — Wolfram-style frontend delegating all math to puremp; drives public-API requests

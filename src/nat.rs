@@ -21,26 +21,26 @@ use crate::error::{Error, Result};
 use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 
 // Multiplication crossovers, tuned from `measure_mul_crossovers` (see the test
-// module). The schoolbook loop is fast, so Karatsuba only pays off past ~160
-// limbs. Even with the division-free Goldilocks reduction, the single-prime
-// NTT's power-of-two transform steps keep it slower than the smoothly-scaling
-// Toom-4 until ~24k limbs (with the precomputed-twiddle transform). Re-measure
-// per platform to retune.
+// module) with the addmul_2 schoolbook loop. The faster basecase pushes every
+// crossover up: Karatsuba from ~128 limbs, Toom-3 from ~1.4k, Toom-4 from ~6k.
+// Even with the division-free Goldilocks reduction, the single-prime NTT's
+// power-of-two transform steps keep it slower than the smoothly-scaling Toom
+// ladder until ~11k limbs. Re-measure per platform to retune.
 
 /// Operands with fewer than this many limbs use schoolbook multiplication.
 const KARATSUBA_THRESHOLD: usize = 128;
 
 /// Operands with at least this many limbs use Toom-3 (above Karatsuba).
-const TOOM3_THRESHOLD: usize = 2400;
+const TOOM3_THRESHOLD: usize = 1400;
 
 /// Operands with at least this many limbs use Toom-4 (above Toom-3).
-const TOOM4_THRESHOLD: usize = 3000;
+const TOOM4_THRESHOLD: usize = 6000;
 
 /// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
 const LEHMER_THRESHOLD: usize = 16;
 
 /// Operands with at least this many limbs use NTT multiplication (above Toom-4).
-const NTT_THRESHOLD: usize = 24000;
+const NTT_THRESHOLD: usize = 11000;
 
 // --- Number-theoretic transform over the Goldilocks field 2^64 − 2^32 + 1 ---
 //

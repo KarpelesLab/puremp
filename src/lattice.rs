@@ -285,11 +285,11 @@ mod relations {
 
     /// Canonicalizes a relation so its first nonzero entry is positive.
     fn normalize_sign(mut v: Vec<Int>) -> Vec<Int> {
-        if let Some(first) = v.iter().find(|c| !c.is_zero()) {
-            if first.is_negative() {
-                for c in &mut v {
-                    *c = c.neg();
-                }
+        if let Some(first) = v.iter().find(|c| !c.is_zero())
+            && first.is_negative()
+        {
+            for c in &mut v {
+                *c = c.neg();
             }
         }
         v

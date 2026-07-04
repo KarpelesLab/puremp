@@ -18,6 +18,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
+use crate::int::Int;
 use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 
 // Multiplication crossovers, tuned from `measure_mul_crossovers` (see the test
@@ -39,6 +40,16 @@ const TOOM4_THRESHOLD: usize = 6000;
 /// below it, the wider window's u128 division libcalls cost more than the
 /// full-length passes they save.
 const LEHMER_DW_LIMBS: usize = 110;
+
+/// Number of limbs below which the Half-GCD recursion stops and reduces the
+/// pair with the windowed-Lehmer base case (`hgcd_base`).
+const HGCD_RECURSION_BASE_LIMBS: usize = 128;
+
+/// Smallest operand (in limbs) for which [`Nat::gcd`] engages the subquadratic
+/// Half-GCD driver; smaller inputs stay on the (faster there) Lehmer path. The
+/// crossover was measured near ~8k limbs; the threshold keeps a margin so the
+/// Half-GCD path is never slower than Lehmer.
+const HGCD_GCD_THRESHOLD: usize = 10240;
 
 /// The digit width (bytes) and transform length [`mul_ntt`] uses for a product
 /// totalling `total_bytes` of operand, or `None` if even 1-byte digits would
@@ -883,6 +894,302 @@ fn shifted_window(x: &Nat, shift: u64) -> u128 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Subquadratic Half-GCD (Schönhage; Möller, *Math. Comp.* 77 (2008);
+// Lichtblau, "Half-GCD, Fast Rational Recovery, and Planar Lattice Reduction",
+// ISSAC 2005). See Brent & Zimmermann, *Modern Computer Arithmetic* §1.6.
+//
+// `hgcd(m, n)` (m > n ≥ 0) returns a 2×2 cofactor matrix `R` — a product of
+// elementary Euclidean quotient matrices `E(q) = [[0,1],[1,-q]]`, so `det R =
+// ±1` — together with the reduced pair `(va, vb) = R·(m, n)`, a *consecutive
+// pair in the Euclidean remainder sequence of `(m, n)`* that straddles the
+// half-length point: `bit_len(va) > h ≥ bit_len(vb)` with `h = ⌈bit_len(m)/2⌉`.
+//
+// Correctness rests on Lichtblau's Lemma 3 (a.k.a. Fact 1 in Möller): *any*
+// product of elementary matrices applied to `(m, n)` that yields an ordered
+// positive pair `u > v > 0` is a genuine consecutive remainder pair of
+// `(m, n)`. A recursion working on the top halves of the limbs may overshoot
+// the true quotient sequence by a bounded amount; `hgcd_make_valid` backs up
+// with reverse Euclidean steps (recovering the last quotient from the matrix
+// entries) until the pair is ordered again — Möller's left-to-right stop
+// condition guarantees this needs only a bounded number of steps, so the
+// asymptotic cost stays `O(M(n)·log n)`. Because every `R` is unimodular, the
+// pair-gcd is preserved unconditionally: `gcd(va, vb) = gcd(m, n)` even in the
+// (tested-against) event of an off-by-one reduction, which is the safety net
+// that makes the driver's output bit-identical to plain Euclid/Lehmer.
+// ---------------------------------------------------------------------------
+
+/// A 2×2 integer matrix `[[a, b], [c, d]]` accumulating Euclidean cofactors,
+/// maintained as a product of elementary matrices (determinant `±1`).
+#[derive(Clone)]
+struct HgcdMat {
+    a: Int,
+    b: Int,
+    c: Int,
+    d: Int,
+}
+
+impl HgcdMat {
+    fn identity() -> Self {
+        HgcdMat {
+            a: Int::from(1i64),
+            b: Int::from(0i64),
+            c: Int::from(0i64),
+            d: Int::from(1i64),
+        }
+    }
+
+    fn is_identity(&self) -> bool {
+        self.b.is_zero() && self.c.is_zero() && self.a.is_one() && self.d.is_one()
+    }
+
+    /// Matrix product `self · other`.
+    fn mul(&self, o: &HgcdMat) -> HgcdMat {
+        HgcdMat {
+            a: self.a.mul(&o.a).add(&self.b.mul(&o.c)),
+            b: self.a.mul(&o.b).add(&self.b.mul(&o.d)),
+            c: self.c.mul(&o.a).add(&self.d.mul(&o.c)),
+            d: self.c.mul(&o.b).add(&self.d.mul(&o.d)),
+        }
+    }
+
+    /// Matrix–vector product `self · (x, y)`.
+    fn mul_vec(&self, x: &Int, y: &Int) -> (Int, Int) {
+        (
+            self.a.mul(x).add(&self.b.mul(y)),
+            self.c.mul(x).add(&self.d.mul(y)),
+        )
+    }
+
+    /// The last Euclidean quotient baked into `self` (which must be a nontrivial
+    /// product of elementary matrices): `q = ⌊|c|/|a|⌋`, or `⌊|d|/|b|⌋` when
+    /// `a = 0` (the single-factor case). Reversing this quotient strips the last
+    /// elementary factor, taking `R_j` back to `R_{j-1}`.
+    fn last_quotient(&self) -> Nat {
+        let (num, den) = if !self.a.is_zero() {
+            (self.c.magnitude(), self.a.magnitude())
+        } else {
+            (self.d.magnitude(), self.b.magnitude())
+        };
+        num.div_rem(&den).map(|(q, _)| q).unwrap_or_else(Nat::zero)
+    }
+}
+
+/// One forward Euclidean step on an ordered positive pair (`va > vb > 0`):
+/// premultiply `r` by `E(q) = [[0,1],[1,-q]]` and advance
+/// `(va, vb) → (vb, va mod vb)`.
+fn hgcd_forward(r: &mut HgcdMat, va: &mut Int, vb: &mut Int) {
+    let (q, rem) = va
+        .magnitude()
+        .div_rem(&vb.magnitude())
+        .expect("hgcd_forward: vb > 0");
+    let qi = Int::from(q);
+    // R ← [[0,1],[1,-q]] · R  =  [[c, d], [a - q·c, b - q·d]]
+    let nc = r.a.sub(&qi.mul(&r.c));
+    let nd = r.b.sub(&qi.mul(&r.d));
+    r.a = core::mem::replace(&mut r.c, nc);
+    r.b = core::mem::replace(&mut r.d, nd);
+    // (va, vb) ← (vb, rem)
+    *va = core::mem::replace(vb, Int::from(rem));
+}
+
+/// One reverse Euclidean step: strip the last elementary factor of `r`
+/// (premultiply by `[[q,1],[1,0]]`) and map `(va, vb) → (q·va + vb, va)`.
+fn hgcd_reverse(r: &mut HgcdMat, va: &mut Int, vb: &mut Int, q: &Nat) {
+    let qi = Int::from(q.clone());
+    // R ← [[q,1],[1,0]] · R  =  [[q·a + c, q·b + d], [a, b]]
+    let na = qi.mul(&r.a).add(&r.c);
+    let nb = qi.mul(&r.b).add(&r.d);
+    r.c = core::mem::replace(&mut r.a, na);
+    r.d = core::mem::replace(&mut r.b, nb);
+    // (va, vb) ← (q·va + vb, va)
+    let nva = qi.mul(va).add(vb);
+    *vb = core::mem::replace(va, nva);
+}
+
+/// Back up (reverse Euclidean steps) until `(va, vb)` is an ordered pair
+/// `va > vb ≥ 0` with `va > 0`. By Lichtblau's Lemma 3 the resulting pair is a
+/// genuine consecutive remainder pair of the original `(m, n)`.
+fn hgcd_make_valid(r: &mut HgcdMat, va: &mut Int, vb: &mut Int) {
+    while !(va.is_positive() && !vb.is_negative() && Ord::cmp(&*va, &*vb) == Ordering::Greater) {
+        if r.is_identity() {
+            break;
+        }
+        let q = r.last_quotient();
+        hgcd_reverse(r, va, vb, &q);
+    }
+}
+
+/// From an ordered genuine pair, walk forward/backward to the pair straddling
+/// bit length `h`: `bit_len(va) > h ≥ bit_len(vb)`.
+fn hgcd_straddle(r: &mut HgcdMat, va: &mut Int, vb: &mut Int, h: u64) {
+    loop {
+        if vb.is_zero() {
+            break;
+        }
+        if vb.bit_len() as u64 > h {
+            hgcd_forward(r, va, vb);
+            continue;
+        }
+        if (va.bit_len() as u64) <= h && !r.is_identity() {
+            let q = r.last_quotient();
+            hgcd_reverse(r, va, vb, &q);
+            continue;
+        }
+        break;
+    }
+}
+
+/// One forward Euclidean step on `Nat` operands `u > v > 0`, updating the
+/// cofactor matrix `R ← E(q)·R` (`q = ⌊u/v⌋`) and the pair `(u, v) ← (v, u−qv)`.
+fn hgcd_step_nat(r: &mut HgcdMat, u: &mut Nat, v: &mut Nat) {
+    let (q, rem) = u.div_rem(v).expect("hgcd_step_nat: v > 0");
+    let qi = Int::from(q);
+    // R ← [[0,1],[1,-q]] · R  =  [[c, d], [a - q·c, b - q·d]]
+    let nc = r.a.sub(&qi.mul(&r.c));
+    let nd = r.b.sub(&qi.mul(&r.d));
+    r.a = core::mem::replace(&mut r.c, nc);
+    r.b = core::mem::replace(&mut r.d, nd);
+    *u = core::mem::replace(v, rem);
+}
+
+/// Base case: reduce `(m, n)` to the pair straddling bit length `h`. Uses the
+/// same double/single-word Lehmer windows as [`Nat::gcd_lehmer`] to strip
+/// ~63–126 bits per full-length matrix application (rather than one quotient at
+/// a time), switching to exact single steps near the straddle point so the
+/// window cannot overshoot it. The scalar Lehmer matrix `L = [[a,b],[c,d]]`
+/// (a product of elementary factors) is folded into `R ← L·R`.
+fn hgcd_base(m: &Nat, n: &Nat, h: u64) -> (HgcdMat, Nat, Nat) {
+    let mut r = HgcdMat::identity();
+    let mut u = m.clone();
+    let mut v = n.clone();
+    while !v.is_zero() && v.bit_len() > h {
+        // Near the straddle, take exact single steps (a window could strip past
+        // the ~126-bit-wide target and overshoot the straddle pair).
+        if v.bit_len() <= h + 160 {
+            hgcd_step_nat(&mut r, &mut u, &mut v);
+            continue;
+        }
+        let (a, b, c, d) = if v.limbs.len() >= LEHMER_DW_LIMBS {
+            let shift = u.bit_len() - 126; // v ≥ 3 limbs ⇒ u.bit_len() > 128
+            lehmer_step128(shifted_window(&u, shift), shifted_window(&v, shift))
+        } else {
+            let shift = u.bit_len().saturating_sub(63);
+            lehmer_step64(
+                shifted_window(&u, shift) as u64,
+                shifted_window(&v, shift) as u64,
+            )
+        };
+        if b == 0 {
+            hgcd_step_nat(&mut r, &mut u, &mut v);
+        } else {
+            let nu = lincomb_pos(a, &u, b, &v);
+            let nv = lincomb_pos(c, &u, d, &v);
+            u = nu;
+            v = nv;
+            // R ← L·R, with L the (elementary-product) Lehmer window matrix.
+            let l = HgcdMat {
+                a: Int::from_i128(a),
+                b: Int::from_i128(b),
+                c: Int::from_i128(c),
+                d: Int::from_i128(d),
+            };
+            r = l.mul(&r);
+            debug_assert!(u.cmp_ref(&v) != Ordering::Less, "Lehmer window kept order");
+        }
+    }
+    (r, u, v)
+}
+
+/// Applies a child cofactor matrix to a full-precision pair using the known
+/// high part: given `child·(hi_x, hi_y) = (px, py)` (the child's reduced pair)
+/// and the low `k`-bit remainders `(xl, yl)`, returns
+/// `child·(x, y) = 2^k·(px, py) + child·(xl, yl)`. Only the low-bit product is
+/// computed, halving the multiplication size versus a full matrix–vector apply.
+fn hgcd_apply_split(child: &HgcdMat, px: &Nat, py: &Nat, xl: &Int, yl: &Int, k: u64) -> (Int, Int) {
+    let (lo0, lo1) = child.mul_vec(xl, yl);
+    let hi0 = Int::from(px.clone()).mul_2k(k as u32);
+    let hi1 = Int::from(py.clone()).mul_2k(k as u32);
+    (hi0.add(&lo0), hi1.add(&lo1))
+}
+
+/// Recursive Half-GCD. Precondition: `m > n ≥ 0`. Returns the cofactor matrix
+/// `R` and reduced pair `(va, vb) = R·(m, n)` straddling `2^{⌈bit_len(m)/2⌉}`.
+fn hgcd(m: &Nat, n: &Nat) -> (HgcdMat, Nat, Nat) {
+    debug_assert!(m.cmp_ref(n) == Ordering::Greater, "hgcd requires m > n");
+    let bm = m.bit_len();
+    let h = bm.div_ceil(2);
+    // Already straddled: nothing to reduce.
+    if n.is_zero() || n.bit_len() <= h {
+        return (HgcdMat::identity(), m.clone(), n.clone());
+    }
+    if m.limbs.len() <= HGCD_RECURSION_BASE_LIMBS {
+        return hgcd_base(m, n, h);
+    }
+
+    // Phase 1: recurse on the high half (strip the low k ≈ bit_len(m)/2 bits),
+    // then apply the resulting cofactor matrix to the full pair. Only the low
+    // k bits need the (expensive) matrix–vector product: the high part of
+    // rc1·(m, n) is already the child's reduced pair, since
+    //   rc1·(m, n) = 2^k·rc1·(m≫k, n≫k) + rc1·(m mod 2^k, n mod 2^k).
+    let k = (bm - 1) / 2;
+    let f0 = m.shr(k);
+    let g0 = n.shr(k);
+    let f1 = m.checked_sub(&f0.shl(k)).expect("low bits of m");
+    let g1 = n.checked_sub(&g0.shl(k)).expect("low bits of n");
+    let (rc1, ri, rip1) = if f0.cmp_ref(&g0) == Ordering::Greater {
+        hgcd(&f0, &g0)
+    } else {
+        (HgcdMat::identity(), f0.clone(), g0.clone())
+    };
+    let (mut va, mut vb) = hgcd_apply_split(&rc1, &ri, &rip1, &Int::from(f1), &Int::from(g1), k);
+    let mut r = rc1;
+    hgcd_make_valid(&mut r, &mut va, &mut vb);
+
+    // Phase 2: recurse on the high part of the partially reduced pair to strip
+    // the second quarter, reaching the half-length straddle point.
+    if !vb.is_zero() && vb.bit_len() as u64 > h {
+        let bva = va.bit_len() as u64;
+        let k2 = (2 * h).saturating_sub(bva);
+        if k2 > 0 {
+            let vam = va.magnitude();
+            let vbm = vb.magnitude();
+            let f2 = vam.shr(k2);
+            let g2 = vbm.shr(k2);
+            if f2.cmp_ref(&g2) == Ordering::Greater {
+                let f2l = vam.checked_sub(&f2.shl(k2)).expect("low bits of va");
+                let g2l = vbm.checked_sub(&g2.shl(k2)).expect("low bits of vb");
+                let (rc2, sj, sjp1) = hgcd(&f2, &g2);
+                (va, vb) = hgcd_apply_split(&rc2, &sj, &sjp1, &Int::from(f2l), &Int::from(g2l), k2);
+                r = rc2.mul(&r);
+                hgcd_make_valid(&mut r, &mut va, &mut vb);
+            }
+        }
+    }
+
+    // Land exactly on the straddle pair (a bounded number of adjustment steps).
+    hgcd_straddle(&mut r, &mut va, &mut vb, h);
+    debug_assert!(
+        !va.is_negative() && !vb.is_negative() && va.cmp(&vb) == Ordering::Greater,
+        "hgcd must return an ordered non-negative pair"
+    );
+    // The gcd-preservation guarantee rests on two invariants held by
+    // construction: (va, vb) = R·(m, n) exactly, and det R = ±1 (R is a product
+    // of elementary matrices). Check them in debug builds.
+    debug_assert!(
+        {
+            let (cva, cvb) = r.mul_vec(&Int::from(m.clone()), &Int::from(n.clone()));
+            cva == va && cvb == vb
+        },
+        "hgcd invariant (va,vb) = R·(m,n) violated"
+    );
+    debug_assert!(
+        r.a.mul(&r.d).sub(&r.b.mul(&r.c)).abs().is_one(),
+        "hgcd cofactor matrix must be unimodular"
+    );
+    (r, va.magnitude(), vb.magnitude())
+}
+
 /// Single-word Lehmer pass: partial Euclid on the leading ~63 bits (`x`, `y`
 /// aligned, `x < 2^63`), accumulating the cofactor matrix `[[a,b],[c,d]]` in
 /// machine words. An i128 quotient would lower to a slow division libcall,
@@ -1627,7 +1934,57 @@ impl Nat {
                 rhs.to_u128().expect("<= 2 limbs"),
             ));
         }
+        // Large operands: subquadratic Half-GCD driver. The smaller operand
+        // bounds the work, so gate on it.
+        if self.limbs.len().min(rhs.limbs.len()) >= HGCD_GCD_THRESHOLD {
+            return self.gcd_hgcd(rhs);
+        }
         self.gcd_lehmer(rhs)
+    }
+
+    /// Subquadratic GCD: a Lehmer-style loop driven by the recursive Half-GCD
+    /// ([`hgcd`]). Each iteration replaces `(a, b)` by the remainder-sequence
+    /// pair straddling `2^{bit_len(a)/2}` (halving the operand size in
+    /// `O(M(n))`), so the whole GCD costs `O(M(n)·log n)`. The residual small
+    /// pair is finished with [`Nat::gcd_lehmer`]. Precondition: both non-zero.
+    fn gcd_hgcd(&self, rhs: &Nat) -> Nat {
+        self.gcd_hgcd_floor(rhs, HGCD_GCD_THRESHOLD)
+    }
+
+    /// [`Nat::gcd_hgcd`] with an explicit limb `floor`: once the smaller operand
+    /// drops below `floor` limbs the residual is finished with Lehmer. Split out
+    /// so the differential tests can force the Half-GCD path (and its full
+    /// recursion) on medium-sized inputs where an independent oracle is cheap.
+    fn gcd_hgcd_floor(&self, rhs: &Nat, floor: usize) -> Nat {
+        let floor = floor.max(3);
+        let mut a = self.clone();
+        let mut b = rhs.clone();
+        if a.cmp_ref(&b) == Ordering::Less {
+            core::mem::swap(&mut a, &mut b);
+        }
+        while b.limbs.len() >= floor {
+            let h = a.bit_len().div_ceil(2);
+            // Unbalanced (Half-GCD a no-op) or equal operands (`hgcd` needs
+            // `m > n` strictly): a single full division makes progress.
+            if b.bit_len() <= h || a.cmp_ref(&b) != Ordering::Greater {
+                let (_, r) = a.div_rem(&b).expect("b is non-zero");
+                a = core::mem::replace(&mut b, r);
+                continue;
+            }
+            let (_, va, vb) = hgcd(&a, &b);
+            if vb.bit_len() >= b.bit_len() {
+                // Defensive: force progress if a level somehow made none.
+                let (_, r) = a.div_rem(&b).expect("b is non-zero");
+                a = core::mem::replace(&mut b, r);
+            } else {
+                a = va;
+                b = vb;
+            }
+        }
+        if b.is_zero() {
+            return a;
+        }
+        a.gcd_lehmer(&b)
     }
 
     /// Stein's binary GCD (no division). Precondition: both operands non-zero.
@@ -3310,6 +3667,290 @@ mod tests {
         let a = common.mul(&Nat::from_u64(7).pow(30));
         let b = common.mul(&Nat::from_u64(11).pow(25));
         assert_eq!(a.gcd_lehmer(&b), common);
+    }
+
+    // Deterministic xorshift helper for the Half-GCD tests.
+    fn hgcd_rng(mut state: u64) -> impl FnMut() -> u64 {
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    fn hgcd_build(cnt: usize, f: &mut dyn FnMut() -> u64) -> Nat {
+        let bytes: Vec<u8> = (0..cnt * 8).map(|_| f() as u8).collect();
+        Nat::from_bytes_le(&bytes)
+    }
+
+    // Forces the Half-GCD driver (with full recursion) regardless of the
+    // production size threshold, so the tests exercise it on medium inputs where
+    // an independent oracle is cheap. `floor` is one above the recursion base so
+    // even modest sizes recurse.
+    fn gcd_via_hgcd(a: &Nat, b: &Nat) -> Nat {
+        if a.is_zero() {
+            return b.clone();
+        }
+        if b.is_zero() {
+            return a.clone();
+        }
+        a.gcd_hgcd_floor(b, HGCD_RECURSION_BASE_LIMBS + 1)
+    }
+
+    #[test]
+    fn hgcd_matrix_invariant() {
+        // `hgcd(m, n)` must return an ordered non-negative pair `(va, vb) =
+        // R·(m, n)` straddling the half-length point, with `R` unimodular and
+        // gcd-preserving. Sizes span one to several recursion levels (base is
+        // 128 limbs).
+        let mut next = hgcd_rng(0x9e37_79b9_7f4a_7c15);
+        for i in 0..400 {
+            // Most in the 1–3 recursion-level range; a few much larger to drive
+            // deep recursion. `gcd_lehmer` is the (fast, independently tested)
+            // oracle.
+            let span = if i % 40 == 0 { 1500 } else { 320 };
+            let la = HGCD_RECURSION_BASE_LIMBS - 40 + (next() as usize % span);
+            let lb = HGCD_RECURSION_BASE_LIMBS - 40 + (next() as usize % span);
+            let mut m = hgcd_build(la, &mut next);
+            let mut n = hgcd_build(lb, &mut next);
+            if m.is_zero() || n.is_zero() {
+                continue;
+            }
+            if m.cmp_ref(&n) != Ordering::Greater {
+                core::mem::swap(&mut m, &mut n);
+            }
+            if m.cmp_ref(&n) != Ordering::Greater {
+                continue; // equal
+            }
+            let (r, va, vb) = hgcd(&m, &n);
+            // R · (m, n) == (va, vb).
+            let (cva, cvb) = r.mul_vec(&Int::from(m.clone()), &Int::from(n.clone()));
+            assert_eq!(cva, Int::from(va.clone()), "R·(m,n) row0");
+            assert_eq!(cvb, Int::from(vb.clone()), "R·(m,n) row1");
+            // det R = ±1.
+            let det = r.a.mul(&r.d).sub(&r.b.mul(&r.c));
+            assert!(det.abs().is_one(), "det must be ±1");
+            // Ordered pair, straddling h.
+            let h = m.bit_len().div_ceil(2);
+            assert!(va.cmp_ref(&vb) == Ordering::Greater, "va > vb");
+            assert!(va.bit_len() > h, "va above the straddle point");
+            assert!(vb.bit_len() <= h, "vb at/below the straddle point");
+            // gcd preserved (against the independent binary/Lehmer oracles).
+            assert_eq!(m.gcd_lehmer(&n), va.gcd_lehmer(&vb), "hgcd preserves gcd");
+        }
+    }
+
+    #[test]
+    fn hgcd_gcd_matches_reference() {
+        // Thousands of random pairs across a wide size range. Small pairs go
+        // through the dispatched `gcd`; every pair is also reduced with the
+        // Half-GCD driver forced on (full recursion). All three — dispatched
+        // `gcd`, forced Half-GCD, and the binary-GCD oracle — must agree
+        // bit-for-bit.
+        let mut next = hgcd_rng(0x2545_f491_4f6c_dd1d);
+        for iter in 0..4000u32 {
+            let scale = match next() % 4 {
+                0 => 4,
+                1 => 40,
+                2 => 130,
+                _ => 300,
+            };
+            let la = 1 + (next() as usize % scale);
+            let lb = 1 + (next() as usize % scale);
+            let a = hgcd_build(la, &mut next);
+            let b = hgcd_build(lb, &mut next);
+            let g_ref = if a.is_zero() {
+                b.clone()
+            } else if b.is_zero() {
+                a.clone()
+            } else {
+                a.gcd_binary(&b)
+            };
+            assert_eq!(
+                a.gcd(&b),
+                g_ref,
+                "iter {iter}: dispatched gcd la={la} lb={lb}"
+            );
+            assert_eq!(b.gcd(&a), g_ref, "iter {iter}: symmetry");
+            assert_eq!(gcd_via_hgcd(&a, &b), g_ref, "iter {iter}: forced hgcd");
+            assert_eq!(gcd_via_hgcd(&b, &a), g_ref, "iter {iter}: forced hgcd sym");
+        }
+    }
+
+    #[test]
+    fn hgcd_deep_recursion_matches_lehmer() {
+        // Larger inputs (up to ~3000 limbs → several recursion levels), forced
+        // through the Half-GCD driver, must match Lehmer. Includes pairs with a
+        // planted common factor so the gcd is nontrivial.
+        let mut next = hgcd_rng(0x0123_4567_89ab_cdef);
+        for _ in 0..50 {
+            let la = 200 + (next() as usize % 1900);
+            let lb = 200 + (next() as usize % 1900);
+            let a = hgcd_build(la, &mut next);
+            let b = hgcd_build(lb, &mut next);
+            if a.is_zero() || b.is_zero() {
+                continue;
+            }
+            assert_eq!(gcd_via_hgcd(&a, &b), a.gcd_lehmer(&b), "coprime-ish");
+
+            // Planted common factor g.
+            let g = hgcd_build(1 + (next() as usize % 300), &mut next);
+            if g.is_zero() {
+                continue;
+            }
+            let ga = g.mul(&a);
+            let gb = g.mul(&b);
+            assert_eq!(gcd_via_hgcd(&ga, &gb), ga.gcd_lehmer(&gb), "planted factor");
+        }
+    }
+
+    #[test]
+    fn hgcd_dispatch_engages_above_threshold() {
+        // Exercise the *public* `gcd` at the production threshold so the
+        // dispatch actually runs the Half-GCD driver, and confirm it is
+        // bit-identical to Lehmer.
+        let mut next = hgcd_rng(0xfeed_face_dead_c0de);
+        let n = HGCD_GCD_THRESHOLD + 40;
+        for _ in 0..2 {
+            let a = hgcd_build(n + (next() as usize % 64), &mut next);
+            let b = hgcd_build(n + (next() as usize % 64), &mut next);
+            assert!(a.limbs.len().min(b.limbs.len()) >= HGCD_GCD_THRESHOLD);
+            assert_eq!(a.gcd(&b), a.gcd_lehmer(&b), "dispatched hgcd vs lehmer");
+        }
+    }
+
+    #[test]
+    fn hgcd_structured_cases() {
+        let mut next = hgcd_rng(0xdead_beef_cafe_f00d);
+        let big = |c: usize, f: &mut dyn FnMut() -> u64| hgcd_build(c, f);
+        // Route through the forced Half-GCD driver so these exercise `hgcd`.
+        let g = gcd_via_hgcd;
+
+        // Zero / one edges.
+        let x = big(400, &mut next);
+        assert_eq!(g(&x, &Nat::zero()), x);
+        assert_eq!(g(&Nat::zero(), &x), x);
+        assert_eq!(g(&x, &Nat::one()), Nat::one());
+        assert_eq!(g(&Nat::one(), &x), Nat::one());
+        assert_eq!(g(&Nat::zero(), &Nat::zero()), Nat::zero());
+
+        // Equal operands: gcd(x, x) == x.
+        assert_eq!(g(&x, &x), x);
+
+        // One divides the other: gcd(x, k·x) == x.
+        let k = big(200, &mut next);
+        let mult = x.mul(&k);
+        assert_eq!(g(&x, &mult), x);
+        assert_eq!(g(&mult, &x), x);
+
+        // Consecutive Fibonacci numbers are coprime (worst case for Euclid).
+        let (mut f0, mut f1) = (Nat::zero(), Nat::one());
+        for _ in 0..12000 {
+            let f2 = f0.add(&f1);
+            f0 = core::mem::replace(&mut f1, f2);
+        }
+        let fib_next = f0.add(&f1);
+        assert!(f1.limbs.len() > HGCD_RECURSION_BASE_LIMBS, "fibs recurse");
+        assert_eq!(
+            g(&f1, &fib_next),
+            Nat::one(),
+            "consecutive Fibonacci coprime"
+        );
+
+        // Powers of two: gcd(2^i, 2^j) == 2^min(i,j).
+        let p_big = Nat::one().shl(90_000);
+        let p_small = Nat::one().shl(30_000);
+        assert_eq!(g(&p_big, &p_small), p_small.clone());
+        assert_eq!(g(&p_small, &p_big), p_small);
+
+        // Shared known factor: gcd(g·u, g·v) == g·gcd(u, v).
+        for _ in 0..40 {
+            let gg = big(1 + (next() as usize % 400), &mut next);
+            let u = big(1 + (next() as usize % 500), &mut next);
+            let v = big(1 + (next() as usize % 500), &mut next);
+            if gg.is_zero() || u.is_zero() || v.is_zero() {
+                continue;
+            }
+            let a = gg.mul(&u);
+            let b = gg.mul(&v);
+            let expect = gg.mul(&u.gcd_lehmer(&v));
+            assert_eq!(g(&a, &b), expect, "gcd(g·u, g·v) == g·gcd(u,v)");
+        }
+
+        // Both even, both odd, mixed parity.
+        for _ in 0..40 {
+            let mut a = big(1 + (next() as usize % 400), &mut next);
+            let mut b = big(1 + (next() as usize % 400), &mut next);
+            if a.is_zero() || b.is_zero() {
+                continue;
+            }
+            for (pa, pb) in [(false, false), (true, true), (false, true)] {
+                let aa = if pa {
+                    a.shl(1)
+                } else {
+                    a.shl(1).add(&Nat::one())
+                };
+                let bb = if pb {
+                    b.shl(1)
+                } else {
+                    b.shl(1).add(&Nat::one())
+                };
+                assert_eq!(g(&aa, &bb), aa.gcd_lehmer(&bb), "parity case");
+                a = aa;
+                b = bb;
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run with --release --ignored"]
+    fn hgcd_crossover_bench() {
+        use std::hint::black_box;
+        use std::println;
+        use std::time::Instant;
+        let mk = |limbs: usize, seed: u64| {
+            let mut s = seed;
+            hgcd_build(limbs, &mut || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            })
+        };
+        println!(
+            "{:>8} {:>13} {:>13} {:>9}",
+            "limbs", "lehmer(ms)", "hgcd(ms)", "speedup"
+        );
+        for &limbs in &[
+            64usize, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 16384, 24576, 32768,
+        ] {
+            let a = mk(limbs, 0xA1 ^ limbs as u64);
+            let b = mk(limbs, 0xB2 ^ limbs as u64);
+            let reps = if limbs <= 64 {
+                40
+            } else if limbs <= 256 {
+                10
+            } else if limbs <= 1024 {
+                3
+            } else {
+                1
+            };
+            let gl = a.gcd_lehmer(&b);
+            let gh = a.gcd_hgcd(&b);
+            assert_eq!(gl, gh, "mismatch at {limbs} limbs");
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                black_box(a.gcd_lehmer(&b));
+            }
+            let tl = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let t1 = Instant::now();
+            for _ in 0..reps {
+                black_box(a.gcd_hgcd(&b));
+            }
+            let th = t1.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            println!("{limbs:>8} {tl:>13.3} {th:>13.3} {:>9.2}", tl / th);
+        }
     }
 
     #[test]

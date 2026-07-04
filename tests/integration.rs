@@ -1019,3 +1019,22 @@ fn isqrt_exhaustive_and_large() {
     assert!(s.mul(&s) <= n);
     assert!(s.add(&Nat::one()).square() > n);
 }
+
+#[test]
+fn division_large_divisors_padded_bz() {
+    // Exercise Burnikel–Ziegler above the threshold across many divisor sizes,
+    // including odd limb counts (which drive the power-of-two block padding).
+    // Verify q·b + r == a and r < b against an independent construction.
+    for bits in [17000u32, 20000, 24000, 30000, 40000, 64000] {
+        let b = int("7").pow(bits / 3).add(&int("1")); // irregular, ~bits/3·2.8 bits
+        let q_ref = int("11").pow(bits / 4).add(&int("999999"));
+        let r_ref = int("123456789012345678901234567890"); // < b for these sizes
+        let a = q_ref.mul(&b).add(&r_ref);
+        let (q, r) = a.div_rem(&b).unwrap();
+        assert_eq!(q, q_ref, "quotient at {bits} bits");
+        assert_eq!(r, r_ref, "remainder at {bits} bits");
+        assert!(r < b);
+        // and the fundamental identity
+        assert_eq!(q.mul(&b).add(&r), a);
+    }
+}

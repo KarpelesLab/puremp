@@ -212,7 +212,7 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
 
 /// Divisors with at least this many limbs use Burnikel–Ziegler recursive
 /// division; smaller ones use Knuth Algorithm D directly.
-const BZ_THRESHOLD: usize = 64;
+const BZ_THRESHOLD: usize = 256;
 
 /// Recursion base case (in half-block limbs) for Burnikel–Ziegler.
 const BZ_BASE: usize = 32;
@@ -233,17 +233,24 @@ fn bz_block(x: &Nat, i: usize, n: usize) -> Nat {
 /// `a > b` and `b.limbs.len() >= 2`.
 fn bz_div_rem(a: &Nat, b: &Nat) -> (Nat, Nat) {
     let n = b.limbs.len();
+    // Use a power-of-two block size so every recursive split stays even and the
+    // recursion never bails to quadratic Knuth. Padding the divisor to `n2`
+    // limbs by an extra left shift is value-preserving: shifting both operands
+    // left by the same amount leaves the quotient unchanged and only scales the
+    // remainder, which the final `shr` undoes.
+    let n2 = n.next_power_of_two();
     let s = b.limbs[n - 1].leading_zeros() as u64;
-    let bn = b.shl(s);
-    let an = a.shl(s);
-    let nbits = n as u64 * LIMB_BITS as u64;
-    let t = an.limbs.len().div_ceil(n).max(2);
+    let shift = s + (n2 - n) as u64 * LIMB_BITS as u64;
+    let bn = b.shl(shift); // exactly n2 limbs, top bit set
+    let an = a.shl(shift);
+    let nbits = n2 as u64 * LIMB_BITS as u64;
+    let t = an.limbs.len().div_ceil(n2).max(2);
 
     let mut r = Nat::zero();
     let mut parts: Vec<Nat> = Vec::with_capacity(t);
     for i in (0..t).rev() {
-        let cur = r.shl(nbits).add(&bz_block(&an, i, n));
-        let (qi, ri) = bz_div_2n_1n(&cur, &bn, n);
+        let cur = r.shl(nbits).add(&bz_block(&an, i, n2));
+        let (qi, ri) = bz_div_2n_1n(&cur, &bn, n2);
         parts.push(qi);
         r = ri;
     }
@@ -251,7 +258,7 @@ fn bz_div_rem(a: &Nat, b: &Nat) -> (Nat, Nat) {
     for (j, part) in parts.into_iter().enumerate() {
         q = q.add(&part.shl((t - 1 - j) as u64 * nbits));
     }
-    (q, r.shr(s))
+    (q, r.shr(shift))
 }
 
 /// Divide a `≤ 2n`-limb value by the `n`-limb normalized divisor `b`

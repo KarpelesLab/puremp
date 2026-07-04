@@ -26,6 +26,11 @@
 //! - [`Poly`] — generic univariate polynomials (`poly`).
 //! - [`Matrix`] — dense matrices with exact determinant/inverse/solve
 //!   (`matrix`).
+//!
+//! The generic [`Poly`]/[`Matrix`] containers work over any [`Ring`], an
+//! abstraction whose zero/one are taken relative to a sample element so that
+//! context-carrying rings ([`ModInt`], [`GfElement`]) can supply identities in
+//! their own modulus/field.
 //! - [`Interval`] — outward-rounded interval arithmetic (`interval`).
 //! - [`Ball`] — midpoint–radius (mid-rad) rigorous arithmetic, Arb-style (`ball`).
 //! - [`Padic`] — fixed-precision `p`-adic numbers in `ℚ_p` (`padic`).
@@ -82,6 +87,8 @@ extern crate alloc;
 extern crate std;
 
 pub mod error;
+
+pub mod ring;
 
 #[cfg(feature = "int")]
 mod limb;
@@ -182,6 +189,8 @@ pub mod ffi;
 mod serde_impls;
 
 pub use error::{Error, Result};
+
+pub use ring::Ring;
 
 #[cfg(feature = "int")]
 pub use int::{Int, Sign};

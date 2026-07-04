@@ -9,9 +9,9 @@
 //! - [`Matrix<Rational>`](Matrix): determinant, inverse, linear solve, and rank
 //!   by exact Gaussian elimination over the rationals.
 
+use crate::ring::Ring;
 use alloc::vec::Vec;
 use core::fmt;
-use core::ops::{Add, Mul, Neg, Sub};
 
 /// A dense `rows × cols` matrix stored row-major.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -21,21 +21,12 @@ pub struct Matrix<T> {
     data: Vec<T>,
 }
 
-impl<T: Clone + Default> Matrix<T> {
+impl<T> Matrix<T> {
     /// Builds a `rows × cols` matrix from row-major data. Panics on a length
     /// mismatch.
     pub fn new(rows: usize, cols: usize, data: Vec<T>) -> Matrix<T> {
         assert_eq!(rows * cols, data.len(), "Matrix::new: data length mismatch");
         Matrix { rows, cols, data }
-    }
-
-    /// Builds a `rows × cols` zero matrix.
-    pub fn zeros(rows: usize, cols: usize) -> Matrix<T> {
-        Matrix {
-            rows,
-            cols,
-            data: alloc::vec![T::default(); rows * cols],
-        }
     }
 
     /// Builds a matrix from a list of rows. Panics if the rows differ in length.
@@ -89,23 +80,75 @@ impl<T: Clone + Default> Matrix<T> {
     pub fn as_slice(&self) -> &[T] {
         &self.data
     }
+}
+
+impl<T: Clone> Matrix<T> {
+    /// Builds a `rows × cols` matrix with every entry a clone of `value`.
+    ///
+    /// This is the context-carrying constructor: unlike [`zeros`](Matrix::zeros)
+    /// (which needs a context-free `Default`), it works for rings whose zero
+    /// depends on a runtime context (`ModInt`, `GfElement`) — pass their
+    /// [`Ring::zero`].
+    pub fn filled(value: T, rows: usize, cols: usize) -> Matrix<T> {
+        Matrix {
+            rows,
+            cols,
+            data: alloc::vec![value; rows * cols],
+        }
+    }
 
     /// Returns the transpose.
     pub fn transpose(&self) -> Matrix<T> {
-        let mut out = Matrix::zeros(self.cols, self.rows);
+        let mut data = self.data.clone();
         for i in 0..self.rows {
             for j in 0..self.cols {
-                out.data[j * self.rows + i] = self.data[i * self.cols + j].clone();
+                data[j * self.rows + i] = self.data[i * self.cols + j].clone();
             }
         }
-        out
+        Matrix {
+            rows: self.cols,
+            cols: self.rows,
+            data,
+        }
     }
 }
 
-impl<T> Matrix<T>
-where
-    T: Clone + Default + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
-{
+impl<T: Clone + Default> Matrix<T> {
+    /// Builds a `rows × cols` zero matrix.
+    pub fn zeros(rows: usize, cols: usize) -> Matrix<T> {
+        Matrix {
+            rows,
+            cols,
+            data: alloc::vec![T::default(); rows * cols],
+        }
+    }
+}
+
+impl<T: Ring> Matrix<T> {
+    /// Builds a `rows × cols` zero matrix, taking the ring's zero from `sample`.
+    ///
+    /// The context-carrying counterpart of [`zeros`](Matrix::zeros): use it for
+    /// component rings whose zero depends on a runtime context (`ModInt`,
+    /// `GfElement`).
+    pub fn zeros_like(sample: &T, rows: usize, cols: usize) -> Matrix<T> {
+        Matrix::filled(sample.zero(), rows, cols)
+    }
+
+    /// Builds the `n × n` identity, taking the ring's zero/one from `sample`.
+    ///
+    /// The context-carrying counterpart of the concrete `Matrix::<Int>::identity`
+    /// / `Matrix::<Rational>::identity`.
+    pub fn identity_like(sample: &T, n: usize) -> Matrix<T> {
+        let mut m = Matrix::zeros_like(sample, n, n);
+        let one = sample.one();
+        for i in 0..n {
+            m.set(i, i, one.clone());
+        }
+        m
+    }
+}
+
+impl<T: Ring> Matrix<T> {
     /// Returns `self + rhs`. Panics on a shape mismatch.
     pub fn add(&self, rhs: &Matrix<T>) -> Matrix<T> {
         assert!(
@@ -146,7 +189,25 @@ where
     /// disagree.
     pub fn mul(&self, rhs: &Matrix<T>) -> Matrix<T> {
         assert_eq!(self.cols, rhs.rows, "Matrix::mul: inner dimension mismatch");
-        let mut out: Matrix<T> = Matrix::zeros(self.rows, rhs.cols);
+        let out_len = self.rows * rhs.cols;
+        // Accumulator zeros come from a sample cell (the ring's zero). The only
+        // way both operands are empty yet a cell is needed is the degenerate
+        // `m×0 · 0×n` product, whose ring cannot be inferred.
+        let data: Vec<T> = match self.data.first().or_else(|| rhs.data.first()) {
+            Some(sample) => alloc::vec![sample.zero(); out_len],
+            None => {
+                assert_eq!(
+                    out_len, 0,
+                    "Matrix::mul: cannot infer the ring's zero from empty operands"
+                );
+                Vec::new()
+            }
+        };
+        let mut out = Matrix {
+            rows: self.rows,
+            cols: rhs.cols,
+            data,
+        };
         for i in 0..self.rows {
             for k in 0..self.cols {
                 let a = self.data[i * self.cols + k].clone();
@@ -174,10 +235,7 @@ where
     }
 }
 
-impl<T> Matrix<T>
-where
-    T: Clone + Default + Neg<Output = T>,
-{
+impl<T: Ring> Matrix<T> {
     /// Returns `-self`.
     pub fn neg(&self) -> Matrix<T> {
         Matrix {
@@ -188,7 +246,7 @@ where
     }
 }
 
-impl<T: fmt::Display + Clone + Default> fmt::Display for Matrix<T> {
+impl<T: fmt::Display> fmt::Display for Matrix<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for i in 0..self.rows {
             f.write_str("[")?;
@@ -536,20 +594,14 @@ fn fraction_free_solve(
 
 macro_rules! matrix_binop {
     ($tr:ident, $m:ident, $atr:ident, $am:ident) => {
-        impl<T> core::ops::$tr for Matrix<T>
-        where
-            T: Clone + Default + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
-        {
+        impl<T: Ring> core::ops::$tr for Matrix<T> {
             type Output = Matrix<T>;
             #[inline]
             fn $m(self, rhs: Matrix<T>) -> Matrix<T> {
                 Matrix::$m(&self, &rhs)
             }
         }
-        impl<T> core::ops::$tr<&Matrix<T>> for &Matrix<T>
-        where
-            T: Clone + Default + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
-        {
+        impl<T: Ring> core::ops::$tr<&Matrix<T>> for &Matrix<T> {
             type Output = Matrix<T>;
             #[inline]
             fn $m(self, rhs: &Matrix<T>) -> Matrix<T> {

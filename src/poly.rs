@@ -3,17 +3,21 @@
 //! Coefficients are stored low-to-high (`coeffs[i]` multiplies `xⁱ`) and kept
 //! trimmed so the leading coefficient is nonzero (the zero polynomial has no
 //! coefficients). Like [`Complex`](crate::complex::Complex), `Poly<T>` composes
-//! with any component type exposing the right operators: ring operations
-//! (`+ - *`, evaluation, derivative) need only `+ - *`; polynomial division and
-//! GCD additionally need component division, so they are available for field
-//! components (`Rational`, `Decimal`, `FixedFloat`) but not for `Int`.
+//! with any component type that is a [`Ring`]: ring operations
+//! (`+ - *`, evaluation, derivative) need only the [`Ring`]
+//! operators; polynomial division and GCD additionally need component division,
+//! so they are available for field components (`Rational`, `Decimal`,
+//! `FixedFloat`, `ModInt`, `GfElement`) but not for `Int`.
 //!
-//! `T::default()` is taken to be the additive identity (zero), matching all of
-//! this crate's numeric types.
+//! The additive identity of the component ring is obtained from
+//! [`Ring::zero`] of an available coefficient, so
+//! context-carrying rings (`ModInt`, `GfElement`) work too; the zero polynomial
+//! is the empty-coefficient one.
 
+use crate::ring::Ring;
 use alloc::vec::Vec;
 use core::fmt;
-use core::ops::{Add, Div, Mul, Neg, Sub};
+use core::ops::Div;
 
 /// Degree (in the smaller operand's coefficient count) at or above which
 /// `Poly::mul` switches from schoolbook to Karatsuba.
@@ -26,11 +30,11 @@ pub struct Poly<T> {
 }
 
 /// Highest index holding a nonzero entry, or `None` if all are zero.
-fn top_nonzero<T: Default + PartialEq>(v: &[T]) -> Option<usize> {
-    v.iter().rposition(|c| *c != T::default())
+fn top_nonzero<T: Ring>(v: &[T]) -> Option<usize> {
+    v.iter().rposition(|c| !c.is_zero())
 }
 
-impl<T: Clone + Default + PartialEq> Poly<T> {
+impl<T: Ring> Poly<T> {
     /// Builds a polynomial from low-to-high coefficients, trimming trailing zeros.
     pub fn new(mut coeffs: Vec<T>) -> Poly<T> {
         match top_nonzero(&coeffs) {
@@ -53,7 +57,7 @@ impl<T: Clone + Default + PartialEq> Poly<T> {
     /// The monomial `c·x^degree`.
     pub fn monomial(c: T, degree: usize) -> Poly<T> {
         let mut v = Vec::with_capacity(degree + 1);
-        v.resize(degree, T::default());
+        v.resize(degree, c.zero());
         v.push(c);
         Poly::new(v)
     }
@@ -77,8 +81,19 @@ impl<T: Clone + Default + PartialEq> Poly<T> {
     }
 
     /// Returns the coefficient of `xⁱ` (zero if out of range).
+    ///
+    /// The out-of-range zero is derived from an existing coefficient's ring, so
+    /// this panics only on the zero polynomial (which has no coefficient to draw
+    /// a ring from) — use [`is_zero`](Poly::is_zero) to guard that case.
     pub fn coeff(&self, i: usize) -> T {
-        self.coeffs.get(i).cloned().unwrap_or_default()
+        match self.coeffs.get(i) {
+            Some(c) => c.clone(),
+            None => self
+                .coeffs
+                .first()
+                .expect("Poly::coeff: cannot derive a zero from the zero polynomial")
+                .zero(),
+        }
     }
 
     /// Returns the leading coefficient, or `None` for the zero polynomial.
@@ -87,16 +102,18 @@ impl<T: Clone + Default + PartialEq> Poly<T> {
     }
 }
 
-impl<T> Poly<T>
-where
-    T: Clone + Default + PartialEq + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
-{
+impl<T: Ring> Poly<T> {
     /// Returns `self + rhs`.
     pub fn add(&self, rhs: &Poly<T>) -> Poly<T> {
         let n = self.coeffs.len().max(rhs.coeffs.len());
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            out.push(self.coeff(i) + rhs.coeff(i));
+            match (self.coeffs.get(i), rhs.coeffs.get(i)) {
+                (Some(a), Some(b)) => out.push(a.clone() + b.clone()),
+                (Some(a), None) => out.push(a.clone()),
+                (None, Some(b)) => out.push(b.clone()),
+                (None, None) => unreachable!("i < max(len) so one side is in range"),
+            }
         }
         Poly::new(out)
     }
@@ -106,7 +123,12 @@ where
         let n = self.coeffs.len().max(rhs.coeffs.len());
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            out.push(self.coeff(i) - rhs.coeff(i));
+            match (self.coeffs.get(i), rhs.coeffs.get(i)) {
+                (Some(a), Some(b)) => out.push(a.clone() - b.clone()),
+                (Some(a), None) => out.push(a.clone()),
+                (None, Some(b)) => out.push(-b.clone()),
+                (None, None) => unreachable!("i < max(len) so one side is in range"),
+            }
         }
         Poly::new(out)
     }
@@ -138,7 +160,10 @@ where
 
     /// Quadratic schoolbook multiplication.
     fn mul_schoolbook(&self, rhs: &Poly<T>) -> Poly<T> {
-        let mut out = alloc::vec![T::default(); self.coeffs.len() + rhs.coeffs.len() - 1];
+        // `mul` guarantees both operands are nonzero, so a coefficient exists to
+        // derive the ring's zero from.
+        let zero = self.coeffs[0].zero();
+        let mut out = alloc::vec![zero; self.coeffs.len() + rhs.coeffs.len() - 1];
         for (i, a) in self.coeffs.iter().enumerate() {
             for (j, b) in rhs.coeffs.iter().enumerate() {
                 let prod = a.clone() * b.clone();
@@ -166,7 +191,7 @@ where
             return self.clone();
         }
         let mut v = Vec::with_capacity(self.coeffs.len() + k);
-        v.resize(k, T::default());
+        v.resize(k, self.coeffs[0].zero());
         v.extend_from_slice(&self.coeffs);
         Poly::new(v)
     }
@@ -183,7 +208,7 @@ where
 
     /// Evaluates the polynomial at `x` (Horner's method).
     pub fn eval(&self, x: &T) -> T {
-        let mut acc = T::default();
+        let mut acc = x.zero();
         for c in self.coeffs.iter().rev() {
             acc = acc * x.clone() + c.clone();
         }
@@ -198,7 +223,7 @@ where
         let mut out = Vec::with_capacity(self.coeffs.len() - 1);
         for (i, c) in self.coeffs.iter().enumerate().skip(1) {
             // i·c via repeated addition (no integer-scalar trait required).
-            let mut acc = T::default();
+            let mut acc = c.zero();
             for _ in 0..i {
                 acc = acc + c.clone();
             }
@@ -208,16 +233,7 @@ where
     }
 }
 
-impl<T> Poly<T>
-where
-    T: Clone
-        + Default
-        + PartialEq
-        + Add<Output = T>
-        + Sub<Output = T>
-        + Mul<Output = T>
-        + Neg<Output = T>,
-{
+impl<T: Ring> Poly<T> {
     /// Returns `-self`.
     pub fn neg(&self) -> Poly<T> {
         Poly {
@@ -228,13 +244,7 @@ where
 
 impl<T> Poly<T>
 where
-    T: Clone
-        + Default
-        + PartialEq
-        + Add<Output = T>
-        + Sub<Output = T>
-        + Mul<Output = T>
-        + Div<Output = T>,
+    T: Ring + Div<Output = T>,
 {
     /// Divides `self` by `divisor`, returning `(quotient, remainder)` with
     /// `deg(remainder) < deg(divisor)`. Requires a field component type. Panics
@@ -245,7 +255,7 @@ where
             .expect("Poly::div_rem: division by zero polynomial");
         let lead = divisor.leading().unwrap().clone();
         let mut rem = self.coeffs.clone();
-        let mut quot = alloc::vec![T::default(); self.coeffs.len().saturating_sub(dd)];
+        let mut quot = alloc::vec![lead.zero(); self.coeffs.len().saturating_sub(dd)];
         while let Some(rd) = top_nonzero(&rem) {
             if rd < dd {
                 break;
@@ -296,14 +306,14 @@ where
     }
 }
 
-impl<T: fmt::Display + Clone + Default + PartialEq> fmt::Display for Poly<T> {
+impl<T: fmt::Display + Ring> fmt::Display for Poly<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_zero() {
             return f.write_str("0");
         }
         let mut first = true;
         for (i, c) in self.coeffs.iter().enumerate().rev() {
-            if *c == T::default() {
+            if c.is_zero() {
                 continue;
             }
             if !first {
@@ -322,30 +332,21 @@ impl<T: fmt::Display + Clone + Default + PartialEq> fmt::Display for Poly<T> {
 
 macro_rules! poly_binop {
     ($tr:ident, $m:ident, $atr:ident, $am:ident) => {
-        impl<T> core::ops::$tr for Poly<T>
-        where
-            T: Clone + Default + PartialEq + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
-        {
+        impl<T: Ring> core::ops::$tr for Poly<T> {
             type Output = Poly<T>;
             #[inline]
             fn $m(self, rhs: Poly<T>) -> Poly<T> {
                 Poly::$m(&self, &rhs)
             }
         }
-        impl<T> core::ops::$tr<&Poly<T>> for &Poly<T>
-        where
-            T: Clone + Default + PartialEq + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
-        {
+        impl<T: Ring> core::ops::$tr<&Poly<T>> for &Poly<T> {
             type Output = Poly<T>;
             #[inline]
             fn $m(self, rhs: &Poly<T>) -> Poly<T> {
                 Poly::$m(self, rhs)
             }
         }
-        impl<T> core::ops::$atr for Poly<T>
-        where
-            T: Clone + Default + PartialEq + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
-        {
+        impl<T: Ring> core::ops::$atr for Poly<T> {
             #[inline]
             fn $am(&mut self, rhs: Poly<T>) {
                 *self = Poly::$m(self, &rhs);
@@ -362,8 +363,8 @@ poly_binop!(Mul, mul, MulAssign, mul_assign);
 // Real-root isolation over ℚ (Sturm sequences).
 //
 // These operate on `Poly<Rational>` and power both the public root-finding API
-// below and the `Algebraic` number type. `T::default()` is the additive
-// identity, so `Rational::default() == 0`.
+// below and the `Algebraic` number type. `Rational::ZERO` (the `Ring` additive
+// identity) is the zero coefficient.
 // ===========================================================================
 
 #[cfg(feature = "rational")]

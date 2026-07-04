@@ -191,7 +191,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for crate::complex::Complex<T> {
 }
 
 #[cfg(feature = "poly")]
-impl<T: Serialize + Clone + Default + PartialEq> Serialize for crate::poly::Poly<T> {
+impl<T: Serialize + crate::ring::Ring> Serialize for crate::poly::Poly<T> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         self.coeffs().serialize(s)
     }
@@ -199,7 +199,7 @@ impl<T: Serialize + Clone + Default + PartialEq> Serialize for crate::poly::Poly
 #[cfg(feature = "poly")]
 impl<'de, T> Deserialize<'de> for crate::poly::Poly<T>
 where
-    T: Deserialize<'de> + Clone + Default + PartialEq,
+    T: Deserialize<'de> + crate::ring::Ring,
 {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let coeffs = alloc::vec::Vec::<T>::deserialize(d)?;

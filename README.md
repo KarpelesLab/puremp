@@ -129,6 +129,9 @@ The exact-algebra layers stack on top of these:
 - `lattice::lll_reduce` is an exact LLL lattice reduction; on top of it,
   `find_integer_relation` recognizes constants (e.g. is a number `a·√2 + b`?) and
   `minimal_polynomial` recovers a real algebraic number's defining polynomial.
+- `Poly<T>` and `Matrix<T>` are generic over any `Ring` — including the
+  context-carrying `ModInt` (ℤ/nℤ) and `GfElement` (GF(pᵏ)), so polynomials and
+  matrices over finite fields and modular integers work, not just over `Int`/`Rational`.
 
 For a bare `no_std` build: `--no-default-features` (add `--features int` for the
 integer types).

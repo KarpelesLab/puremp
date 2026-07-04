@@ -1038,3 +1038,49 @@ fn division_large_divisors_padded_bz() {
         assert_eq!(q.mul(&b).add(&r), a);
     }
 }
+
+#[test]
+fn modpow_windowed_vs_reference() {
+    // Independent plain right-to-left square-and-multiply reference.
+    fn ref_modpow(mut base: Int, exp: &Int, m: &Int) -> Int {
+        let mut result = Int::ONE;
+        base = base.rem_euclid(m);
+        let bits = exp.magnitude().bit_len();
+        for i in 0..bits {
+            if exp.magnitude().bit(i) {
+                result = result.mul(&base).rem_euclid(m);
+            }
+            base = base.mul(&base).rem_euclid(m);
+        }
+        result
+    }
+    // Cover odd and even moduli (Montgomery vs Barrett paths), single- and
+    // multi-limb, and exponent sizes straddling window widths (2..6).
+    let cases = [
+        ("2", "10", "1000"),
+        ("7", "255", "13"),                       // exp spans a window boundary
+        ("123456789", "987654321", "1000000007"), // odd modulus (Montgomery)
+        ("123456789", "987654321", "1000000006"), // even modulus (Barrett)
+        ("3", "65537", "340282366920938463463374607431768211297"), // large odd
+        ("5", "0", "97"),                         // exp 0 -> 1
+        ("5", "1", "97"),                         // exp 1
+    ];
+    for (b, e, m) in cases {
+        let (b, e, m) = (int(b), int(e), int(m));
+        assert_eq!(
+            b.modpow(&e, &m),
+            ref_modpow(b.clone(), &e, &m),
+            "modpow {b}^{e} mod {m}"
+        );
+    }
+    // Exponents of every bit length 1..80 (window-boundary stress).
+    let (b, m) = (int("6"), int("1000000007"));
+    for k in 1..80u32 {
+        let e = int("2").pow(k).sub(&int("1")); // k ones
+        assert_eq!(
+            b.modpow(&e, &m),
+            ref_modpow(b.clone(), &e, &m),
+            "2^{k}-1 exponent"
+        );
+    }
+}

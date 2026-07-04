@@ -342,6 +342,64 @@ fn isqrt_u128(v: u128) -> u128 {
     }
 }
 
+/// Left-to-right fixed-window modular exponentiation in an abstract domain.
+///
+/// `base` and `one` are already in the working domain (e.g. Montgomery form),
+/// and `mulmod` multiplies within it. Processing the exponent `w` bits at a time
+/// replaces most of the per-bit multiplications with a small precomputed table,
+/// cutting the multiply count relative to binary square-and-multiply while the
+/// squaring count is unchanged. (Squaring stays fast because `Nat::mul`
+/// dispatches equal operands to `square`.)
+fn modpow_windowed(base: Nat, one: Nat, exp: &Nat, mulmod: impl Fn(&Nat, &Nat) -> Nat) -> Nat {
+    let bits = exp.bit_len();
+    if bits == 0 {
+        return one; // exp == 0
+    }
+    // Window width scaled to the exponent size (table costs 2^w multiplies).
+    let w: u64 = match bits {
+        0..=32 => 2,
+        33..=128 => 3,
+        129..=512 => 4,
+        513..=2048 => 5,
+        _ => 6,
+    };
+    // Precompute base^0 .. base^(2^w − 1).
+    let size = 1usize << w;
+    let mut table = Vec::with_capacity(size);
+    table.push(one);
+    table.push(base.clone());
+    for i in 2..size {
+        table.push(mulmod(&table[i - 1], &base));
+    }
+
+    let mut result: Option<Nat> = None;
+    let mut idx = bits;
+    while idx > 0 {
+        let take = idx.min(w);
+        let shift = idx - take;
+        let mut window = 0usize;
+        for j in 0..take {
+            if exp.bit(shift + j) {
+                window |= 1 << j;
+            }
+        }
+        result = Some(match result {
+            None => table[window].clone(), // first (top) window: no squaring yet
+            Some(mut r) => {
+                for _ in 0..take {
+                    r = mulmod(&r, &r); // square `take` times
+                }
+                if window != 0 {
+                    r = mulmod(&r, &table[window]);
+                }
+                r
+            }
+        });
+        idx = shift;
+    }
+    result.expect("bits > 0 guarantees at least one window")
+}
+
 /// `s·a + t·b` as an [`Int`], for the Lehmer cofactor combination.
 fn lincomb(s: i128, a: &crate::int::Int, t: i128, b: &crate::int::Int) -> crate::int::Int {
     use crate::int::Int;
@@ -1435,34 +1493,16 @@ impl Nat {
     /// apply).
     fn modpow_barrett(&self, exp: &Nat, modulus: &Nat) -> Nat {
         let recip = Reciprocal::new(modulus);
-        let mut result = Nat::one();
-        let mut base = self.div_rem(modulus).expect("non-zero").1;
-        let bits = exp.bit_len();
-        for i in 0..bits {
-            if exp.bit(i) {
-                result = recip.reduce(&result.mul(&base));
-            }
-            if i + 1 < bits {
-                base = recip.reduce(&base.square());
-            }
-        }
-        result
+        let base = self.div_rem(modulus).expect("non-zero").1;
+        modpow_windowed(base, Nat::one(), exp, |a, b| recip.reduce(&a.mul(b)))
     }
 
     /// Square-and-multiply with a division-based reduction after each step.
     fn modpow_simple(&self, exp: &Nat, modulus: &Nat) -> Nat {
-        let mut result = Nat::one();
-        let mut base = self.div_rem(modulus).expect("non-zero modulus").1;
-        let bits = exp.bit_len();
-        for i in 0..bits {
-            if exp.bit(i) {
-                result = result.mul(&base).div_rem(modulus).expect("non-zero").1;
-            }
-            if i + 1 < bits {
-                base = base.square().div_rem(modulus).expect("non-zero").1;
-            }
-        }
-        result
+        let base = self.div_rem(modulus).expect("non-zero modulus").1;
+        modpow_windowed(base, Nat::one(), exp, |a, b| {
+            a.mul(b).div_rem(modulus).expect("non-zero").1
+        })
     }
 
     /// Montgomery-reduction modpow for an odd `modulus > 1`.
@@ -1492,17 +1532,9 @@ impl Nat {
         };
 
         let base_mod = self.div_rem(modulus).expect("non-zero").1;
-        let mut base = redc(&base_mod.mul(&r2)); // into Montgomery form
-        let mut result = r.div_rem(modulus).expect("non-zero").1; // 1 in Montgomery form
-        let bits = exp.bit_len();
-        for i in 0..bits {
-            if exp.bit(i) {
-                result = redc(&result.mul(&base));
-            }
-            if i + 1 < bits {
-                base = redc(&base.square());
-            }
-        }
+        let base = redc(&base_mod.mul(&r2)); // into Montgomery form
+        let one_mont = r.div_rem(modulus).expect("non-zero").1; // 1 in Montgomery form
+        let result = modpow_windowed(base, one_mont, exp, |a, b| redc(&a.mul(b)));
         redc(&result) // back out of Montgomery form
     }
 

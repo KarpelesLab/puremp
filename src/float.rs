@@ -1494,11 +1494,22 @@ fn ln2_at(w: u64) -> Float {
 }
 
 /// `e^x` at precision `w` via range reduction `x = k·ln2 + r` and a Taylor sum.
+///
+/// A second reduction stage `exp(r) = exp(r/2^j)^(2^j)` with `j ≈ √w` balances
+/// series length against squaring count: each halving of `r` removes ~1 term
+/// per remaining `w/j` bits, so the term count drops from `O(w/log w)` to
+/// `O(√w)` at the cost of `√w` cheap squarings.
 fn exp_at(x: &Float, w: u64) -> Float {
+    // The squarings amplify rounding error by ~2^j ulps, so work at w + j + 8
+    // bits; the returned extra bits keep Ziv's ambiguity check sound.
+    let j = w.isqrt().max(1);
+    let w = w + j + 8;
+    let j = j as i64;
     let ln2 = ln2_at(w);
     let k = x.div(&ln2, w, NEAR).round_to_int();
     let ki = k.to_i64().unwrap_or(0);
     let r = x.sub(&Float::from_int(&k, w, NEAR).mul(&ln2, w, NEAR), w, NEAR);
+    let r = r.scale_pow2(-j); // exact
     // exp(r) = Σ rⁿ/n!
     let mut term = iflt(1, w);
     let mut sum = iflt(1, w);
@@ -1510,6 +1521,9 @@ fn exp_at(x: &Float, w: u64) -> Float {
             break;
         }
         n += 1;
+    }
+    for _ in 0..j {
+        sum = sum.mul(&sum, w, NEAR);
     }
     sum.scale_pow2(ki)
 }

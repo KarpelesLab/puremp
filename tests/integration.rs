@@ -1122,7 +1122,7 @@ fn modpow_random_differential() {
         result
     }
     let mut s: u64 = 0xF00D_CAFE;
-    let mut rng_int = |bits: u32, s: &mut u64| -> Int {
+    let rng_int = |bits: u32, s: &mut u64| -> Int {
         let mut v = Int::ZERO;
         let limbs = (bits / 64 + 1).max(1);
         for _ in 0..limbs {

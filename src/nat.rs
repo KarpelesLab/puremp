@@ -461,6 +461,7 @@ fn inv_mod_2_64(x: Limb) -> Limb {
 /// through a single `s+2`-word accumulator, so there is no full-width product or
 /// per-step allocation. Requires an odd modulus with a non-zero top limb, and
 /// `a, b < m` (shorter inputs are zero-extended).
+#[allow(clippy::needless_range_loop)] // index drives t[j], t[j-1], m[j] and the padded b[j] together
 fn mont_mul_cios(a: &Nat, b: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
     let s = m.len();
     let ga = |i: usize| a.limbs.get(i).copied().unwrap_or(0) as u128;

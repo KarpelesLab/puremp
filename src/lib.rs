@@ -136,6 +136,12 @@ pub mod algebraic;
 
 #[cfg(feature = "float")]
 pub mod float;
+#[cfg(feature = "float")]
+mod float_consts;
+#[cfg(feature = "float")]
+mod float_mp;
+#[cfg(feature = "float")]
+mod float_mp_consts;
 
 #[cfg(feature = "float")]
 pub mod fixed_float;

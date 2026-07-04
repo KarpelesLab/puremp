@@ -1075,10 +1075,14 @@ impl Float {
             Repr::Inf(true) => Float::zero(precision),
             Repr::Inf(false) => Float::infinity(precision),
             Repr::Zero(_) => Float::from_int(&Int::ONE, precision, mode),
-            Repr::Normal { .. } => {
-                let x = self.clone();
-                Float::ziv(precision, mode, move |w| exp_at(&x.round(w, NEAR), w))
-            }
+            Repr::Normal { .. } => match crate::float_mp::exp_mp(self, precision, mode) {
+                // Multi-prime fast path (returns a correctly-rounded result or None).
+                Some(v) => v,
+                None => {
+                    let x = self.clone();
+                    Float::ziv(precision, mode, move |w| exp_at(&x.round(w, NEAR), w))
+                }
+            },
         }
     }
 
@@ -1475,7 +1479,45 @@ fn atan_recip_scaled(q: u64, n: u64) -> Nat {
 
 /// π via Machin's formula, `16·atan(1/5) − 4·atan(1/239)`, at precision `w`,
 /// evaluated in scaled integer arithmetic.
+/// Rounds a precomputed constant `sig / 2^CONST_BITS` to `w` bits, using only the
+/// top (significant) limbs. `sig` is little-endian, so its high limbs are last.
+fn from_const(sig: &[u64], w: u64) -> Float {
+    let keep = (((w + 16) / 64 + 2) as usize).min(sig.len());
+    let drop = sig.len() - keep;
+    let mag = Nat::from_limbs(&sig[drop..]);
+    let exp = drop as i64 * 64 - crate::float_consts::CONST_BITS as i64; // value ≈ mag·2^exp
+    Float::round_raw(false, mag, exp, w, NEAR).0
+}
+
+/// `ln 2` at `w` bits from the embedded constant, or `None` beyond its length.
+/// Exposed for the multi-prime `exp` fast path.
+pub(crate) fn ln2_embedded(w: u64) -> Option<Float> {
+    (w + 16 <= crate::float_consts::CONST_BITS)
+        .then(|| from_const(&crate::float_consts::LN2_SIG, w))
+}
+
+/// Rounds `num·2^exp2 / den` (`num ≥ 0`, `den > 0`) to `w` bits, by a single
+/// truncating division plus `round_raw` — no rational gcd normalization. Exposed
+/// for the multi-prime `exp` fast path's inner rounding.
+pub(crate) fn round_ratio(num: &Int, den: &Int, exp2: i64, w: u64, mode: RoundingMode) -> Float {
+    let g = w as i64 + 32; // guard bits below the rounding position
+    let q = num.mul_2k(g as u32).div_floor(den).magnitude();
+    Float::round_raw(false, q, exp2 - g, w, mode).0
+}
+
+/// Rounds `sig / 2^total_bits` to `w` bits via `round_raw` (fast — no rational
+/// normalization). Exposed for the multi-prime `exp` fast path's embedded logs.
+pub(crate) fn round_const_bits(sig: &[u64], total_bits: u64, w: u64) -> Float {
+    let keep = (((w + 48) / 64 + 2) as usize).min(sig.len());
+    let drop = sig.len() - keep;
+    let mag = Nat::from_limbs(&sig[drop..]);
+    Float::round_raw(false, mag, drop as i64 * 64 - total_bits as i64, w, NEAR).0
+}
+
 fn pi_at(w: u64) -> Float {
+    if w + 16 <= crate::float_consts::CONST_BITS {
+        return from_const(&crate::float_consts::PI_SIG, w);
+    }
     let n = w + 32; // guard bits over the series' truncation error
     let a1 = atan_recip_scaled(5, n);
     let a2 = atan_recip_scaled(239, n);
@@ -1537,6 +1579,9 @@ fn split_atan_sum(a: u64, b: u64, m: u64, alternating: bool) -> (Int, Nat, Nat) 
 /// ln 2 via `2·atanh(1/3) = (2/3)·Σ 1/((2k+1)·9^k)` at precision `w`, evaluated
 /// exactly by binary splitting and finished with one scaled division.
 fn ln2_at(w: u64) -> Float {
+    if w + 16 <= crate::float_consts::CONST_BITS {
+        return from_const(&crate::float_consts::LN2_SIG, w);
+    }
     let n = w + 32;
     // Each term shrinks by 9 > 2^3, so n/3 + 2 terms push the tail below 2^-n.
     let k = n / 3 + 2;

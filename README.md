@@ -167,12 +167,14 @@ this list.
 
 **Faster algorithms** (existing operations, correct today, just not maximally fast):
 
-- **Multi-prime argument reduction** for elementary functions (`exp`/`log`/`sin`/
-  `cos`) — reduces the argument using Diophantine combinations of logarithms of
-  many primes, solved with a fast integer-relation search. Reported ~2× speedup
-  from a few thousand bits to millions; applies directly to the series we already
-  ship. Johansson, *Arbitrary-precision computation of the gamma function* /
-  "faster elementary functions" (arXiv:2207.02501, 2022). **Most actionable.**
+- **Context-cached transcendentals** — `FloatContext::exp` *(shipped)* caches the
+  constants the stateless `Float::exp` recomputes each call (chiefly `ln 2`),
+  giving ~17–28% on repeated evaluations without any global state. The deeper
+  **multi-prime argument reduction** (Johansson, arXiv:2207.02501) — reduce the
+  argument by a combination of many prime logarithms so only a short series
+  remains — builds on the same context but needs a high-precision Babai reduction
+  over many primes to beat the tuned `√`-precision method (a naive few-prime
+  greedy reduces only a handful of bits); that reduction remains future work.
 - **Sharper Newton building blocks** — power-series square root in `(4/3)·M(n)`
   (from ~1.83) and reciprocal in `(13/9)·M(n)` (from 1.5) via a third-order
   iteration whose extra term is nearly free; feeds `Float::sqrt`, reciprocal, and

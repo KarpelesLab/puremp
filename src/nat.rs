@@ -1747,8 +1747,15 @@ impl Nat {
         // ≤ self), then share it across the whole recursion instead of
         // re-squaring it at every node.
         let mut powers = alloc::vec![Nat::from_u64(radix as u64)];
+        let bits = self.bit_len();
         loop {
-            let sq = powers.last().unwrap().square();
+            let last = powers.last().unwrap();
+            // `bit_len(x²) ≥ 2·bit_len(x) − 1`: skip the (large, discarded)
+            // final squaring when it certainly exceeds `self`.
+            if 2 * last.bit_len() - 1 > bits {
+                break;
+            }
+            let sq = last.square();
             if sq.cmp_ref(self) == Ordering::Greater {
                 break;
             }
@@ -1895,7 +1902,10 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
             }
         }
         level = next;
-        power = power.mul(&power);
+        if level.len() > 1 {
+            // The last level's power is never used: skip that (full-size) square.
+            power = power.mul(&power);
+        }
     }
     Ok(level.pop().unwrap_or_else(Nat::zero))
 }

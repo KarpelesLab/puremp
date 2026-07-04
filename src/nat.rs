@@ -2376,12 +2376,14 @@ impl Nat {
     ///
     /// The pipeline escalates by difficulty: trial division clears tiny
     /// factors, Pollard's rho splits small ones (up to ~15 digits), the
-    /// quadratic sieve handles balanced semiprimes into the mid-40-digit range
-    /// (its cost scaling with `self`), and Lenstra's elliptic-curve method
-    /// reaches medium factors of larger numbers (its cost scaling with the
-    /// factor). Each split factor is confirmed prime with Baillie–PSW.
-    /// Genuinely hard inputs — two large balanced factors beyond the sieve's
-    /// range — remain expensive, as always.
+    /// quadratic sieve handles balanced semiprimes (its cost scaling with
+    /// `self`) — the single-polynomial variant below ~40 digits and the
+    /// self-initializing multiple-polynomial sieve (SIQS) from there into the
+    /// ~50-digit range — and Lenstra's elliptic-curve method reaches medium
+    /// factors of larger numbers (its cost scaling with the factor). Each split
+    /// factor is confirmed prime with Baillie–PSW. Genuinely hard inputs — two
+    /// large balanced factors beyond the sieve's range — remain expensive, as
+    /// always.
     pub fn factorize(&self) -> Vec<Nat> {
         let mut factors = Vec::new();
         if self.is_zero() || self.is_one() {
@@ -2547,9 +2549,18 @@ fn split_composite(n: &Nat) -> Nat {
     if let Some(f) = pollard_rho(n, Some(1 << 20)) {
         return f;
     }
-    // For a balanced semiprime within the single-polynomial sieve's range
-    // (~≤ 45 digits), the quadratic sieve is faster and more reliable than
-    // ECM, whose cost would depend on the (large) factor rather than on `n`.
+    // For a balanced semiprime the quadratic sieve is faster and more reliable
+    // than ECM, whose cost would depend on the (large) factor rather than on
+    // `n`. Below ~40 digits the single-polynomial sieve is simplest; from there
+    // up to ~52 digits the self-initializing MPQS (SIQS) lifts the interval and
+    // memory limit and is the method of choice. Each falls through to the next
+    // strategy if it fails to split `n`.
+    if n.bit_len() >= 130
+        && n.bit_len() <= 175
+        && let Some(f) = crate::qsieve::siqs_factor(n)
+    {
+        return f;
+    }
     if n.bit_len() <= 152
         && let Some(f) = crate::qsieve::qs_factor(n)
     {

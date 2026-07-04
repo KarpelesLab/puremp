@@ -945,6 +945,48 @@ fn factorization_and_random_prime() {
 }
 
 #[test]
+fn factorization_siqs_range() {
+    // Full `factorize` escalation across the SIQS range: each `n` is a known
+    // balanced semiprime that Pollard rho cannot reach and that lands in the
+    // self-initializing MPQS bucket. Verify the returned factors are exactly
+    // the two primes, multiply back to `n`, and are themselves prime.
+    let check = |p: &str, q: &str| {
+        let p = int(p);
+        let q = int(q);
+        assert!(p.is_prime_bpsw() && q.is_prime_bpsw());
+        let n = p.mul(&q);
+        let f = n.factorize();
+        assert_eq!(f.len(), 2, "expected two prime factors of {n}");
+        assert_eq!(f[0].mul(&f[1]), n, "factors reconstruct {n}");
+        assert!(
+            f.iter().all(|x| x.is_prime_bpsw()),
+            "factors of {n} are prime"
+        );
+        assert!(f[0] == p || f[0] == q);
+    };
+    // ~40-digit balanced semiprime (two 20-digit primes): past Pollard rho's
+    // reach, routed to SIQS. (Larger 43–45-digit inputs are exercised directly
+    // in the `qsieve` unit tests to keep this debug-mode gate fast.)
+    check("30000000000000000041", "50000000000000000059");
+
+    // Edge case — a perfect square p²: handled by the isqrt shortcut, and the
+    // full factorization must list p twice.
+    let p = int("40000000000000000019");
+    assert!(p.is_prime_bpsw());
+    let sq = p.mul(&p);
+    let fs = sq.factorize();
+    assert_eq!(fs, vec![p.clone(), p.clone()]);
+
+    // Edge case — a semiprime with one small factor: caught by trial
+    // division / Pollard rho long before SIQS, and never mis-handled.
+    let small = int("101");
+    let large = int("2000000000000000000069");
+    let n = small.mul(&large);
+    let f = n.factorize();
+    assert_eq!(f, vec![small, large]);
+}
+
+#[test]
 fn continued_fractions() {
     let r = |s: &str| -> Rational { s.parse().unwrap() };
     let cf = |terms: &[i64]| -> Vec<Int> { terms.iter().map(|&t| Int::from(t)).collect() };

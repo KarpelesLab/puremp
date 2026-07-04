@@ -1526,17 +1526,39 @@ fn to_radix_recursive(v: &Nat, powers: &[Nat], radix: u32) -> String {
 const RADIX_RECURSION_LIMBS: usize = 3;
 
 /// Minimal base-`radix` digit string via repeated single-limb division (for
-/// small values / the recursion base case).
+/// small values / the recursion base case). Each multi-limb division peels a
+/// whole limb's worth of digits (`radix^chunk`, the largest power fitting a
+/// `u64`), which are then split out with cheap machine-word arithmetic.
 fn simple_radix_string(n: &Nat, radix: u32) -> String {
     if n.is_zero() {
         return String::new();
     }
+    // Largest `chunk` with `radix^chunk` fitting a u64, and that power itself.
+    let (chunk, base) = {
+        let (mut d, mut p) = (0u32, 1u64);
+        while let Some(next) = p.checked_mul(radix as u64) {
+            p = next;
+            d += 1;
+        }
+        (d, p)
+    };
     let mut n = n.clone();
     let mut buf = Vec::new();
     while !n.is_zero() {
-        let (q, d) = n.divmod_small(radix as Limb);
-        buf.push(digit_char(d as u32));
+        let (q, mut r) = n.divmod_small(base);
         n = q;
+        if n.is_zero() {
+            // Most significant chunk: stop at its leading digit.
+            while r != 0 {
+                buf.push(digit_char((r % radix as u64) as u32));
+                r /= radix as u64;
+            }
+        } else {
+            for _ in 0..chunk {
+                buf.push(digit_char((r % radix as u64) as u32));
+                r /= radix as u64;
+            }
+        }
     }
     buf.reverse();
     String::from_utf8(buf).unwrap_or_default()

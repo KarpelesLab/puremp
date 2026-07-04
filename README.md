@@ -217,9 +217,10 @@ this list.
   via **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁵)`, fast
   variant `Õ((log N)⁴)`) or the deterministic **APR-CL**.
 - **Building on the `lattice` LLL** (shipped, with `find_integer_relation`,
-  `minimal_polynomial`, and `Algebraic::from_float` — recover an exact algebraic
-  number from a float approximation — on top) — **PSLQ** integer relations and
-  Diophantine approximation as further refinements.
+  `minimal_polynomial`, `Algebraic::from_float` — recover an exact algebraic
+  number from a float approximation — and **PSLQ** integer-relation detection
+  (`lattice::pslq`, one-level PSLQ with γ = 2/√3; Ferguson, Bailey & Arno) — all
+  shipped). Further Diophantine-approximation refinements remain future work.
 - **`Poly::factor`** (shipped) factors rational polynomials over ℚ by
   Berlekamp–Zassenhaus — square-free decomposition (Yun), Cantor–Zassenhaus mod
   `p`, Hensel lifting, and **van Hoeij**'s LLL-knapsack recombination (built on the
@@ -228,14 +229,19 @@ this list.
   subset search — so Swinnerton–Dyer-style inputs (many modular factors, few
   rational ones) factor quickly. Trial recombination remains the verified
   fallback.
-- **Special functions** for `Float` — Γ / `lgamma` (Stirling series evaluated by
-  **rectangular splitting**, ~2√n full multiplications; Johansson, arXiv:2109.08392,
-  2021), the Riemann ζ (Euler–Maclaurin / Borwein), `erf`/`erfc` (incomplete-Γ
-  series), Bessel functions (MCA §4.7.1), and Euler's constant γ (Brent–McMillan
-  B3 via Bessel I₀/K₀, binary-split; the fastest known method), all correctly
-  rounded.
-- **Discrete logarithm** (baby-step/giant-step, Pollard rho for DLP) and
-  **`p`-adic numbers** (ℤ_p/ℚ_p) as new exact-arithmetic types.
+- **Special functions** for `Float` — *shipped*: Euler's constant γ
+  (`euler_gamma`, Brent–McMillan), Catalan's constant (`catalan`), the Riemann ζ
+  (`zeta`, Borwein's acceleration of the alternating η, real `s > 0, s ≠ 1`), and
+  `erf` / `erfc` (all-positive Kummer series with a continued-fraction tail for
+  large arguments) — all correctly rounded via the Ziv strategy. Still candidate:
+  Γ / `lgamma` (Stirling by **rectangular splitting**, ~2√n full multiplications;
+  Johansson, arXiv:2109.08392) and Bessel functions (MCA §4.7.1).
+- **Discrete logarithm** *(shipped, `dlog` feature)* — baby-step/giant-step and
+  Pollard's rho for logs (`dlog::discrete_log`, `ModInt::discrete_log`; HAC §3.6),
+  `factorize`-style automatic dispatch by group-order size.
+- **`p`-adic numbers** *(shipped, `padic` feature)* — `Padic`, fixed-precision
+  ℤ_p / ℚ_p as `p^v·u` (unit `u`), with valuation-aware `+ − × ÷`, digit
+  expansion, and Hensel-lifted `sqrt`.
 
 ## License
 

@@ -24,7 +24,8 @@ use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 // module). The schoolbook loop is fast, so Karatsuba only pays off past ~160
 // limbs. Even with the division-free Goldilocks reduction, the single-prime
 // NTT's power-of-two transform steps keep it slower than the smoothly-scaling
-// Toom-4 until ~28k limbs. Re-measure per platform to retune.
+// Toom-4 until ~24k limbs (with the precomputed-twiddle transform). Re-measure
+// per platform to retune.
 
 /// Operands with fewer than this many limbs use schoolbook multiplication.
 const KARATSUBA_THRESHOLD: usize = 128;
@@ -39,7 +40,7 @@ const TOOM4_THRESHOLD: usize = 3000;
 const LEHMER_THRESHOLD: usize = 16;
 
 /// Operands with at least this many limbs use NTT multiplication (above Toom-4).
-const NTT_THRESHOLD: usize = 28000;
+const NTT_THRESHOLD: usize = 24000;
 
 // --- Number-theoretic transform over the Goldilocks field 2^64 − 2^32 + 1 ---
 //
@@ -129,21 +130,29 @@ fn ntt(a: &mut [u64], inverse: bool) {
             a.swap(i, j);
         }
     }
+    // Twiddle scratch, reused across stages (largest stage needs n/2 entries).
+    let mut tw: Vec<u64> = Vec::with_capacity(n / 2);
     let mut len = 2;
     while len <= n {
         let mut wlen = gf_pow(GOLDILOCKS_ROOT, (GOLDILOCKS - 1) / len as u64);
         if inverse {
             wlen = gf_pow(wlen, GOLDILOCKS - 2);
         }
+        let half = len / 2;
+        // Precompute this stage's twiddles once, then reuse across every block.
+        tw.clear();
+        let mut w = 1u64;
+        for _ in 0..half {
+            tw.push(w);
+            w = gf_mul(w, wlen);
+        }
         let mut i = 0;
         while i < n {
-            let mut w = 1u64;
-            for k in 0..len / 2 {
+            for k in 0..half {
                 let u = a[i + k];
-                let v = gf_mul(a[i + k + len / 2], w);
+                let v = gf_mul(a[i + k + half], tw[k]);
                 a[i + k] = gf_add(u, v);
-                a[i + k + len / 2] = gf_sub(u, v);
-                w = gf_mul(w, wlen);
+                a[i + k + half] = gf_sub(u, v);
             }
             i += len;
         }

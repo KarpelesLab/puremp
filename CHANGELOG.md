@@ -7,6 +7,26 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/KarpelesLab/puremp/compare/v0.1.7...v0.1.8) - 2026-07-04
+
+### Fixed
+
+- clippy needless_range_loop in the matrix zero-pivot test
+
+### Other
+
+- scaled-integer atanh/atan/sin/cos series — ln ~4x, sin ~3x, atan ~3.5x faster at 1k bits
+- don't intra-doc-link private ntt_worthwhile from public square docs
+- retire the nth_root_floor future-work item
+- Newton's method for nth_root_floor (k>2) — 10-29x faster
+- fill-aware NTT dispatch, 24-bit digits and one-transform squaring
+- Karatsuba multiplication for Poly<T>
+- paired REDC steps and addmul_2 product in Montgomery arithmetic — modpow ~10% faster
+- fraction-free Matrix<Rational> solve/inverse — solve up to ~8x
+- binary splitting for ln2/atan series and integer-series exp — pi ~2.5x, exp ~2.6x faster
+- fraction-free (Bareiss) Matrix<Rational> determinant
+- Möller–Granlund reciprocal in divmod_small — pi ~26%, exp ~19% faster
+
 ## [0.1.7](https://github.com/KarpelesLab/puremp/compare/v0.1.6...v0.1.7) - 2026-07-04
 
 ### Fixed

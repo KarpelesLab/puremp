@@ -248,8 +248,9 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
 /// division; smaller ones use Knuth Algorithm D directly.
 const BZ_THRESHOLD: usize = 256;
 
-/// Recursion base case (in half-block limbs) for Burnikel–Ziegler.
-const BZ_BASE: usize = 32;
+/// Recursion base case (in half-block limbs) for Burnikel–Ziegler, tuned with
+/// the addmul_2 basecase (larger Knuth blocks now beat recursion overhead).
+const BZ_BASE: usize = 96;
 
 /// Extracts block `i` (limbs `[i·n, (i+1)·n)`) of `x` as a [`Nat`].
 fn bz_block(x: &Nat, i: usize, n: usize) -> Nat {

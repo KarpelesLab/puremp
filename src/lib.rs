@@ -190,7 +190,7 @@ mod serde_impls;
 
 pub use error::{Error, Result};
 
-pub use ring::Ring;
+pub use ring::{Field, Ring};
 
 #[cfg(feature = "int")]
 pub use int::{Int, Sign};

@@ -183,3 +183,47 @@ impl<T: Ring> Ring for crate::complex::Complex<T> {
         self.re.is_zero() && self.im.is_zero()
     }
 }
+
+/// An element of a (commutative) field: a [`Ring`] whose nonzero elements are
+/// invertible (it also has division).
+///
+/// Caveat: `ModInt` is a genuine field only when its modulus is prime, and
+/// `Float` only up to rounding. Both implement `Field` so the generic
+/// linear-algebra / polynomial machinery can run over them, but it is the
+/// caller's responsibility that the ring is actually a field (a prime modulus,
+/// numerically well-conditioned data, …).
+pub trait Field: Ring + core::ops::Div<Output = Self> {
+    /// The multiplicative inverse of `self`, or `None` when `self` is zero.
+    fn inv(&self) -> Option<Self> {
+        if self.is_zero() {
+            None
+        } else {
+            Some(self.one() / self.clone())
+        }
+    }
+}
+
+#[cfg(feature = "rational")]
+impl Field for crate::rational::Rational {}
+
+#[cfg(feature = "float")]
+impl Field for crate::float::Float {}
+
+#[cfg(feature = "int")]
+impl Field for crate::mod_int::ModInt {
+    #[inline]
+    fn inv(&self) -> Option<Self> {
+        crate::mod_int::ModInt::inv(self)
+    }
+}
+
+#[cfg(feature = "galois")]
+impl Field for crate::galois::GfElement {
+    #[inline]
+    fn inv(&self) -> Option<Self> {
+        crate::galois::GfElement::inv(self)
+    }
+}
+
+#[cfg(feature = "complex")]
+impl<F: Field> Field for crate::complex::Complex<F> {}

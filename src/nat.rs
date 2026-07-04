@@ -454,14 +454,25 @@ impl Nat {
         } else {
             (rhs, self)
         };
+        let sl = short.limbs.len();
         let mut out = Vec::with_capacity(long.limbs.len() + 1);
         let mut carry = 0;
-        for (i, &a) in long.limbs.iter().enumerate() {
-            let b = short.limbs.get(i).copied().unwrap_or(0);
+        // Overlapping low limbs (bounds-check-free zip).
+        for (&a, &b) in long.limbs[..sl].iter().zip(&short.limbs) {
             let (s, c) = adc(a, b, carry);
             out.push(s);
             carry = c;
         }
+        // High limbs of `long`: propagate the carry, then bulk-copy the rest.
+        let tail = &long.limbs[sl..];
+        let mut i = 0;
+        while carry != 0 && i < tail.len() {
+            let (s, c) = adc(tail[i], 0, carry);
+            out.push(s);
+            carry = c;
+            i += 1;
+        }
+        out.extend_from_slice(&tail[i..]);
         if carry != 0 {
             out.push(carry);
         }
@@ -475,14 +486,25 @@ impl Nat {
         if self.cmp_ref(rhs) == Ordering::Less {
             return None;
         }
+        let rl = rhs.limbs.len();
         let mut out = Vec::with_capacity(self.limbs.len());
         let mut borrow = 0;
-        for (i, &a) in self.limbs.iter().enumerate() {
-            let b = rhs.limbs.get(i).copied().unwrap_or(0);
+        // Overlapping low limbs (self is at least as long, given self >= rhs).
+        for (&a, &b) in self.limbs[..rl].iter().zip(&rhs.limbs) {
             let (d, bb) = sbb(a, b, borrow);
             out.push(d);
             borrow = bb;
         }
+        // High limbs of `self`: propagate the borrow, then bulk-copy the rest.
+        let tail = &self.limbs[rl..];
+        let mut i = 0;
+        while borrow != 0 && i < tail.len() {
+            let (d, bb) = sbb(tail[i], 0, borrow);
+            out.push(d);
+            borrow = bb;
+            i += 1;
+        }
+        out.extend_from_slice(&tail[i..]);
         debug_assert_eq!(borrow, 0, "checked_sub borrow escaped after a >= b check");
         let mut n = Nat { limbs: out };
         n.normalize();

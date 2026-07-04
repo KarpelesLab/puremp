@@ -140,9 +140,6 @@ pub mod float;
 #[cfg(feature = "float")]
 pub mod fixed_float;
 
-#[cfg(feature = "float")]
-pub mod float_reduce;
-
 #[cfg(feature = "interval")]
 pub mod interval;
 
@@ -196,8 +193,6 @@ pub use quadratic::Quadratic;
 pub use fixed_float::FixedFloat;
 #[cfg(feature = "float")]
 pub use float::{Float, RoundingMode};
-#[cfg(feature = "float")]
-pub use float_reduce::FloatContext;
 
 #[cfg(feature = "interval")]
 pub use interval::Interval;

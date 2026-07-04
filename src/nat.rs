@@ -45,6 +45,42 @@ const LEHMER_DW_LIMBS: usize = 110;
 /// pair with the windowed-Lehmer base case (`hgcd_base`).
 const HGCD_RECURSION_BASE_LIMBS: usize = 128;
 
+/// Production recursion base (in limbs). A test-only seam (see the `tests`
+/// module's `hgcd_with_test_base`) can shrink this so small inputs still drive
+/// the full recursion — `hgcd_make_valid`, `hgcd_straddle`, `hgcd_apply_split`
+/// and the make-valid back-ups — millions of times cheaply.
+#[cfg(not(test))]
+#[inline(always)]
+fn hgcd_recursion_base_limbs() -> usize {
+    HGCD_RECURSION_BASE_LIMBS
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only override for the Half-GCD recursion base (per-thread, so
+    /// parallel tests stay isolated).
+    static HGCD_TEST_BASE: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(HGCD_RECURSION_BASE_LIMBS) };
+}
+
+#[cfg(test)]
+fn hgcd_recursion_base_limbs() -> usize {
+    HGCD_TEST_BASE.with(|c| c.get())
+}
+
+/// Runs `f` with the Half-GCD recursion base shrunk to `base` limbs (>= 2),
+/// restoring the previous value afterwards. Lets the differential tests drive
+/// the full recursion — make-valid back-ups, straddle, apply-split — on tiny
+/// operands, so millions of pairs cost little yet exercise the same code paths
+/// as production's 128-limb base.
+#[cfg(test)]
+fn hgcd_with_test_base<R>(base: usize, f: impl FnOnce() -> R) -> R {
+    let prev = HGCD_TEST_BASE.with(|c| c.replace(base.max(2)));
+    let out = f();
+    HGCD_TEST_BASE.with(|c| c.set(prev));
+    out
+}
+
 /// Smallest operand (in limbs) for which [`Nat::gcd`] engages the subquadratic
 /// Half-GCD driver; smaller inputs stay on the (faster there) Lehmer path. The
 /// crossover was measured near ~8k limbs; the threshold keeps a margin so the
@@ -1113,9 +1149,44 @@ fn hgcd_apply_split(child: &HgcdMat, px: &Nat, py: &Nat, xl: &Int, yl: &Int, k: 
     (hi0.add(&lo0), hi1.add(&lo1))
 }
 
+/// Always-on correctness guard for one Half-GCD reduction: returns `true` iff
+/// `det R = ±1` and `(va, vb) = R·(m, n)` exactly. Those two facts together
+/// *prove* `gcd(va, vb) = gcd(m, n)` — a unimodular map preserves the gcd — so a
+/// `true` result means the reduction is trustworthy even against a latent bug in
+/// [`hgcd`]; a `false` result tells the driver to fall back to the trusted
+/// Lehmer GCD, so a wrong Half-GCD result can never reach `Rational`. Cost is one
+/// matrix–vector product plus a 2×2 determinant at the current operand size —
+/// `O(M(n))`, negligible against the (only-above-10k-limb) Half-GCD it guards,
+/// and it shrinks geometrically down the driver loop, so the whole guard adds
+/// `O(M(n))` overall.
+fn hgcd_reduction_ok(r: &HgcdMat, m: &Nat, n: &Nat, va: &Nat, vb: &Nat) -> bool {
+    if !r.a.mul(&r.d).sub(&r.b.mul(&r.c)).abs().is_one() {
+        return false;
+    }
+    let (cva, cvb) = r.mul_vec(&Int::from(m.clone()), &Int::from(n.clone()));
+    cva == Int::from(va.clone()) && cvb == Int::from(vb.clone())
+}
+
 /// Recursive Half-GCD. Precondition: `m > n ≥ 0`. Returns the cofactor matrix
 /// `R` and reduced pair `(va, vb) = R·(m, n)` straddling `2^{⌈bit_len(m)/2⌉}`.
+///
+/// This wrapper checks the gcd-preservation invariants on *every* return path
+/// (including the base case and both early returns of [`hgcd_inner`]) in debug
+/// builds, so any drift between `R` and `(va, vb)` trips immediately in tests.
 fn hgcd(m: &Nat, n: &Nat) -> (HgcdMat, Nat, Nat) {
+    let (r, va, vb) = hgcd_inner(m, n);
+    #[cfg(debug_assertions)]
+    {
+        debug_assert!(
+            hgcd_reduction_ok(&r, m, n, &va, &vb),
+            "hgcd invariant (va,vb)=R·(m,n) with det R=±1 violated"
+        );
+    }
+    (r, va, vb)
+}
+
+/// Recursion body for [`hgcd`]; see that wrapper for the checked contract.
+fn hgcd_inner(m: &Nat, n: &Nat) -> (HgcdMat, Nat, Nat) {
     debug_assert!(m.cmp_ref(n) == Ordering::Greater, "hgcd requires m > n");
     let bm = m.bit_len();
     let h = bm.div_ceil(2);
@@ -1123,7 +1194,7 @@ fn hgcd(m: &Nat, n: &Nat) -> (HgcdMat, Nat, Nat) {
     if n.is_zero() || n.bit_len() <= h {
         return (HgcdMat::identity(), m.clone(), n.clone());
     }
-    if m.limbs.len() <= HGCD_RECURSION_BASE_LIMBS {
+    if m.limbs.len() <= hgcd_recursion_base_limbs() {
         return hgcd_base(m, n, h);
     }
 
@@ -1173,20 +1244,8 @@ fn hgcd(m: &Nat, n: &Nat) -> (HgcdMat, Nat, Nat) {
         !va.is_negative() && !vb.is_negative() && va.cmp(&vb) == Ordering::Greater,
         "hgcd must return an ordered non-negative pair"
     );
-    // The gcd-preservation guarantee rests on two invariants held by
-    // construction: (va, vb) = R·(m, n) exactly, and det R = ±1 (R is a product
-    // of elementary matrices). Check them in debug builds.
-    debug_assert!(
-        {
-            let (cva, cvb) = r.mul_vec(&Int::from(m.clone()), &Int::from(n.clone()));
-            cva == va && cvb == vb
-        },
-        "hgcd invariant (va,vb) = R·(m,n) violated"
-    );
-    debug_assert!(
-        r.a.mul(&r.d).sub(&r.b.mul(&r.c)).abs().is_one(),
-        "hgcd cofactor matrix must be unimodular"
-    );
+    // The gcd-preservation invariants — (va, vb) = R·(m, n) and det R = ±1 — are
+    // checked on every return path by the [`hgcd`] wrapper.
     (r, va.magnitude(), vb.magnitude())
 }
 
@@ -1948,14 +2007,18 @@ impl Nat {
     /// `O(M(n))`), so the whole GCD costs `O(M(n)·log n)`. The residual small
     /// pair is finished with [`Nat::gcd_lehmer`]. Precondition: both non-zero.
     fn gcd_hgcd(&self, rhs: &Nat) -> Nat {
+        // The Half-GCD path carries an always-on correctness guard. If it ever
+        // trips (a latent reduction bug), fall back to the trusted Lehmer GCD so
+        // a wrong result can never escape into `Rational` reduction.
         self.gcd_hgcd_floor(rhs, HGCD_GCD_THRESHOLD)
+            .unwrap_or_else(|| self.gcd_lehmer(rhs))
     }
 
     /// [`Nat::gcd_hgcd`] with an explicit limb `floor`: once the smaller operand
     /// drops below `floor` limbs the residual is finished with Lehmer. Split out
     /// so the differential tests can force the Half-GCD path (and its full
     /// recursion) on medium-sized inputs where an independent oracle is cheap.
-    fn gcd_hgcd_floor(&self, rhs: &Nat, floor: usize) -> Nat {
+    fn gcd_hgcd_floor(&self, rhs: &Nat, floor: usize) -> Option<Nat> {
         let floor = floor.max(3);
         let mut a = self.clone();
         let mut b = rhs.clone();
@@ -1971,7 +2034,13 @@ impl Nat {
                 a = core::mem::replace(&mut b, r);
                 continue;
             }
-            let (_, va, vb) = hgcd(&a, &b);
+            let (r, va, vb) = hgcd(&a, &b);
+            // Always-on guard: `det R = ±1` and `(va, vb) = R·(a, b)` prove this
+            // reduction preserved the gcd. If it fails, bail so the caller falls
+            // back to the trusted Lehmer GCD (a wrong result cannot escape).
+            if !hgcd_reduction_ok(&r, &a, &b, &va, &vb) {
+                return None;
+            }
             if vb.bit_len() >= b.bit_len() {
                 // Defensive: force progress if a level somehow made none.
                 let (_, r) = a.div_rem(&b).expect("b is non-zero");
@@ -1981,10 +2050,18 @@ impl Nat {
                 b = vb;
             }
         }
-        if b.is_zero() {
-            return a;
+        let g = if b.is_zero() { a } else { a.gcd_lehmer(&b) };
+        // Belt-and-suspenders: the result must divide both original operands.
+        // (One division of each — O(M(n)) once — catches any driver bookkeeping
+        // slip the per-reduction guard would not.)
+        if g.is_zero() {
+            return None;
         }
-        a.gcd_lehmer(&b)
+        let divides = |x: &Nat| x.div_rem(&g).map(|(_, r)| r.is_zero()).unwrap_or(false);
+        if !divides(self) || !divides(rhs) {
+            return None;
+        }
+        Some(g)
     }
 
     /// Stein's binary GCD (no division). Precondition: both operands non-zero.
@@ -3696,6 +3773,172 @@ mod tests {
             return a.clone();
         }
         a.gcd_hgcd_floor(b, HGCD_RECURSION_BASE_LIMBS + 1)
+            .expect("hgcd reduction guard tripped — gcd invariant violated")
+    }
+
+    // Forces the Half-GCD driver with an explicit small `floor` so the driver
+    // loop actually engages on small operands (paired with a shrunk recursion
+    // base). A tripped guard (`None`) panics — that is a bug reproduction.
+    fn gcd_via_hgcd_floor(a: &Nat, b: &Nat, floor: usize) -> Nat {
+        if a.is_zero() {
+            return b.clone();
+        }
+        if b.is_zero() {
+            return a.clone();
+        }
+        a.gcd_hgcd_floor(b, floor)
+            .expect("hgcd reduction guard tripped — gcd invariant violated")
+    }
+
+    // One deterministic differential pass over the danger zones: sizes straddling
+    // the (shrunk) recursion base and the split points, near-equal operands, one
+    // much larger, and planted common factors that force make-valid back-ups.
+    // Every pair is checked against the independent binary-GCD oracle through the
+    // guarded Half-GCD driver (both operand orders). `base` is the shrunk
+    // recursion base; `floor` (3) keeps the driver looping down to Lehmer.
+    fn hgcd_diff_pass(seed: u64, count: usize, base: usize) {
+        hgcd_with_test_base(base, || {
+            let mut next = hgcd_rng(seed);
+            for i in 0..count {
+                let span = 4 * base + 4;
+                let (la, lb) = match next() % 6 {
+                    // Just above the base (base/recurse boundary).
+                    0 => (
+                        base + 1 + (next() as usize % 3),
+                        base + 1 + (next() as usize % 3),
+                    ),
+                    // Near-equal sizes around two levels.
+                    1 => {
+                        let s = 1 + next() as usize % span;
+                        (s, s.saturating_sub(next() as usize % 2))
+                    }
+                    // One much larger than the other (unbalanced).
+                    2 => (
+                        3 * base + (next() as usize % (2 * base)),
+                        1 + next() as usize % 3,
+                    ),
+                    // Small, around one level.
+                    3 => (
+                        1 + next() as usize % (base + 2),
+                        1 + next() as usize % (base + 2),
+                    ),
+                    // Wide random.
+                    _ => (1 + next() as usize % span, 1 + next() as usize % span),
+                };
+                let mut m = hgcd_build(la, &mut next);
+                let mut n = hgcd_build(lb, &mut next);
+                if next().is_multiple_of(2) {
+                    let g = hgcd_build(1 + next() as usize % (base + 1), &mut next);
+                    if !g.is_zero() {
+                        m = m.mul(&g);
+                        n = n.mul(&g);
+                    }
+                }
+                let oracle = if m.is_zero() {
+                    n.clone()
+                } else if n.is_zero() {
+                    m.clone()
+                } else {
+                    m.gcd_binary(&n)
+                };
+                assert_eq!(
+                    gcd_via_hgcd_floor(&m, &n, 3),
+                    oracle,
+                    "seed {seed} i {i} la {la} lb {lb} base {base}"
+                );
+                assert_eq!(
+                    gcd_via_hgcd_floor(&n, &m, 3),
+                    oracle,
+                    "seed {seed} i {i} sym la {la} lb {lb} base {base}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn hgcd_forced_recursion_deep() {
+        // Always-run subset: a few thousand pairs per shrunk base, spanning one
+        // to several recursion levels, all checked against the binary-GCD oracle.
+        for (seed, base) in [
+            (0x1111_2222_3333_4444u64, 3usize),
+            (0x5555_6666_7777_8888, 4),
+            (0x9999_aaaa_bbbb_cccc, 6),
+            (0xdddd_eeee_ffff_0001, 9),
+            (0x0f0f_0f0f_1e1e_1e1e, 13),
+        ] {
+            hgcd_diff_pass(seed, 1200, base);
+        }
+    }
+
+    #[test]
+    fn hgcd_base_boundary_real() {
+        // The real 128-limb base: sizes straddling it so both the base case
+        // (with the 126-bit Lehmer window + lincomb_pos) and one recursion level
+        // are exercised, checked bit-for-bit against Lehmer.
+        let mut next = hgcd_rng(0xa5a5_5a5a_c3c3_3c3c);
+        for _ in 0..24 {
+            let la = HGCD_RECURSION_BASE_LIMBS - 2 + (next() as usize % 8);
+            let lb = HGCD_RECURSION_BASE_LIMBS - 2 + (next() as usize % 8);
+            let m = hgcd_build(la, &mut next);
+            let n = hgcd_build(lb, &mut next);
+            if m.is_zero() || n.is_zero() {
+                continue;
+            }
+            let oracle = m.gcd_lehmer(&n);
+            assert_eq!(
+                gcd_via_hgcd_floor(&m, &n, 3),
+                oracle,
+                "boundary la {la} lb {lb}"
+            );
+            // Planted factor so the gcd is nontrivial across the boundary.
+            let g = hgcd_build(1 + next() as usize % 40, &mut next);
+            if g.is_zero() {
+                continue;
+            }
+            let (gm, gn) = (m.mul(&g), n.mul(&g));
+            assert_eq!(
+                gcd_via_hgcd_floor(&gm, &gn, 3),
+                gm.gcd_lehmer(&gn),
+                "boundary planted la {la} lb {lb}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "exhaustive stress; run with `cargo test --release -- --ignored hgcd_massive`"]
+    fn hgcd_massive_deterministic() {
+        // Millions of deterministic pairs across every recursion regime and
+        // shrunk base. Any mismatch against the binary-GCD oracle, or any tripped
+        // correctness guard, fails loudly with the exact seed/index/sizes.
+        let bases = [2usize, 3, 4, 5, 6, 8, 11, 16, 24, 37];
+        let mut seed = 0xdead_0000_beef_0000u64;
+        for (bi, &base) in bases.iter().enumerate() {
+            for pass in 0..12u64 {
+                seed = seed
+                    .wrapping_mul(0x2545_f491_4f6c_dd1d)
+                    .wrapping_add(0x9e37_79b9_7f4a_7c15)
+                    ^ ((bi as u64) << 32)
+                    ^ pass;
+                hgcd_diff_pass(seed | 1, 20_000, base);
+            }
+        }
+        // A smaller tier at the real 128-limb base to exercise the production
+        // Lehmer-window base case at volume.
+        let mut next = hgcd_rng(0x1357_9bdf_2468_ace0);
+        for _ in 0..400 {
+            let la = HGCD_RECURSION_BASE_LIMBS - 4 + (next() as usize % 260);
+            let lb = HGCD_RECURSION_BASE_LIMBS - 4 + (next() as usize % 260);
+            let m = hgcd_build(la, &mut next);
+            let n = hgcd_build(lb, &mut next);
+            if m.is_zero() || n.is_zero() {
+                continue;
+            }
+            assert_eq!(
+                gcd_via_hgcd_floor(&m, &n, 3),
+                m.gcd_lehmer(&n),
+                "real-base la {la} lb {lb}"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,32 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/KarpelesLab/puremp/compare/v0.1.8...v0.1.9) - 2026-07-04
+
+### Added
+
+- quadratic sieve for balanced-semiprime factorization
+- FloatContext — context-cached exp (caller-held, no global state)
+- Lenstra ECM for medium-factor integer factorization
+- Algebraic::from_float — recover an exact algebraic number from a float
+- van Hoeij LLL recombination for polynomial factorization
+- polynomial factorization over ℚ (Poly::factor, Berlekamp–Zassenhaus)
+- integer-relation detection and minimal-polynomial recovery (LLL)
+- LLL lattice basis reduction (lattice feature)
+
+### Fixed
+
+- use integer sqrt in ECM stage 2 for no_std builds
+- collapse if-let in normalize_sign (clippy -D warnings)
+
+### Other
+
+- surface the exact-algebra capabilities in the README
+- cite rectangular splitting (Γ) and Brent–McMillan B3 (γ) in the roadmap
+- refine roadmap from the literature survey (verified references)
+- double-word Lehmer window and O(1) window reads — gcd ~20% faster at 14k bits, ~2x at 200k
+- expand future work into a roadmap (faster algorithms + new capabilities)
+
 ## [0.1.8](https://github.com/KarpelesLab/puremp/compare/v0.1.7...v0.1.8) - 2026-07-04
 
 ### Fixed

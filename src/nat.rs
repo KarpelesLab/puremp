@@ -1221,6 +1221,14 @@ impl Nat {
         if rhs.is_zero() {
             return self.clone();
         }
+        // Machine-word operands: allocation-free binary GCD (this is the hot
+        // path of every small-`Rational` reduction).
+        if self.limbs.len() <= 2 && rhs.limbs.len() <= 2 {
+            return Nat::from_u128(u128_gcd(
+                self.to_u128().expect("<= 2 limbs"),
+                rhs.to_u128().expect("<= 2 limbs"),
+            ));
+        }
         if self.limbs.len().max(rhs.limbs.len()) < LEHMER_THRESHOLD {
             self.gcd_binary(rhs)
         } else {
@@ -2210,6 +2218,29 @@ fn lucas_strong(n: &Nat) -> bool {
         }
     }
     false
+}
+
+/// Binary GCD on two double words (internal helper for the small-operand path).
+fn u128_gcd(mut u: u128, mut v: u128) -> u128 {
+    if u == 0 {
+        return v;
+    }
+    if v == 0 {
+        return u;
+    }
+    let shift = (u | v).trailing_zeros();
+    u >>= u.trailing_zeros();
+    loop {
+        v >>= v.trailing_zeros();
+        if u > v {
+            core::mem::swap(&mut u, &mut v);
+        }
+        v -= u;
+        if v == 0 {
+            break;
+        }
+    }
+    u << shift
 }
 
 /// Binary GCD on two machine words.

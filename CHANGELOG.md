@@ -7,6 +7,35 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/KarpelesLab/puremp/compare/v0.1.6...v0.1.7) - 2026-07-04
+
+### Fixed
+
+- clippy clean-up for the CIOS Montgomery commit
+
+### Other
+
+- do not intra-doc-link the private sqrt_rem from public isqrt docs
+- changelog entries for the performance work
+- unit fast paths in Nat::mul, gcd and Rational::normalize — integer-valued rationals ~4x faster
+- slice-recursion Karatsuba into shared out/scratch buffers
+- retune Burnikel–Ziegler base case to 96 half-block limbs
+- skip the discarded top-of-ladder squarings in radix I/O — ~16% faster
+- fused single-pass Lehmer cofactor application — gcd ~3x faster
+- second range-reduction stage in exp — ~40% faster
+- Zimmermann square root with remainder — isqrt ~2.9x faster
+- raise the radix-conversion base case to 10 limbs
+- machine-word fast path for small gcd — small Rational ops ~4x faster
+- evaluate pi and ln2 by scaled integer series — pi ~4.7x, exp ~2x faster
+- fold significand trailing zeros into the exponent in Float mul/div
+- retune multiplication crossovers for the addmul_2 basecase
+- dedicated Montgomery squaring + bounds-check-free CIOS — modpow ~18% faster
+- paired triangle rows (addmul_2) in schoolbook squaring
+- addmul_2 inner loop for schoolbook multiplication — ~2.5x faster basecase
+- emit 19 digits per division in the radix base case — to_string ~10% faster
+- precompute NTT twiddle factors per stage — NTT ~40% faster
+- CIOS Montgomery multiplication — modpow ~32% faster
+
 ### Other
 
 - unit fast paths in Nat::mul, gcd and Rational::normalize — integer-valued rationals ~4x faster

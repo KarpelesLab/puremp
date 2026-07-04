@@ -105,6 +105,7 @@ int main(void) {
 | `ball` | ✔ | `Ball` — midpoint–radius (mid-rad) rigorous arithmetic, Arb-style (implies `interval`) |
 | `algebraic` | ✔ | `Quadratic` (ℚ(√d)) and general real `Algebraic` numbers |
 | `identify` | ✔ | Inverse symbolic calculator (`identify`, `machin_like`) via PSLQ (implies `lattice` + `float`) |
+| `primality` | ✔ | Primality proving with auditable certificates — Pocklington + BLS `n∓1` (implies `int`) |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
 | `dlog` | | Discrete logarithm — BSGS, Pollard rho, Pohlig–Hellman (implies `int`) |
 | `num-traits` | | Implements `num-traits` interfaces for `Int`/`Rational`/`Nat`/`Decimal`/`Complex` |
@@ -194,19 +195,17 @@ available drafts) is the umbrella reference for much of this list.
 
 **Candidate new capabilities** (new operations / types):
 
-- **SIQS** — push integer factorization toward 100 digits. `factorize` already
-  escalates trial division → Pollard rho → ECM → single-polynomial quadratic
-  sieve; the next step is the self-initializing multiple-polynomial variant
-  (SIQS), whose small per-polynomial sieve intervals lift the single-polynomial
-  memory limit. Pomerance, *A Tale of Two Sieves*; Crandall & Pomerance; the HAC.
-- **Primality *proving*** — upgrade probabilistic Baillie–PSW to a checkable
-  certificate: `n−1` (Pocklington) and `n+1` (Lucas) tests for numbers with a
-  sufficiently factorable `n∓1`, and the general **ECPP** (Goldwasser–Kilian →
-  Atkin → Morain; heuristic `Õ((log N)⁴⁻⁵)`) or deterministic **APR-CL** for
-  arbitrary inputs.
-- **More special functions** for `Float` — the Γ function and `lgamma` (Stirling
-  series by **rectangular splitting**, ~2√n full multiplications; Johansson,
-  arXiv:2109.08392) and Bessel functions (MCA §4.7.1).
+- **Primality proving for arbitrary inputs** — `n∓1` certificate proofs
+  (Pocklington + BLS `n^{1/3}`) already prove any number with a sufficiently
+  factorable `n∓1`; the general case (a large prime whose `n∓1` is hard) needs
+  **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁴⁻⁵)`) or the
+  deterministic **APR-CL**.
+- **Second-kind Bessel functions** — `Yₙ` and `Kₙ` (the subtractive-cancellation
+  cases; first-kind `Jₙ` and modified `Iₙ` are done). DLMF §10; MCA §4.7.1.
+- **Factorization past ~50 digits** — SIQS handles balanced semiprimes into the
+  ~50-digit range; a large-prime variation, a sparse GF(2) solver (block
+  Lanczos / Wiedemann in place of dense Gaussian elimination), and ultimately the
+  number-field sieve (GNFS) are the path toward ~80–100+ digits.
 
 ## License
 

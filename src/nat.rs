@@ -1954,15 +1954,33 @@ impl Nat {
         if k == 2 {
             return self.isqrt();
         }
-        let hb = self.bit_len().div_ceil(k as u64);
-        let mut root = Nat::zero();
-        for bit in (0..=hb).rev() {
-            let cand = root.add(&Nat::one().shl(bit));
-            if cand.pow(k).cmp_ref(self) != Ordering::Greater {
-                root = cand;
+        // Newton's method for the integer kth root, converging quadratically from
+        // an overestimate: x ← ⌊((k−1)·x + ⌊N/x^(k−1)⌋) / k⌋, which decreases
+        // monotonically toward ⌊N^(1/k)⌋. Start above the root at 2^⌈bits/k⌉, then
+        // fix any ±1 slop from the integer divisions with an exact adjustment.
+        let km1 = Nat::from_u64((k - 1) as u64);
+        let kk = Nat::from_u64(k as u64);
+        let mut x = Nat::one().shl(self.bit_len().div_ceil(k as u64));
+        loop {
+            let div = self.div_rem(&x.pow(k - 1)).expect("x >= 1").0;
+            let next = x.mul(&km1).add(&div).div_rem(&kk).expect("k >= 1").0;
+            if next.cmp_ref(&x) != Ordering::Less {
+                break;
             }
+            x = next;
         }
-        root
+        // Exact adjustment: land on the largest x with x^k ≤ N.
+        while x.pow(k).cmp_ref(self) == Ordering::Greater {
+            x = x.checked_sub(&Nat::one()).expect("root is positive");
+        }
+        loop {
+            let up = x.add(&Nat::one());
+            if up.pow(k).cmp_ref(self) == Ordering::Greater {
+                break;
+            }
+            x = up;
+        }
+        x
     }
 
     /// Writes the magnitude in the given `radix` (2–36) to `out`.
@@ -2770,6 +2788,58 @@ impl core::ops::MulAssign for Nat {
 mod tests {
     use super::*;
     use core::str::FromStr;
+
+    #[test]
+    fn nth_root_floor_newton_is_exact() {
+        // Definition check: x = ⌊N^(1/k)⌋ iff x^k ≤ N < (x+1)^k.
+        let check = |n: &Nat, k: u32| {
+            let x = n.nth_root_floor(k);
+            assert!(
+                x.pow(k).cmp_ref(n) != Ordering::Greater,
+                "x^k > N (n bits={}, k={})",
+                n.bit_len(),
+                k
+            );
+            assert!(
+                x.add(&Nat::one()).pow(k).cmp_ref(n) == Ordering::Greater,
+                "(x+1)^k <= N (n bits={}, k={})",
+                n.bit_len(),
+                k
+            );
+        };
+        // Exhaustive small values across many k.
+        for n in 0u64..2000 {
+            let nat = Nat::from_u64(n);
+            for k in 2u32..=12 {
+                check(&nat, k);
+            }
+        }
+        // Perfect powers and one below: m^k → m, m^k − 1 → m − 1.
+        for m in 2u64..200 {
+            for k in 3u32..=8 {
+                let mk = Nat::from_u64(m).pow(k);
+                assert_eq!(mk.nth_root_floor(k), Nat::from_u64(m));
+                assert_eq!(
+                    mk.checked_sub(&Nat::one()).unwrap().nth_root_floor(k),
+                    Nat::from_u64(m - 1)
+                );
+            }
+        }
+        // Large pseudo-random operands.
+        let mut seed = 0xB007_5EEDu64;
+        for _ in 0..200 {
+            let mut bytes = alloc::vec::Vec::new();
+            let limbs = 1 + (seed as usize % 40);
+            for _ in 0..limbs * 8 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                bytes.push((seed >> 40) as u8);
+            }
+            let n = Nat::from_bytes_le(&bytes);
+            for k in [3u32, 4, 5, 7, 11, 13] {
+                check(&n, k);
+            }
+        }
+    }
 
     #[test]
     fn inv_mod_2_64_is_correct() {

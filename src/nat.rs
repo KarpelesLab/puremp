@@ -1394,7 +1394,8 @@ fn kara_scratch_len(n: usize) -> usize {
 impl Nat {
     /// Returns `self²`, using a symmetric schoolbook or Karatsuba squaring
     /// (roughly half the limb multiplications of the general `mul`), or the
-    /// NTT where its two-transform squaring wins (see [`ntt_worthwhile`]).
+    /// NTT where its two-transform squaring wins (per the internal
+    /// `ntt_worthwhile` shape heuristic).
     pub fn square(&self) -> Nat {
         let n = self.limbs.len();
         if n == 0 {

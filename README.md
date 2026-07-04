@@ -142,12 +142,42 @@ C-header compatibility (puremp ships its own cleaner C ABI).
 Run `cargo run --release --example bench` for a throughput harness across the
 core operations and the derived types.
 
-**Known future optimizations** (correct today, just not maximally fast):
+## Roadmap
 
-- A **half-GCD** for asymptotically faster `Rational` reduction (a recursive
-  matrix HGCD; only wins over the tuned Lehmer step at very large operand sizes),
-  and a **subresultant PRS** to tame Sturm-sequence coefficient growth for
-  high-degree `Algebraic` operations.
+Candidate directions, all specifiable from open literature (so they preserve the
+clean-room provenance). Nothing here is implemented yet; ordering is rough
+interest, not commitment.
+
+**Faster algorithms** (existing operations, correct today, just not maximally fast):
+
+- **Half-GCD** for subquadratic `Rational` reduction — a recursive 2×2 cofactor
+  matrix HGCD, `O(M(n)·log n)` vs. the current `~O(n²)` Lehmer. Only wins at very
+  large operand sizes and needs Möller's conservative-cut correction to be both
+  correct and fast. Stehlé–Zimmermann; *Modern Computer Arithmetic* §1.6.
+- **AGM-based transcendentals** — π and `log`/`exp` via the arithmetic–geometric
+  mean (Brent–Salamin), `O(M(n)·log n)`, overtaking binary-splitting series at
+  very high precision. Brent, *Multiple-precision zero-finding methods and the
+  complexity of elementary function evaluation* (1976).
+- **Subresultant PRS** to tame Sturm-sequence coefficient growth for high-degree
+  `Algebraic` operations (Collins–Brown; *MCA* §2.4).
+
+**Candidate new capabilities** (new operations / types):
+
+- **Integer factorization beyond trial division + Pollard rho** — Lenstra's
+  **ECM** (elliptic-curve method) and the **quadratic sieve**, extending
+  `factorize` into the 40–100-digit range. Crandall & Pomerance, *Prime Numbers:
+  A Computational Perspective*; the HAC.
+- **Primality *proving*** — **APR-CL** or **ECPP** to upgrade the probabilistic
+  Miller–Rabin test into a certificate. Atkin–Morain (ECPP).
+- **Lattice reduction (LLL)** — Lenstra–Lenstra–Lovász, unlocking integer-relation
+  detection (**PSLQ**), minimal-polynomial recovery for `Algebraic`, and
+  Diophantine approximation. *MCA* / the original 1982 paper.
+- **Special functions** for `Float` — Γ / `lgamma` (Spouge or binary-splitting),
+  the Riemann ζ, `erf`/`erfc`, and Bessel functions, with correct rounding.
+- **Polynomial factorization** over 𝔽ₚ and ℚ — Cantor–Zassenhaus and
+  Zassenhaus/van Hoeij, strengthening the `Poly`/`Algebraic` layer.
+- **Discrete logarithm** (baby-step/giant-step, Pollard rho for DLP) and
+  **`p`-adic numbers** (ℤ_p/ℚ_p) as new exact-arithmetic types.
 
 ## License
 

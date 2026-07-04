@@ -7,3 +7,6 @@
 
 # Claude Code session/worktree state
 .claude/
+
+# Claude Code agent memory (belongs in the scratch memory dir, not the repo)
+/memory/

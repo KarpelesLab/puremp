@@ -22,8 +22,9 @@ use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 
 // Multiplication crossovers, tuned from `measure_mul_crossovers` (see the test
 // module). The schoolbook loop is fast, so Karatsuba only pays off past ~160
-// limbs, and the NTT's `u128 % p` reduction keeps it slower than Toom-4 until
-// several thousand limbs. Re-measure per platform to retune.
+// limbs. Even with the division-free Goldilocks reduction, the single-prime
+// NTT's power-of-two transform steps keep it slower than the smoothly-scaling
+// Toom-4 until ~28k limbs. Re-measure per platform to retune.
 
 /// Operands with fewer than this many limbs use schoolbook multiplication.
 const KARATSUBA_THRESHOLD: usize = 160;
@@ -38,22 +39,46 @@ const TOOM4_THRESHOLD: usize = 448;
 const LEHMER_THRESHOLD: usize = 16;
 
 /// Operands with at least this many limbs use NTT multiplication (above Toom-4).
-const NTT_THRESHOLD: usize = 6000;
+const NTT_THRESHOLD: usize = 28000;
 
 // --- Number-theoretic transform over the Goldilocks field 2^64 − 2^32 + 1 ---
 //
 // This prime has `p − 1 = 2^32·(2^32 − 1)`, so it supports NTTs of any power-of-
-// two length up to 2^32, and 7 is a primitive root. Modular reduction uses the
-// portable `u128 % p` (correct, if not the fastest possible).
+// two length up to 2^32, and 7 is a primitive root. Modular reduction is
+// division-free, exploiting `2^64 ≡ 2^32 − 1` and `2^96 ≡ −1 (mod p)`.
 
 /// The Goldilocks prime `2^64 − 2^32 + 1`.
 const GOLDILOCKS: u64 = 0xFFFF_FFFF_0000_0001;
 /// A primitive root of the Goldilocks multiplicative group.
 const GOLDILOCKS_ROOT: u64 = 7;
+/// `2^64 mod p = 2^32 − 1`.
+const GF_EPSILON: u128 = 0xFFFF_FFFF;
+
+/// Reduces a 128-bit value modulo the Goldilocks prime without any division,
+/// using `2^64 ≡ 2^32 − 1` and `2^96 ≡ −1 (mod p)`. Returns a canonical result
+/// in `[0, p)`.
+#[inline]
+fn gf_reduce128(x: u128) -> u64 {
+    let lo = (x as u64) as u128;
+    let hi = (x >> 64) as u64;
+    let hi_hi = (hi >> 32) as u128; // top 32 bits contribute ·2^96 ≡ −1
+    let hi_lo = (hi & 0xFFFF_FFFF) as u128; // next 32 bits contribute ·2^64 ≡ ε
+    // acc ≡ x (mod p); adding one p keeps the `− hi_hi` non-negative. acc < 2^66.
+    let acc = lo + hi_lo * GF_EPSILON + GOLDILOCKS as u128 - hi_hi;
+    // Fold the ≤ 2 high bits back in (value·2^64 ≡ value·ε). folded < 2^64 + 2^34.
+    let folded = (acc & u64::MAX as u128) + (acc >> 64) * GF_EPSILON;
+    let mut r = folded as u64;
+    if (folded >> 64) != 0 {
+        // One more 2^64 to fold; `s + ε` cannot overflow (s < ε here).
+        let (s, c) = r.overflowing_add(GF_EPSILON as u64);
+        r = if c { s + GF_EPSILON as u64 } else { s };
+    }
+    if r >= GOLDILOCKS { r - GOLDILOCKS } else { r }
+}
 
 #[inline]
 fn gf_mul(a: u64, b: u64) -> u64 {
-    ((a as u128 * b as u128) % GOLDILOCKS as u128) as u64
+    gf_reduce128(a as u128 * b as u128)
 }
 
 #[inline]
@@ -2072,6 +2097,43 @@ impl core::ops::MulAssign for Nat {
 mod tests {
     use super::*;
     use core::str::FromStr;
+
+    #[test]
+    fn goldilocks_reduce_matches_modulo() {
+        let p = GOLDILOCKS as u128;
+        // Edge and structured values around the reduction's fold boundaries.
+        let edges: &[u64] = &[
+            0,
+            1,
+            GOLDILOCKS - 1,
+            GOLDILOCKS,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0xFFFF_FFFF_0000_0000,
+            u64::MAX,
+            0x1234_5678_9ABC_DEF0,
+        ];
+        for &a in edges {
+            for &b in edges {
+                let x = a as u128 * b as u128;
+                assert_eq!(gf_reduce128(x), (x % p) as u64, "reduce({a}·{b})");
+            }
+        }
+        // Pseudo-random coverage across the full 128-bit product range.
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            s
+        };
+        for _ in 0..200_000 {
+            let (a, b) = (next() % GOLDILOCKS, next() % GOLDILOCKS);
+            let x = a as u128 * b as u128;
+            assert_eq!(gf_reduce128(x), (x % p) as u64);
+            // Also full-width u128 inputs (products can be up to (p-1)^2 < 2^128).
+            let y = ((next() as u128) << 64) | next() as u128;
+            assert_eq!(gf_reduce128(y), (y % p) as u64);
+        }
+    }
 
     /// Reference bit-at-a-time long division, kept only for differential testing
     /// against the production Algorithm-D path.

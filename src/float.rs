@@ -405,7 +405,13 @@ impl Float {
                     sig: sb,
                     exp: eb,
                 },
-            ) => Float::round_raw(na ^ nb, sa.mul(sb), ea + eb, precision, mode),
+            ) => {
+                // Fold exact power-of-two factors into the exponents so
+                // integer-valued operands multiply at their true size.
+                let (sa, ea) = strip_pow2(sa, *ea);
+                let (sb, eb) = strip_pow2(sb, *eb);
+                Float::round_raw(na ^ nb, sa.mul(&sb), ea + eb, precision, mode)
+            }
         }
     }
 
@@ -457,6 +463,13 @@ impl Float {
                     exp: eb,
                 },
             ) => {
+                // Trailing zero bits of a significand are an exact power-of-two
+                // factor: fold them into the exponent so integer-valued
+                // divisors (e.g. a series' `n · 2^k` at working precision)
+                // reduce to a division by a small value.
+                let (sa, ea) = strip_pow2(sa, *ea);
+                let (sb, eb) = strip_pow2(sb, *eb);
+                let (sa, sb) = (sa.as_ref(), sb.as_ref());
                 // Shift so the quotient has ≥ precision + 2 bits regardless of
                 // the operands' own bit lengths (they may differ from `precision`).
                 let guard = (precision as i64 + 2 + sb.bit_len() as i64 - sa.bit_len() as i64)
@@ -765,6 +778,18 @@ fn format_plain(neg: bool, ds: &str, exp: i64) -> String {
         out.push_str(ds);
     }
     out
+}
+
+/// Splits a non-zero significand into its odd part and an adjusted exponent:
+/// trailing zero bits are an exact `2^k` factor folded into `exp`. Returns the
+/// significand borrowed when there is nothing to strip.
+fn strip_pow2(sig: &Nat, exp: i64) -> (alloc::borrow::Cow<'_, Nat>, i64) {
+    let tz = sig.trailing_zeros();
+    if tz == 0 {
+        (alloc::borrow::Cow::Borrowed(sig), exp)
+    } else {
+        (alloc::borrow::Cow::Owned(sig.shr(tz)), exp + tz as i64)
+    }
 }
 
 /// `Sign` from a sign bit.

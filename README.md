@@ -1,5 +1,10 @@
 # puremp
 
+[![CI](https://github.com/KarpelesLab/puremp/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/puremp/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/puremp.svg)](https://crates.io/crates/puremp)
+[![docs.rs](https://img.shields.io/docsrs/puremp)](https://docs.rs/puremp)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust, MIT-licensed, arbitrary-precision arithmetic — **integers,
 rationals, MPFR-class floating point, and base-10 decimals**, plus derived
 **modular integers, complex numbers, polynomials, matrices, and intervals** —

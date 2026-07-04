@@ -144,13 +144,10 @@ core operations and the derived types.
 
 **Known future optimizations** (correct today, just not maximally fast):
 
-- **`nth_root_floor`** (for `k > 2`) still uses a bitwise search with a full
-  `pow(k)` per candidate bit; a Newton/recursive `k`th root would match the
-  `O(M(n))` integer square root.
-- A **half-GCD** for asymptotically faster `Rational` reduction; allocation-
-  reducing **scratch buffers** in the recursive multiply/divide code; and a
-  **subresultant PRS** to tame Sturm-sequence coefficient growth for high-degree
-  `Algebraic` operations.
+- A **half-GCD** for asymptotically faster `Rational` reduction (a recursive
+  matrix HGCD; only wins over the tuned Lehmer step at very large operand sizes),
+  and a **subresultant PRS** to tame Sturm-sequence coefficient growth for
+  high-degree `Algebraic` operations.
 
 ## License
 

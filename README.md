@@ -132,6 +132,9 @@ The exact-algebra layers stack on top of these:
 - `Poly<T>` and `Matrix<T>` are generic over any `Ring` — including the
   context-carrying `ModInt` (ℤ/nℤ) and `GfElement` (GF(pᵏ)), so polynomials and
   matrices over finite fields and modular integers work, not just over `Int`/`Rational`.
+  Over a `Field`, `FieldMatrix` gives `determinant`/`inverse`/`solve`/`rank` by
+  Gaussian elimination, and `FactorOverField` factors polynomials over a finite
+  field (Cantor–Zassenhaus).
 
 For a bare `no_std` build: `--no-default-features` (add `--features int` for the
 integer types).

@@ -1005,15 +1005,6 @@ fn rflt(num: i64, den: i64, w: u64) -> Float {
     )
 }
 
-/// True if `term` is negligible relative to `sum` at working precision `w`.
-fn negligible(term: &Float, sum: &Float, w: u64) -> bool {
-    match (term.exponent(), sum.exponent()) {
-        (None, _) => true, // term is zero
-        (Some(te), Some(se)) => te < se - (w as i64) - 4,
-        (Some(_), None) => false,
-    }
-}
-
 impl Float {
     /// Multiplies by `2^k` exactly (adjusts the exponent).
     fn scale_pow2(&self, k: i64) -> Float {
@@ -1384,44 +1375,79 @@ fn round_ziv(val: &Float, prec: u64, mode: RoundingMode) -> Option<Float> {
     }
 }
 
-/// `atanh(x) = x + x³/3 + x⁵/5 + …` at working precision `w` (needs `|x| < 1`).
-fn atanh_series(x: &Float, w: u64) -> Float {
-    let x2 = x.mul(x, w, NEAR);
-    let mut pow = x.clone();
-    let mut sum = x.clone();
-    let mut k: i64 = 1;
-    loop {
-        pow = pow.mul(&x2, w, NEAR);
-        let term = pow.div(&iflt(2 * k + 1, w), w, NEAR);
-        sum = sum.add(&term, w, NEAR);
-        if negligible(&term, &sum, w) {
-            break;
-        }
-        k += 1;
+/// The working scale for an odd Taylor sum on `0 ≤ x < 1` at precision `w`, or
+/// `None` when the series collapses to its first term. The scale is anchored
+/// to `x`'s magnitude so a small argument keeps `w`-bit *relative* precision
+/// (a fixed absolute scale would silently hand Ziv an inaccurate value).
+fn odd_series_scale(x: &Float, w: u64) -> Option<u64> {
+    let e = match &x.repr {
+        Repr::Normal { sig, exp, .. } => exp + sig.bit_len() as i64 - 1, // ⌊log2 x⌋
+        _ => return None,                                                // ±0: the sum is x itself
+    };
+    // The next term is below x·2^(2e); once that clears the guarded target
+    // precision, x itself is the correctly-rounded-enough sum.
+    if e <= -(w as i64) / 2 - 28 {
+        return None;
     }
-    sum
+    Some(w + 32 + (-e).max(0) as u64)
 }
 
-/// `atan(x) = x − x³/3 + x⁵/5 − …` at working precision `w` (needs `|x| ≤ 1`).
-fn atan_series(x: &Float, w: u64) -> Float {
-    let x2 = x.mul(x, w, NEAR);
-    let mut pow = x.clone();
-    let mut sum = x.clone();
-    let mut k: i64 = 1;
+/// `atanh(x) = x + x³/3 + x⁵/5 + …` at working precision `w` (needs
+/// `0 ≤ x < 1`; the `ln` reduction supplies `x ≤ 1/3`). The sum runs in scaled
+/// integer arithmetic: per term one small multiply plus one single-limb
+/// division instead of full Float operations.
+fn atanh_series(x: &Float, w: u64) -> Float {
+    debug_assert!(!x.is_sign_negative(), "atanh series needs x >= 0");
+    let Some(n) = odd_series_scale(x, w) else {
+        return x.round(w, NEAR);
+    };
+    let xs = scaled_int(x, n as i64).magnitude();
+    let x2 = xs.square().shr(n);
+    let mut pow = xs.clone();
+    let mut sum = xs;
+    let mut k = 1u64;
     loop {
-        pow = pow.mul(&x2, w, NEAR);
-        let term = pow.div(&iflt(2 * k + 1, w), w, NEAR);
-        sum = if k % 2 == 1 {
-            sum.sub(&term, w, NEAR)
-        } else {
-            sum.add(&term, w, NEAR)
-        };
-        if negligible(&term, &sum, w) {
+        pow = pow.mul(&x2).shr(n);
+        let term = pow.div_rem(&Nat::from_u64(2 * k + 1)).expect("odd > 0").0;
+        if term.is_zero() {
             break;
         }
+        sum = sum.add(&term);
         k += 1;
     }
-    sum
+    Float::round_raw(false, sum, -(n as i64), w, NEAR).0
+}
+
+/// `atan(x) = x − x³/3 + x⁵/5 − …` at working precision `w` (needs
+/// `0 ≤ x ≤ 1/4`, supplied by the halving reduction), in scaled integer
+/// arithmetic like [`atanh_series`].
+fn atan_series(x: &Float, w: u64) -> Float {
+    debug_assert!(!x.is_sign_negative(), "atan series needs x >= 0");
+    let Some(n) = odd_series_scale(x, w) else {
+        return x.round(w, NEAR);
+    };
+    let xs = scaled_int(x, n as i64).magnitude();
+    let x2 = xs.square().shr(n);
+    let mut pow = xs.clone();
+    let mut sum = xs;
+    let mut k = 1u64;
+    let mut sub = true;
+    loop {
+        pow = pow.mul(&x2).shr(n);
+        let term = pow.div_rem(&Nat::from_u64(2 * k + 1)).expect("odd > 0").0;
+        if term.is_zero() {
+            break;
+        }
+        sum = if sub {
+            sum.checked_sub(&term)
+                .expect("alternating partial sums stay non-negative")
+        } else {
+            sum.add(&term)
+        };
+        sub = !sub;
+        k += 1;
+    }
+    Float::round_raw(false, sum, -(n as i64), w, NEAR).0
 }
 
 /// `⌊atan(1/q)·2^n⌋` (within a couple of ulps) via the Taylor series
@@ -1628,41 +1654,76 @@ fn sin_cos_at(x: &Float, w: u64) -> (Float, Float) {
     }
 }
 
-/// `(sin r, cos r)` by Taylor series for small `|r|`, at precision `w`.
+/// `(sin r, cos r)` by Taylor series for small `|r| ≤ π/4`, at precision `w`,
+/// in scaled integer arithmetic (see [`atanh_series`]). Handles the sign of
+/// `r` explicitly: both sums run on `z = r² ≥ 0`, whose alternating partial
+/// sums stay non-negative.
 fn sin_cos_series(r: &Float, w: u64) -> (Float, Float) {
-    let r2 = r.mul(r, w, NEAR);
-    // sin
-    let mut term = r.clone();
-    let mut sin = r.clone();
-    let mut n: i64 = 1;
-    loop {
-        // term_{k} = -term_{k-1} · r² / ((2k)(2k+1))
-        term = term
-            .mul(&r2, w, NEAR)
-            .div(&iflt(2 * n * (2 * n + 1), w), w, NEAR)
-            .neg();
-        sin = sin.add(&term, w, NEAR);
-        if negligible(&term, &sin, w) {
-            break;
-        }
-        n += 1;
+    if r.is_zero() {
+        // Exact: sin(±0) = ±0, cos(0) = 1.
+        return (r.round(w, NEAR), iflt(1, w));
     }
-    // cos
-    let mut cterm = iflt(1, w);
-    let mut cos = iflt(1, w);
-    let mut m: i64 = 1;
+    let n = w + 32;
+    // Both sums run on z = r² at absolute scale 2^-n; they stay in [0.7, 1],
+    // so absolute precision is relative precision. The final sin = r·B keeps
+    // r's full relative precision (and its sign) through one Float multiply.
+    // A tiny r collapses z to zero and the sums to exactly 1: Ziv's boundary
+    // test then either rounds correctly (Nearest) or retries (directed modes).
+    let z = scaled_int(r, n as i64).magnitude().square().shr(n);
+    // cos = Σ (−1)^m z^m/(2m)! : term ← term·z/((2m−1)(2m)).
+    let mut term = Nat::one().shl(n);
+    let mut cos = term.clone();
+    let mut m = 1u64;
+    let mut sub = true;
     loop {
-        cterm = cterm
-            .mul(&r2, w, NEAR)
-            .div(&iflt((2 * m - 1) * (2 * m), w), w, NEAR)
-            .neg();
-        cos = cos.add(&cterm, w, NEAR);
-        if negligible(&cterm, &cos, w) {
+        term = term
+            .mul(&z)
+            .shr(n)
+            .div_rem(&Nat::from_u64((2 * m - 1) * (2 * m)))
+            .expect("> 0")
+            .0;
+        if term.is_zero() {
             break;
         }
+        cos = if sub {
+            cos.checked_sub(&term)
+                .expect("alternating partial sums stay non-negative")
+        } else {
+            cos.add(&term)
+        };
+        sub = !sub;
         m += 1;
     }
-    (sin, cos)
+    // sin = r·B(z), B = Σ (−1)^k z^k/(2k+1)! : term ← term·z/((2k)(2k+1)).
+    let mut term = Nat::one().shl(n);
+    let mut bracket = term.clone();
+    let mut k = 1u64;
+    let mut sub = true;
+    loop {
+        term = term
+            .mul(&z)
+            .shr(n)
+            .div_rem(&Nat::from_u64((2 * k) * (2 * k + 1)))
+            .expect("> 0")
+            .0;
+        if term.is_zero() {
+            break;
+        }
+        bracket = if sub {
+            bracket
+                .checked_sub(&term)
+                .expect("alternating partial sums stay non-negative")
+        } else {
+            bracket.add(&term)
+        };
+        sub = !sub;
+        k += 1;
+    }
+    let bracket_f = Float::round_raw(false, bracket, -(n as i64), w, NEAR).0;
+    (
+        r.mul(&bracket_f, w, NEAR),
+        Float::round_raw(false, cos, -(n as i64), w, NEAR).0,
+    )
 }
 
 /// `atan(x)` for finite non-zero `x` at precision `w`.

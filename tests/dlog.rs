@@ -2,7 +2,7 @@
 //! and Pollard's rho, checked against brute force and known values.
 #![cfg(feature = "dlog")]
 
-use puremp::dlog::{bsgs, discrete_log, pollard_rho};
+use puremp::dlog::{bsgs, discrete_log, pohlig_hellman, pollard_rho};
 use puremp::{Int, ModInt};
 
 /// Brute-force reference: least non-negative `x < order` with `g^x ≡ h (mod n)`.
@@ -146,4 +146,114 @@ fn degenerate_inputs() {
         discrete_log(&i(7), &i(5), &Int::ONE, &i(10)),
         Some(Int::ZERO)
     );
+}
+
+#[test]
+fn pohlig_hellman_matches_brute_force() {
+    // (ℤ/1009ℤ)* is cyclic of order 1008 = 2^4·3^2·7 (smooth); 11 is a generator.
+    // Cross-check every recovered exponent against the brute-force reference.
+    let (modulus, order) = (1009u64, 1008u64);
+    for e in 0..order {
+        let h = i(11).modpow(&i(e), &i(modulus));
+        let got = pohlig_hellman(&i(11), &h, &i(modulus), &i(order));
+        let x = got.expect("solution exists (h = g^e)");
+        // Generator ⇒ order is exact ⇒ the unique exponent equals e.
+        assert_eq!(x.to_u64(), Some(e), "e={e}");
+        assert_eq!(i(11).modpow(&x, &i(modulus)), h);
+    }
+}
+
+#[test]
+fn pohlig_hellman_known_and_identity() {
+    // Known value with a smooth prime.
+    let (g, n, order) = (i(11), i(1009), i(1008));
+    let h = g.modpow(&i(555), &n);
+    assert_eq!(h, i(149));
+    let x = pohlig_hellman(&g, &h, &n, &order).unwrap();
+    assert_eq!(x, i(555));
+    assert_eq!(g.modpow(&x, &n), h);
+
+    // Identity target -> exponent 0.
+    assert_eq!(pohlig_hellman(&g, &Int::ONE, &n, &order), Some(Int::ZERO));
+}
+
+#[test]
+fn pohlig_hellman_no_solution() {
+    // 3 generates the order-5 subgroup {1,3,9,5,4} of (ℤ/11ℤ)*; 2 is outside it.
+    // Order 5 is prime, but PH must still report no solution (subgroup dlog None).
+    assert_eq!(pohlig_hellman(&i(3), &i(2), &i(11), &i(5)), None);
+
+    // No power of a unit is ≡ 0 modulo a prime.
+    assert_eq!(pohlig_hellman(&i(11), &Int::ZERO, &i(1009), &i(1008)), None);
+}
+
+#[test]
+fn pohlig_hellman_smooth_advantage_large_order() {
+    // p - 1 = 2^34·3·5^2 is smooth, and the order is > 2^40, so a naive
+    // baby-step table (~2^20.5 entries) would be costly while Pohlig–Hellman,
+    // whose per-subgroup cost is Σ eᵢ·√pᵢ (all primes ≤ 5), is fast.
+    let p = Int::from(1_288_490_188_801u64);
+    let order = p.sub(&Int::ONE); // 1_288_490_188_800
+    assert!(order.magnitude().bit_len() > 40);
+    let g = i(11); // a generator of (ℤ/pℤ)*
+    let x = i(987_654_321);
+    let h = g.modpow(&x, &p);
+    let found = pohlig_hellman(&g, &h, &p, &order).expect("PH must find the log");
+    assert_eq!(found, x);
+    assert_eq!(g.modpow(&found, &p), h);
+
+    // The dispatcher routes composite orders through PH, so it is fast here too.
+    let via_dispatch = discrete_log(&g, &h, &p, &order).expect("dispatch to PH");
+    assert_eq!(g.modpow(&via_dispatch, &p), h);
+}
+
+/// `g^e mod n` for small `u64`, for computing multiplicative orders in tests.
+fn pow_mod(mut g: u64, mut e: u64, n: u64) -> u64 {
+    let (mut r, m) = (1u64 % n, n as u128);
+    g %= n;
+    while e > 0 {
+        if e & 1 == 1 {
+            r = ((r as u128 * g as u128) % m) as u64;
+        }
+        g = ((g as u128 * g as u128) % m) as u64;
+        e >>= 1;
+    }
+    r
+}
+
+/// Multiplicative order of `g` modulo 1009 (a divisor of 1008 = 2^4·3^2·7).
+fn order_mod_1009(g: u64) -> u64 {
+    let mut t = 1008u64;
+    for &p in &[2u64, 3, 7] {
+        while t.is_multiple_of(p) && pow_mod(g, t / p, 1009) == 1 {
+            t /= p;
+        }
+    }
+    t
+}
+
+#[test]
+fn pohlig_hellman_random_roundtrips() {
+    // Several (base, exponent) round-trips over the smooth-order group (ℤ/1009ℤ)*.
+    // Pohlig–Hellman needs the *exact* order of the base, so it is computed per g.
+    let n = i(1009);
+    let mut state = 0x9e37_79b9u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state >> 33
+    };
+    for _ in 0..40 {
+        // 1009 is prime, so every base in [2, 1008] is a unit.
+        let g_val = 2 + next() % 1006;
+        let ord = order_mod_1009(g_val);
+        let x = next() % ord;
+        let g = i(g_val);
+        let h = g.modpow(&i(x), &n);
+        let found = pohlig_hellman(&g, &h, &n, &i(ord)).expect("solution exists");
+        // With the exact order, the representative in [0, ord) is unique.
+        assert_eq!(found, i(x), "g={g_val} x={x}");
+        assert_eq!(g.modpow(&found, &n), h, "g={g_val} x={x}");
+    }
 }

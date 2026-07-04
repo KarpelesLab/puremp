@@ -14,9 +14,17 @@
 //!   Pomerance §5.2). Uses only `O(1)` memory via Floyd cycle detection over the
 //!   partition-into-three-sets iteration, at the cost of being randomized.
 //!
-//! [`discrete_log`] dispatches between them: baby-step giant-step for small
-//! orders (where the table fits comfortably in memory) and Pollard's rho for
-//! large ones, falling back to baby-step giant-step if rho fails to converge.
+//! When the group `order` factors as `∏ pᵢ^eᵢ`, [`pohlig_hellman`] (HAC §3.6.4)
+//! reduces the problem to a discrete logarithm in each prime-order subgroup and
+//! recombines the results with the Chinese Remainder Theorem. Its cost is
+//! `Σ eᵢ·√pᵢ` group operations — dramatically cheaper than the `√order` of the
+//! square-root methods whenever `order` is *smooth* (all prime factors small).
+//!
+//! [`discrete_log`] dispatches between all three: [`pohlig_hellman`] when the
+//! order is composite (so the per-subgroup work is much smaller), otherwise
+//! baby-step giant-step for small orders (where the table fits comfortably in
+//! memory) and Pollard's rho for large ones, falling back to baby-step
+//! giant-step if rho fails to converge.
 //!
 //! The base is assumed to be a unit modulo `n` (i.e. `gcd(g, n) == 1`), the
 //! usual setting for discrete logarithms; a non-invertible base yields `None`.
@@ -33,6 +41,7 @@
 //! ```
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use crate::int::Int;
 use crate::mod_int::ModInt;
@@ -297,6 +306,72 @@ pub fn pollard_rho(base: &Int, target: &Int, modulus: &Int, order: &Int, seed: u
     None
 }
 
+/// Pohlig–Hellman discrete logarithm (HAC §3.6.4): finds an `x` in `[0, order)`
+/// with `base^x ≡ target (mod modulus)` by solving one small logarithm per prime
+/// factor of `order` and recombining the answers with the CRT.
+///
+/// `order` must be the (multiplicative) order of `base` modulo `modulus`. It is
+/// factored as `∏ pᵢ^eᵢ`; for each prime power the exponent `x mod pᵢ^eᵢ` is
+/// recovered digit-by-digit in base `pᵢ` (each digit is a logarithm in the
+/// order-`pᵢ` subgroup, solved by [`discrete_log`], i.e. [`bsgs`]/[`pollard_rho`]).
+/// This costs `Σ eᵢ·√pᵢ` group operations — far cheaper than `√order` when the
+/// order is smooth. Returns `None` when no solution exists (some subgroup
+/// logarithm has none) or when `base` is not a unit modulo `modulus`.
+///
+/// The returned `x` is the unique representative in `[0, order)`; it is verified
+/// to satisfy the congruence, guarding against an incorrect `order`.
+///
+/// # Example
+///
+/// ```
+/// use puremp::{Int, dlog::pohlig_hellman};
+///
+/// // 11 generates (ℤ/1009ℤ)*, whose order 1008 = 2^4·3^2·7 is smooth.
+/// let (g, n, order) = (Int::from(11), Int::from(1009), Int::from(1008));
+/// let h = g.modpow(&Int::from(555), &n);
+/// assert_eq!(pohlig_hellman(&g, &h, &n, &order), Some(Int::from(555)));
+/// ```
+pub fn pohlig_hellman(base: &Int, target: &Int, modulus: &Int, order: &Int) -> Option<Int> {
+    let (g, h, m) = match prepare(base, target, modulus, order) {
+        Ok(v) => v,
+        Err(done) => return done,
+    };
+
+    // g^{-1} mod m — used to strip the digits already recovered.
+    let g_inv = g.modinv(&m)?;
+
+    let factors = order.factor_exponents();
+    let mut residues: Vec<Int> = Vec::with_capacity(factors.len());
+    let mut moduli: Vec<Int> = Vec::with_capacity(factors.len());
+
+    for (p, e) in &factors {
+        // Generator of the order-`p` subgroup: γ = g^{order/p}.
+        let gamma = g.modpow(&order.div_exact(p), &m);
+
+        // Recover xᵢ = x mod p^e, one base-p digit a_j at a time.
+        //   xᵢ = a₀ + a₁·p + … + a_{e-1}·p^{e-1}.
+        let mut xi = Int::ZERO; // Σ recovered digits so far (x mod p^j).
+        let mut pj = Int::ONE; // p^j.
+        for j in 0..*e {
+            // β_j = (h · g^{-xi})^{order / p^{j+1}} = γ^{a_j} lives in ⟨γ⟩.
+            let stripped = mul_mod(&h, &g_inv.modpow(&xi, &m), &m);
+            let beta = stripped.modpow(&order.div_exact(&p.pow(j + 1)), &m);
+            // Solve the order-`p` sub-instance for the j-th digit a_j ∈ [0, p).
+            let digit = discrete_log(&gamma, &beta, &m, p)?;
+            xi = xi.add(&digit.mul(&pj));
+            pj = pj.mul(p); // advance to p^{j+1}; ends at p^e.
+        }
+        residues.push(xi);
+        moduli.push(pj);
+    }
+
+    // CRT-combine the xᵢ over the pairwise-coprime prime powers p^e.
+    let x = Int::crt(&residues, &moduli)?;
+    // Only return a genuinely valid logarithm (a wrong `order` can mislead the
+    // per-subgroup lifts into an inconsistent, non-verifying candidate).
+    if g.modpow(&x, &m) == h { Some(x) } else { None }
+}
+
 /// Solves the discrete logarithm `base^x ≡ target (mod modulus)`, returning the
 /// least non-negative `x` in `[0, order)`, or `None` when no solution exists.
 ///
@@ -304,9 +379,20 @@ pub fn pollard_rho(base: &Int, target: &Int, modulus: &Int, order: &Int, seed: u
 /// any upper bound on the order of `base`). The base is assumed to be a unit
 /// modulo `modulus`; a non-invertible base yields `None`.
 ///
-/// Small orders are solved with deterministic [`bsgs`] (which always returns the
-/// least `x`); large orders use [`pollard_rho`] with several independent walks,
-/// falling back to [`bsgs`] if none converge. See HAC §3.6.
+/// Dispatch, cheapest applicable method first:
+///
+/// - When `order` is **composite** (has more than one prime factor, counting
+///   multiplicity) the problem is smooth-friendly, so [`pohlig_hellman`] handles
+///   it — its cost `Σ eᵢ·√pᵢ` beats `√order`, decisively so for smooth orders.
+/// - Otherwise (`order` prime, or the Pohlig–Hellman attempt did not verify)
+///   small orders fall to deterministic [`bsgs`] (which returns the least `x`)
+///   and large ones to [`pollard_rho`] with several independent walks, backing
+///   off to [`bsgs`] if none converge.
+///
+/// See HAC §3.6. Note that when `order` is a *strict* multiple of the true order
+/// of `base`, the Pohlig–Hellman path returns the unique representative in
+/// `[0, order)` rather than necessarily the least solution; pass the exact order
+/// of `base` for the canonical least `x`.
 ///
 /// # Example
 ///
@@ -321,6 +407,17 @@ pub fn pollard_rho(base: &Int, target: &Int, modulus: &Int, order: &Int, seed: u
 /// assert_eq!(discrete_log(&g, &Int::ZERO, &n, &order), None);
 /// ```
 pub fn discrete_log(base: &Int, target: &Int, modulus: &Int, order: &Int) -> Option<Int> {
+    if order.is_positive() {
+        let factors = order.factor_exponents();
+        // Composite order (≥ 2 prime factors with multiplicity) ⇒ Pohlig–Hellman,
+        // whose per-subgroup cost Σ eᵢ·√pᵢ beats the √order of the generic search.
+        let composite = factors.len() > 1 || factors.first().is_some_and(|(_, e)| *e > 1);
+        if composite && let Some(x) = pohlig_hellman(base, target, modulus, order) {
+            return Some(x);
+        }
+        // If PH is skipped (prime order) or misses (a randomized subgroup walk
+        // failed to converge), fall through to the generic square-root search.
+    }
     if order.is_positive() && order.magnitude().bit_len() <= BSGS_MAX_ORDER_BITS {
         return bsgs(base, target, modulus, order);
     }

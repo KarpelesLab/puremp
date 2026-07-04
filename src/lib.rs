@@ -205,7 +205,7 @@ pub use matrix::Matrix;
 pub use lattice::{lll_reduce, lll_reduce_delta};
 
 #[cfg(feature = "dlog")]
-pub use dlog::{bsgs, discrete_log, pollard_rho};
+pub use dlog::{bsgs, discrete_log, pohlig_hellman, pollard_rho};
 
 #[cfg(feature = "algebraic")]
 pub use algebraic::Algebraic;

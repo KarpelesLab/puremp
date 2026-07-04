@@ -1424,39 +1424,27 @@ fn atan_series(x: &Float, w: u64) -> Float {
     sum
 }
 
-/// `⌊atan(1/q)·2^n⌋` (up to a few ulps low) by the Taylor series in scaled
-/// integer arithmetic: every term is produced by single-limb divisions, far
-/// cheaper than per-term Float operations. Requires `q² ≤ u64::MAX`.
+/// `⌊atan(1/q)·2^n⌋` (within a couple of ulps) via the Taylor series
+/// `atan(1/q) = (1/q)·Σ (−1)^k/((2k+1)·q^2k)`, evaluated exactly by binary
+/// splitting and finished with one scaled division. Requires `q² ≤ u64::MAX`.
 ///
-/// Each truncated division loses < 1 ulp and the series has `n/log2(q²)`
-/// terms, so the total error stays well under the guard bits the callers add.
+/// The single truncated division loses < 1 ulp and the tail of the truncated
+/// alternating series is below 1 ulp, well under the callers' guard bits.
 fn atan_recip_scaled(q: u64, n: u64) -> Nat {
     let q2 = q * q;
-    // x_k = 2^n / q^(2k+1); the alternating partial sums stay non-negative.
-    let mut x = Nat::one()
+    // Terms shrink by q² ≥ 2^l per step, so n/l + 2 of them bound the tail
+    // below 2^-n (floor(log2 q²) only makes the count conservative).
+    let l = 63 - q2.leading_zeros() as u64;
+    let k = n / l + 2;
+    let (num, o, p) = split_atan_sum(0, k, q2, true);
+    // Σ = N·q²/(P·O), so atan(1/q) = Σ/q = N·q/(P·O).
+    debug_assert!(num.is_positive(), "atan series sum must stay positive");
+    num.magnitude()
+        .mul(&Nat::from_u64(q))
         .shl(n)
-        .div_rem(&Nat::from_u64(q))
-        .expect("q > 0")
-        .0;
-    let mut sum = x.clone();
-    let mut k = 1u64;
-    let mut sub = true;
-    loop {
-        x = x.div_rem(&Nat::from_u64(q2)).expect("q² > 0").0;
-        if x.is_zero() {
-            break;
-        }
-        let term = x.div_rem(&Nat::from_u64(2 * k + 1)).expect("2k+1 > 0").0;
-        sum = if sub {
-            sum.checked_sub(&term)
-                .expect("alternating partial sums are non-negative")
-        } else {
-            sum.add(&term)
-        };
-        sub = !sub;
-        k += 1;
-    }
-    sum
+        .div_rem(&p.mul(&o))
+        .expect("denominator > 0")
+        .0
 }
 
 /// π via Machin's formula, `16·atan(1/5) − 4·atan(1/239)`, at precision `w`,
@@ -1472,25 +1460,70 @@ fn pi_at(w: u64) -> Float {
     Float::round_raw(false, pi_scaled, -(n as i64), w, NEAR).0
 }
 
-/// ln 2 via `2·atanh(1/3) = 2·Σ 1/((2k+1)·3^(2k+1))` at precision `w`,
-/// evaluated in scaled integer arithmetic (all terms positive).
+/// Binary-splitting node for `Σ_{k=a}^{b-1} σ^k / ((2k+1)·m^k)` (`σ = −1` when
+/// `alternating`, else `+1`): returns `(N, O, P)` with the partial sum equal to
+/// `N / (m^(b−1)·O)`, where `O = Π (2k+1)` over the range and `P = m^(b−a)`.
+///
+/// Splitting the range keeps every multiplication balanced, so the whole sum
+/// costs `O(M(n)·log n)` instead of the `O(n²/64)` of term-by-term division.
+fn split_atan_sum(a: u64, b: u64, m: u64, alternating: bool) -> (Int, Nat, Nat) {
+    // Leaf: fold up to 4 terms in machine words. With `m < 2^16` and
+    // `2k+1 < 2^24` every intermediate fits: `|N| ≤ 4·(m·(2b+1))³ < 2^123`,
+    // `O < 2^96`, `P ≤ 2^64`.
+    if b - a <= 4 && m < (1 << 16) && 2 * b + 1 < (1 << 24) {
+        let mut n: i128 = 0;
+        let mut o: u128 = 1;
+        let mut p: u128 = 1;
+        for k in a..b {
+            let odd = 2 * k + 1;
+            // Append term k: N ← N·m·(2k+1) + σ^k·O, O ← O·(2k+1), P ← P·m.
+            let t = if alternating && k & 1 == 1 {
+                -(o as i128)
+            } else {
+                o as i128
+            };
+            n = n * m as i128 * odd as i128 + t;
+            o *= odd as u128;
+            p *= m as u128;
+        }
+        return (Int::from_i128(n), Nat::from_u128(o), Nat::from_u128(p));
+    }
+    if b - a == 1 {
+        // Fallback single-term leaf for parameters beyond the machine-word
+        // bounds (astronomical precisions).
+        let n = if alternating && a & 1 == 1 {
+            Int::MINUS_ONE
+        } else {
+            Int::ONE
+        };
+        return (n, Nat::from_u64(2 * a + 1), Nat::from_u64(m));
+    }
+    let c = a + (b - a) / 2;
+    let (n1, o1, p1) = split_atan_sum(a, c, m, alternating);
+    let (n2, o2, p2) = split_atan_sum(c, b, m, alternating);
+    // N(a,b)/ (m^(b−1)·O1·O2) = N1/(m^(c−1)·O1) + N2/(m^(b−1)·O2).
+    let n = n1
+        .mul(&Int::from(p2.mul(&o2)))
+        .add(&n2.mul(&Int::from(o1.clone())));
+    (n, o1.mul(&o2), p1.mul(&p2))
+}
+
+/// ln 2 via `2·atanh(1/3) = (2/3)·Σ 1/((2k+1)·9^k)` at precision `w`, evaluated
+/// exactly by binary splitting and finished with one scaled division.
 fn ln2_at(w: u64) -> Float {
     let n = w + 32;
-    let three = Nat::from_u64(3);
-    let nine = Nat::from_u64(9);
-    let mut x = Nat::one().shl(n).div_rem(&three).expect("3 > 0").0;
-    let mut sum = x.clone();
-    let mut k = 1u64;
-    loop {
-        x = x.div_rem(&nine).expect("9 > 0").0;
-        if x.is_zero() {
-            break;
-        }
-        sum = sum.add(&x.div_rem(&Nat::from_u64(2 * k + 1)).expect("2k+1 > 0").0);
-        k += 1;
-    }
-    // ln 2 = 2 · sum · 2^-n.
-    Float::round_raw(false, sum, 1 - n as i64, w, NEAR).0
+    // Each term shrinks by 9 > 2^3, so n/3 + 2 terms push the tail below 2^-n.
+    let k = n / 3 + 2;
+    let (num, o, p) = split_atan_sum(0, k, 9, false);
+    // Σ = N·9/(P·O), so ln 2 = (2/3)·Σ = 6·N/(P·O).
+    let sum = num
+        .magnitude()
+        .mul(&Nat::from_u64(6))
+        .shl(n)
+        .div_rem(&p.mul(&o))
+        .expect("denominator > 0")
+        .0;
+    Float::round_raw(false, sum, -(n as i64), w, NEAR).0
 }
 
 /// `e^x` at precision `w` via range reduction `x = k·ln2 + r` and a Taylor sum.
@@ -1503,29 +1536,59 @@ fn exp_at(x: &Float, w: u64) -> Float {
     // The squarings amplify rounding error by ~2^j ulps, so work at w + j + 8
     // bits; the returned extra bits keep Ziv's ambiguity check sound.
     let j = w.isqrt().max(1);
-    let w = w + j + 8;
-    let j = j as i64;
-    let ln2 = ln2_at(w);
-    let k = x.div(&ln2, w, NEAR).round_to_int();
+    let n = w + j + 8;
+    let ln2 = ln2_at(n);
+    let k = x.div(&ln2, n, NEAR).round_to_int();
     let ki = k.to_i64().unwrap_or(0);
-    let r = x.sub(&Float::from_int(&k, w, NEAR).mul(&ln2, w, NEAR), w, NEAR);
-    let r = r.scale_pow2(-j); // exact
-    // exp(r) = Σ rⁿ/n!
-    let mut term = iflt(1, w);
-    let mut sum = iflt(1, w);
-    let mut n: i64 = 1;
+    let r = x.sub(&Float::from_int(&k, n, NEAR).mul(&ln2, n, NEAR), n, NEAR);
+    let r = r.scale_pow2(-(j as i64)); // exact
+    // The Taylor sum runs in scaled integer arithmetic (everything is an
+    // integer multiple of 2^-n): per-term cost is one small multiplication and
+    // one single-limb division instead of full Float operations. Truncations
+    // lose < 1 ulp each, well inside the guard bits above.
+    // R = ⌊r·2^n⌋; |r| < ln2/2^(j+1), so |R| < 2^(n−j−1).
+    let rs = scaled_int(&r, n as i64);
+    // exp(R/2^n) = Σ (R/2^n)^k/k!, all terms scaled by 2^n.
+    let mut sum = Int::ONE.mul_2k(n as u32);
+    let mut term = sum.clone();
+    let mut kk: i64 = 1;
     loop {
-        term = term.mul(&r, w, NEAR).div(&iflt(n, w), w, NEAR);
-        sum = sum.add(&term, w, NEAR);
-        if negligible(&term, &sum, w) {
+        term = term
+            .mul(&rs)
+            .div_2k_trunc(n as u32)
+            .div_trunc(&Int::from_i64(kk));
+        if term.is_zero() {
             break;
         }
-        n += 1;
+        sum = sum.add(&term);
+        kk += 1;
     }
+    // Undo the argument halvings: exp(r) = exp(r/2^j)^(2^j). The sum stays
+    // near 2^n (r is tiny), so each squaring is one n-bit multiply.
     for _ in 0..j {
-        sum = sum.mul(&sum, w, NEAR);
+        sum = sum.square().div_2k_trunc(n as u32);
     }
-    sum.scale_pow2(ki)
+    debug_assert!(sum.is_positive(), "exp series sum must stay positive");
+    Float::round_raw(false, sum.magnitude(), -(n as i64), n, NEAR)
+        .0
+        .scale_pow2(ki)
+}
+
+/// `⌊x·2^n⌋` (truncated toward zero) as a signed integer.
+fn scaled_int(x: &Float, n: i64) -> Int {
+    match &x.repr {
+        Repr::Normal { neg, sig, exp } => {
+            let e = exp + n;
+            let mag = if e >= 0 {
+                sig.shl(e as u64)
+            } else {
+                sig.shr((-e) as u64)
+            };
+            let v = Int::from(mag);
+            if *neg { v.neg() } else { v }
+        }
+        _ => Int::ZERO,
+    }
 }
 
 /// `ln(x)` for finite `x > 0` at precision `w`.

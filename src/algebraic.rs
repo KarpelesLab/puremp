@@ -173,6 +173,59 @@ impl Algebraic {
             .collect()
     }
 
+    /// Recovers the exact real algebraic number that a floating-point value
+    /// approximates, searching for a defining polynomial of degree at most
+    /// `max_degree`.
+    ///
+    /// It runs integer-relation detection (LLL) on `1, α, α², …` to recover a
+    /// minimal polynomial, isolates that polynomial's real roots, and returns the
+    /// one closest to `alpha` — an exact [`Algebraic`], not a float. Returns `None`
+    /// if no relation is found within `max_degree` (e.g. `alpha` is transcendental,
+    /// its degree exceeds the bound, or it is not accurate enough). `alpha` must be
+    /// computed to comfortably more than `max_degree · (bits of the true
+    /// coefficients)` of precision for the result to be trustworthy; verify with
+    /// [`to_float`](Self::to_float) if in doubt.
+    ///
+    /// ```
+    /// # use puremp::{Algebraic, Float, RoundingMode};
+    /// let two = Float::from_int(&2i64.into(), 256, RoundingMode::Nearest);
+    /// let root2 = two.sqrt(256, RoundingMode::Nearest);       // √2 as a Float
+    /// let a = Algebraic::from_float(&root2, 4).unwrap();       // recover it exactly
+    /// assert_eq!(a.defining_polynomial().coeffs().len(), 3);   // x² − 2
+    /// assert_eq!(a.mul(&a), Algebraic::from_int(2.into()));    // a² == 2 exactly
+    /// ```
+    #[cfg(feature = "lattice")]
+    pub fn from_float(alpha: &crate::float::Float, max_degree: usize) -> Option<Algebraic> {
+        use crate::float::RoundingMode::Nearest;
+        let prec = alpha.precision();
+        // Detect at ~70% of the input precision, leaving headroom below its noise.
+        let coeffs = crate::lattice::minimal_polynomial(alpha, max_degree, prec * 7 / 10)?;
+        // A degree-1 minimal polynomial c₀ + c₁·x means the value is the rational
+        // −c₀/c₁; return it in canonical rational form.
+        if coeffs.len() == 2 {
+            return Some(Algebraic::from_rational(Rational::new(
+                coeffs[0].neg(),
+                coeffs[1].clone(),
+            )));
+        }
+        let poly = Poly::new(
+            coeffs
+                .iter()
+                .map(|c| Rational::from_integer(c.clone()))
+                .collect(),
+        );
+
+        // Pick the real root nearest the approximation.
+        let mut best: Option<(Algebraic, crate::float::Float)> = None;
+        for root in Algebraic::real_roots_of(&poly) {
+            let dist = root.to_float(prec, Nearest).sub(alpha, prec, Nearest).abs();
+            if best.as_ref().is_none_or(|(_, d)| dist < *d) {
+                best = Some((root, dist));
+            }
+        }
+        best.map(|(root, _)| root)
+    }
+
     /// Builds the unique real root of `poly` lying in `(lo, hi]`. The caller must
     /// guarantee there is exactly one. `poly` is reduced to its squarefree part.
     pub fn new(poly: P, lo: Q, hi: Q) -> Algebraic {

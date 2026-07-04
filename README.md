@@ -187,9 +187,10 @@ this list.
 - **Primality *proving*** — upgrade probabilistic Miller–Rabin to a certificate
   via **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁵)`, fast
   variant `Õ((log N)⁴)`) or the deterministic **APR-CL**.
-- **Building on the `lattice` LLL** (shipped, with `find_integer_relation` and
-  `minimal_polynomial` on top) — **PSLQ** integer relations and Diophantine
-  approximation as further refinements.
+- **Building on the `lattice` LLL** (shipped, with `find_integer_relation`,
+  `minimal_polynomial`, and `Algebraic::from_float` — recover an exact algebraic
+  number from a float approximation — on top) — **PSLQ** integer relations and
+  Diophantine approximation as further refinements.
 - **`Poly::factor`** (shipped) factors rational polynomials over ℚ by
   Berlekamp–Zassenhaus — square-free decomposition (Yun), Cantor–Zassenhaus mod
   `p`, Hensel lifting, and **van Hoeij**'s LLL-knapsack recombination (built on the

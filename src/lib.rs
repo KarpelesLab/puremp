@@ -32,8 +32,9 @@
 //!
 //! `Int`/`Rational` also carry a number-theory toolkit (factorization,
 //! `sqrt_mod`, Jacobi/Legendre, CRT, `random_prime`, combinatorics,
-//! continued-fraction approximation), and an optional `num-traits` bridge slots
-//! the types into generic numeric code.
+//! continued-fraction approximation), certificate-based primality *proving*
+//! ([`primality`], the `primality` feature), and an optional `num-traits` bridge
+//! slots the types into generic numeric code.
 //!
 //! `puremp` is usable as a Rust library, a C library (the `ffi` feature; see
 //! `include/puremp.h`), and a standalone command-line calculator (the `cli`
@@ -139,6 +140,9 @@ pub mod identify;
 #[cfg(feature = "dlog")]
 pub mod dlog;
 
+#[cfg(feature = "primality")]
+pub mod primality;
+
 #[cfg(feature = "algebraic")]
 pub mod quadratic;
 
@@ -215,6 +219,9 @@ pub use identify::{Identification, identify, identify_with, machin_like};
 
 #[cfg(feature = "dlog")]
 pub use dlog::{bsgs, discrete_log, pohlig_hellman, pollard_rho};
+
+#[cfg(feature = "primality")]
+pub use primality::{Primality, PrimalityCertificate, prove_prime};
 
 #[cfg(feature = "algebraic")]
 pub use algebraic::Algebraic;

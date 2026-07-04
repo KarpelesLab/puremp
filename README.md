@@ -146,9 +146,10 @@ core operations and the derived types.
 ## Roadmap
 
 Candidate directions, all specifiable from open literature (so they preserve the
-clean-room provenance). Nothing here is implemented yet; ordering is rough
-interest, not commitment. Brent & Zimmermann's *Modern Computer Arithmetic* (MCA;
-freely available drafts) is the umbrella reference for most of this list.
+clean-room provenance); items marked *(shipped)* are already implemented. Ordering
+is rough interest, not commitment. Brent & Zimmermann's *Modern Computer
+Arithmetic* (MCA; freely available drafts) is the umbrella reference for much of
+this list.
 
 **Faster algorithms** (existing operations, correct today, just not maximally fast):
 
@@ -191,10 +192,12 @@ freely available drafts) is the umbrella reference for most of this list.
   approximation as further refinements.
 - **`Poly::factor`** (shipped) factors rational polynomials over ℚ by
   Berlekamp–Zassenhaus — square-free decomposition (Yun), Cantor–Zassenhaus mod
-  `p`, Hensel lifting, and trial recombination. Still open: **van Hoeij**'s
-  LLL-knapsack recombination, which replaces the worst-case-exponential subset
-  search with a polynomial-time lattice step (matters for many-modular-factor
-  inputs like Swinnerton–Dyer polynomials).
+  `p`, Hensel lifting, and **van Hoeij**'s LLL-knapsack recombination (built on the
+  `lattice` LLL): the true factors are short vectors of a lattice of the modular
+  factors' power sums, recovered in polynomial time rather than by an exponential
+  subset search — so Swinnerton–Dyer-style inputs (many modular factors, few
+  rational ones) factor quickly. Trial recombination remains the verified
+  fallback.
 - **Special functions** for `Float` — Γ / `lgamma` (Stirling series evaluated by
   **rectangular splitting**, ~2√n full multiplications; Johansson, arXiv:2109.08392,
   2021), the Riemann ζ (Euler–Maclaurin / Borwein), `erf`/`erfc` (incomplete-Γ

@@ -7,9 +7,17 @@
 //! to a modulus exceeding the Mignotte coefficient bound, and recombination of
 //! the lifted factors into true integer factors.
 //!
+//! Recombination uses **van Hoeij's LLL knapsack** when the `lattice` feature is
+//! enabled: the true factors correspond to short vectors of a lattice built from
+//! the power sums (traces) of the modular factors, found in polynomial time
+//! rather than by the worst-case-exponential subset search. Every candidate is
+//! division-verified, so an under-resolved lattice safely falls back to trial
+//! recombination — which is also the path when `lattice` is off.
+//!
 //! All modular work uses machine-word `𝔽ₚ` arithmetic; the recombination and the
 //! final results are exact `Int`/`Rational`. References: Knuth, *TAOCP* Vol. 2
-//! §4.6.2; Brent & Zimmermann, *Modern Computer Arithmetic* §3.
+//! §4.6.2; Brent & Zimmermann, *Modern Computer Arithmetic* §3; van Hoeij,
+//! *Factoring polynomials and the knapsack problem*, J. Number Theory (2002).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -541,12 +549,27 @@ fn factor_monic_squarefree(f: &[Int]) -> Vec<Vec<Int>> {
         .expect("a small prime keeps a square-free polynomial square-free mod p");
 
     let modfacs = factor_mod_p(&fp, p);
-    if modfacs.len() == 1 {
+    let r = modfacs.len();
+    if r == 1 {
         return alloc::vec![f.to_vec()]; // irreducible over ℤ
     }
-    // Lift to a modulus exceeding twice the Mignotte bound 2^n·‖f‖₂ ≤ 2^n·‖f‖₁.
+    // Lift to a modulus exceeding twice the Mignotte bound 2^n·‖f‖₂ ≤ 2^n·‖f‖₁ —
+    // and, when van Hoeij is available, also large enough that its trace lattice
+    // separates the true factors (m ≳ (2n·Rᵐᵗ·2^{r+mt})² with mt = r traces).
     let norm1 = f.iter().fold(Int::ZERO, |a, c| a.add(&c.abs()));
-    let bound = Int::ONE.mul_2k(n as u32 + 1).mul(&norm1);
+    let mut bound = Int::ONE.mul_2k(n as u32 + 1).mul(&norm1);
+    #[cfg(feature = "lattice")]
+    {
+        let rb = root_bound(f);
+        let inner = Int::from_u64(2 * n as u64)
+            .mul(&rb.pow(r as u32))
+            .mul(&Int::ONE.mul_2k(2 * r as u32));
+        let sq = inner.mul(&inner);
+        let b_vh = sq.mul(&sq); // 4th power → a clear trace/residue gap for LLL
+        if b_vh.cmp(&bound) == core::cmp::Ordering::Greater {
+            bound = b_vh;
+        }
+    }
     let mut m = Int::from_u64(p);
     let mut exp = 1u32;
     while m.cmp(&bound) != core::cmp::Ordering::Greater {
@@ -554,6 +577,14 @@ fn factor_monic_squarefree(f: &[Int]) -> Vec<Vec<Int>> {
         exp += 1;
     }
     let lifted = lift_all(f, &modfacs, p, exp, &m);
+
+    // Prefer van Hoeij's polynomial-time LLL recombination; it verifies every
+    // candidate by division, so a `None` (under-resolved lattice) is safe to fall
+    // back from.
+    #[cfg(feature = "lattice")]
+    if let Some(factors) = van_hoeij(f, &lifted, &m) {
+        return factors;
+    }
     recombine(f, &lifted, &m)
 }
 
@@ -592,6 +623,163 @@ fn factor_primitive_squarefree(f: &[Int]) -> Vec<Vec<Int>> {
             ip_primitive(&ip_trim(sub))
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// van Hoeij recombination (LLL knapsack). Optional; requires the `lattice`
+// feature. Correctness is guaranteed by dividing every candidate into f, so an
+// under-resolved lattice simply returns `None` and the caller uses trial.
+// ---------------------------------------------------------------------------
+
+/// Power sums `p_1, …, p_L` of the roots of monic `u`, reduced mod `m` into
+/// `[0, m)`, via Newton's identities. For a product of monic polynomials the
+/// power sums add, and for a genuine integer factor they are bounded integers —
+/// the property van Hoeij's lattice exploits.
+#[cfg(feature = "lattice")]
+fn power_sums_mod(u: &[Int], l: usize, m: &Int) -> Vec<Int> {
+    let d = u.len() - 1;
+    let c = |i: usize| -> Int {
+        if (1..=d).contains(&i) {
+            u[d - i].rem_euclid(m)
+        } else {
+            Int::ZERO
+        }
+    };
+    let mut p: Vec<Int> = Vec::with_capacity(l);
+    for k in 1..=l {
+        let mut acc = Int::ZERO;
+        for i in 1..=(k - 1).min(d) {
+            acc = acc.add(&c(i).mul(&p[k - i - 1])).rem_euclid(m);
+        }
+        if k <= d {
+            acc = acc.add(&Int::from_u64(k as u64).mul(&c(k))).rem_euclid(m);
+        }
+        p.push(if acc.is_zero() {
+            Int::ZERO
+        } else {
+            m.sub(&acc)
+        }); // −acc mod m
+    }
+    p
+}
+
+/// Cauchy root bound for monic `f`: every complex root satisfies `|α| ≤ 1 +
+/// max|fᵢ|`.
+#[cfg(feature = "lattice")]
+fn root_bound(f: &[Int]) -> Int {
+    let mx = f[..f.len() - 1]
+        .iter()
+        .map(Int::abs)
+        .fold(Int::ZERO, |a, b| {
+            if a.cmp(&b) == core::cmp::Ordering::Less {
+                b
+            } else {
+                a
+            }
+        });
+    mx.add(&Int::ONE)
+}
+
+/// van Hoeij recombination: recover the true monic integer factors of monic `f`
+/// from its lifted modular factors (`mod m`) by LLL on the trace lattice. Returns
+/// `Some(factors)` only when a complete, division-verified factorization is found;
+/// otherwise `None` (caller falls back to trial recombination).
+#[cfg(feature = "lattice")]
+fn van_hoeij(f: &[Int], lifted: &[Vec<Int>], m: &Int) -> Option<Vec<Vec<Int>>> {
+    let r = lifted.len();
+    let m_t = r; // one trace per factor is enough to separate at adequate precision
+    let dim = r + m_t;
+    let traces: Vec<Vec<Int>> = lifted.iter().map(|u| power_sums_mod(u, m_t, m)).collect();
+
+    // Rows i<r: eᵢ ‖ traces of uᵢ. Rows r+k: m in trace column k (mod-m reduction).
+    let mut basis: Vec<Vec<Int>> = Vec::with_capacity(dim);
+    for (i, tr) in traces.iter().enumerate() {
+        let mut row = alloc::vec![Int::ZERO; dim];
+        row[i] = Int::ONE;
+        for (k, t) in tr.iter().enumerate() {
+            row[r + k] = t.clone();
+        }
+        basis.push(row);
+    }
+    for k in 0..m_t {
+        let mut row = alloc::vec![Int::ZERO; dim];
+        row[r + k] = m.clone();
+        basis.push(row);
+    }
+
+    let reduced = crate::lattice::lll_reduce(&basis);
+
+    // Reduced vectors whose trace part is small span the *solution lattice* L —
+    // the ℤ-combinations of the true-factor indicators (a genuine combination has
+    // integer, hence bounded, power sums; a spurious one leaves a large residue).
+    // Separate the two populations by the largest gap in trace magnitude (falling
+    // back to "everything below m" when they are all small, i.e. every modular
+    // factor is already a true factor).
+    let tbits: Vec<u64> = reduced
+        .iter()
+        .map(|row| {
+            row[r..]
+                .iter()
+                .map(|e| u64::from(e.bit_len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut sorted = tbits.clone();
+    sorted.sort_unstable();
+    // The solution vectors are the *smallest*: take the prefix ending at the first
+    // pronounced gap (the jump from the L cluster up to the generic/mod-row
+    // vectors). If no such gap, every sub-m vector is a solution (all modular
+    // factors are already true factors).
+    let gap_min = (m.bit_len() as u64 / 8).max(2);
+    let mut threshold = m.bit_len() as u64;
+    for w in sorted.windows(2) {
+        if w[1] - w[0] >= gap_min {
+            threshold = w[1];
+            break;
+        }
+    }
+    let sol: Vec<&Vec<Int>> = reduced
+        .iter()
+        .zip(&tbits)
+        .filter(|(_, tb)| **tb < threshold)
+        .map(|(row, _)| row)
+        .collect();
+    if sol.is_empty() {
+        return None;
+    }
+
+    // Two modular factors lie in the same true factor iff they share the same
+    // coordinate in *every* solution vector (an indicator is constant on its
+    // group). Group indices by that signature; each group is a candidate factor.
+    let mut labels = alloc::vec![0usize; r];
+    let mut sigs: Vec<Vec<Int>> = Vec::new();
+    for (i, label) in labels.iter_mut().enumerate() {
+        let sig: Vec<Int> = sol.iter().map(|v| v[i].clone()).collect();
+        *label = match sigs.iter().position(|s| *s == sig) {
+            Some(idx) => idx,
+            None => {
+                sigs.push(sig);
+                sigs.len() - 1
+            }
+        };
+    }
+
+    let mut factors = Vec::with_capacity(sigs.len());
+    for g in 0..sigs.len() {
+        let mut cand = alloc::vec![Int::ONE];
+        for (i, &lab) in labels.iter().enumerate() {
+            if lab == g {
+                cand = ip_sym_mod(&ip_mul(&cand, &lifted[i]), m);
+            }
+        }
+        // Every candidate is division-verified, so a wrong partition fails safely.
+        if (f.len() as isize) < (cand.len() as isize) || !ip_divmod_monic(f, &cand).1.is_empty() {
+            return None;
+        }
+        factors.push(ip_primitive(&cand));
+    }
+    Some(factors)
 }
 
 /// All size-`k` subsets of `0..n` (indices), as index vectors.
@@ -728,5 +916,118 @@ mod tests {
         assert_eq!(facs.len(), 5);
         assert!(facs.iter().all(|g| deg(g) == 1));
         assert_eq!(fp_monic(&prod(&facs, p), p), fp_monic(&f, p));
+    }
+}
+
+#[cfg(all(test, feature = "lattice"))]
+mod vh_tests {
+    use super::*;
+
+    fn ints(c: &[i64]) -> Vec<Int> {
+        c.iter().map(|&x| Int::from_i64(x)).collect()
+    }
+
+    /// Runs the pipeline up to (and including) van Hoeij only — no trial fallback —
+    /// so a `Some` result proves the LLL recombination itself resolved the factors.
+    fn run_vh(f: &[Int]) -> Option<Vec<Vec<Int>>> {
+        let n = f.len() - 1;
+        for &p in &[
+            3u64, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59,
+        ] {
+            let fp = reduce_mod_p(f, p);
+            if deg(&fp) != n as isize || deg(&fp_gcd(&fp, &fp_derivative(&fp, p), p)) != 0 {
+                continue;
+            }
+            let modfacs = factor_mod_p(&fp, p);
+            if modfacs.len() == 1 {
+                return Some(alloc::vec![f.to_vec()]);
+            }
+            let r = modfacs.len();
+            let rb = root_bound(f);
+            let inner = Int::from_u64(2 * n as u64)
+                .mul(&rb.pow(r as u32))
+                .mul(&Int::ONE.mul_2k(2 * r as u32));
+            let sq = inner.mul(&inner);
+            let bound = sq.mul(&sq);
+            let mut m = Int::from_u64(p);
+            let mut exp = 1u32;
+            while m.cmp(&bound) != core::cmp::Ordering::Greater {
+                m = m.mul(&Int::from_u64(p));
+                exp += 1;
+            }
+            let lifted = lift_all(f, &modfacs, p, exp, &m);
+            return (modfacs.len(), van_hoeij(f, &lifted, &m)).1;
+        }
+        None
+    }
+
+    fn prod(fs: &[Vec<Int>]) -> Vec<Int> {
+        fs.iter().fold(alloc::vec![Int::ONE], |a, g| ip_mul(&a, g))
+    }
+
+    #[test]
+    fn van_hoeij_irreducible_swinnerton_dyer() {
+        // x⁴ − 10x² + 1 (√2+√3): irreducible over ℚ but splits into 2–4 factors
+        // mod every prime — the case trial recombination handles slowest.
+        let f = ints(&[1, 0, -10, 0, 1]);
+        let res = run_vh(&f).expect("van Hoeij must resolve");
+        assert_eq!(res.len(), 1, "should be irreducible: {res:?}");
+        assert_eq!(res[0], f);
+    }
+
+    #[test]
+    fn van_hoeij_recombines_into_quadratics() {
+        // (x²−2)(x²−3) = x⁴ − 5x² + 6: mod many primes this splits into 4 linear
+        // factors that van Hoeij must recombine into the two true quadratics.
+        let f = ints(&[6, 0, -5, 0, 1]);
+        let mut res = run_vh(&f).expect("van Hoeij must resolve");
+        assert_eq!(res.len(), 2, "expected two quadratic factors: {res:?}");
+        assert!(res.iter().all(|g| g.len() - 1 == 2));
+        // Reconstruct.
+        res.sort_by(|a, b| a[0].cmp(&b[0]));
+        assert_eq!(prod(&res), f);
+    }
+
+    #[test]
+    fn van_hoeij_multiple_split_factors() {
+        // (x²+1)(x²−2)(x²−3): three irreducible quadratics, each splitting mod many
+        // primes — van Hoeij must group the modular factors into the three.
+        let f = ip_mul(
+            &ip_mul(&ints(&[1, 0, 1]), &ints(&[-2, 0, 1])),
+            &ints(&[-3, 0, 1]),
+        );
+        let mut res = run_vh(&f).expect("van Hoeij must resolve");
+        assert_eq!(res.len(), 3, "expected three quadratic factors: {res:?}");
+        assert!(res.iter().all(|g| g.len() - 1 == 2));
+        res.sort_by(|a, b| a[0].cmp(&b[0]));
+        assert_eq!(prod(&res), f);
+    }
+
+    #[test]
+    fn van_hoeij_mixed_reducible() {
+        // (x−1)(x+2)(x²−2)(x²+x+1): linear + irreducible pieces of mixed degree.
+        let f = ip_mul(
+            &ip_mul(&ip_mul(&ints(&[-1, 1]), &ints(&[2, 1])), &ints(&[-2, 0, 1])),
+            &ints(&[1, 1, 1]),
+        );
+        let res = run_vh(&f).expect("van Hoeij must resolve");
+        assert_eq!(res.len(), 4, "expected four factors: {res:?}");
+        assert_eq!(
+            prod(&{
+                let mut v = res.clone();
+                v.sort_by(|a, b| a.len().cmp(&b.len()).then(a[0].cmp(&b[0])));
+                v
+            }),
+            f
+        );
+    }
+
+    #[test]
+    fn van_hoeij_degree_8_field() {
+        // Minimal polynomial of √2+√3+√5: x⁸ −40x⁶ +352x⁴ −960x² +576, irreducible,
+        // splits into up to 8 factors mod p (8 modular factors → 2⁸ trial subsets).
+        let f = ints(&[576, 0, -960, 0, 352, 0, -40, 0, 1]);
+        let res = run_vh(&f).expect("van Hoeij must resolve degree 8");
+        assert_eq!(res.len(), 1, "should be irreducible: {res:?}");
     }
 }

@@ -544,7 +544,8 @@ impl Poly<crate::rational::Rational> {
     /// Factors this polynomial into monic irreducible factors over ℚ, returned as
     /// `(factor, multiplicity)` pairs (constants yield an empty list). The product
     /// of the factors raised to their multiplicities equals this polynomial made
-    /// monic. Uses Berlekamp–Zassenhaus (factor mod p, Hensel lift, recombine).
+    /// monic. Uses Berlekamp–Zassenhaus with van Hoeij's LLL recombination
+    /// (factor mod p, Hensel lift, recombine).
     pub fn factor(&self) -> alloc::vec::Vec<(Poly<crate::rational::Rational>, usize)> {
         crate::poly_factor::factor_rational(self)
     }

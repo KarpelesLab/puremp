@@ -172,3 +172,72 @@ fn edge_cases() {
     let dep = vec![iv(&[2, 4]), iv(&[1, 2])];
     assert_eq!(lll_reduce(&dep), dep);
 }
+
+#[cfg(feature = "float")]
+mod relations {
+    use super::*;
+    use puremp::lattice::{find_integer_relation, minimal_polynomial};
+    use puremp::{Float, RoundingMode};
+
+    const PREC: u64 = 320;
+    const SCALE: u64 = 200;
+    const M: RoundingMode = RoundingMode::Nearest;
+
+    fn f(n: i64) -> Float {
+        Float::from_int(&Int::from_i64(n), PREC, M)
+    }
+    fn sqrt(n: i64) -> Float {
+        f(n).sqrt(PREC, M)
+    }
+    // ±equal: relations/min-polys are defined up to overall sign.
+    fn eq_upto_sign(got: &[Int], want: &[i64]) -> bool {
+        let w: Vec<Int> = want.iter().map(|&x| Int::from_i64(x)).collect();
+        let neg: Vec<Int> = w.iter().map(|x| x.neg()).collect();
+        got == w.as_slice() || got == neg.as_slice()
+    }
+
+    #[test]
+    fn finds_known_relations() {
+        // 2·√2 − 1·√8 = 0.
+        let r = find_integer_relation(&[sqrt(2), sqrt(8)], SCALE).expect("relation");
+        assert!(eq_upto_sign(&r, &[2, -1]), "got {r:?}");
+        // Among 1, √2, 2: 2·1 − 1·2 = 0 (no √2 component, since √2 is irrational).
+        let r = find_integer_relation(&[f(1), sqrt(2), f(2)], SCALE).expect("relation");
+        assert!(eq_upto_sign(&r, &[2, 0, -1]), "got {r:?}");
+    }
+
+    #[test]
+    fn rejects_independent_values() {
+        // √2 is irrational: no relation a·√2 + b = 0.
+        assert!(find_integer_relation(&[sqrt(2), f(1)], SCALE).is_none());
+        // √2 and √3 are Q-linearly independent.
+        assert!(find_integer_relation(&[sqrt(2), sqrt(3)], SCALE).is_none());
+    }
+
+    #[test]
+    fn recovers_minimal_polynomials() {
+        // √2 → x² − 2.
+        assert!(eq_upto_sign(
+            &minimal_polynomial(&sqrt(2), 4, SCALE).unwrap(),
+            &[-2, 0, 1]
+        ));
+        // Golden ratio (1+√5)/2 → x² − x − 1.
+        let phi = f(1).add(&sqrt(5), PREC, M).div(&f(2), PREC, M);
+        assert!(eq_upto_sign(
+            &minimal_polynomial(&phi, 4, SCALE).unwrap(),
+            &[-1, -1, 1]
+        ));
+        // 2^(1/3) → x³ − 2.
+        let cbrt2 = f(2).pow(&f(1).div(&f(3), PREC, M), PREC, M);
+        assert!(eq_upto_sign(
+            &minimal_polynomial(&cbrt2, 4, SCALE).unwrap(),
+            &[-2, 0, 0, 1]
+        ));
+        // √2 + √3 → x⁴ − 10x² + 1 (degree 4, no spurious lower-degree relation).
+        let s = sqrt(2).add(&sqrt(3), PREC, M);
+        assert!(eq_upto_sign(
+            &minimal_polynomial(&s, 5, SCALE).unwrap(),
+            &[1, 0, -10, 0, 1]
+        ));
+    }
+}

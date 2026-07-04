@@ -195,3 +195,103 @@ fn dot_rr(a: &[Rational], b: &[Rational]) -> Rational {
     }
     acc
 }
+
+#[cfg(feature = "float")]
+pub use relations::{find_integer_relation, minimal_polynomial};
+
+/// Integer-relation detection and minimal-polynomial recovery, built on LLL.
+#[cfg(feature = "float")]
+mod relations {
+    use super::{Int, Rational, Vec, lll_reduce, round_to_int};
+    use crate::float::{Float, RoundingMode};
+
+    /// Searches for a small nonzero **integer relation** among the real numbers
+    /// `xs`: a vector of integers `a`, not all zero, with `Σ aᵢ·xᵢ ≈ 0`. Returns
+    /// `None` if no relation is found at the requested precision (e.g. the values
+    /// are rationally independent, like `[1, π]`).
+    ///
+    /// `scale_bits` controls detection precision: the search weights the values by
+    /// `2^scale_bits`, so it should be comfortably below the accuracy of the input
+    /// `Float`s (a common choice is ~70–90% of their precision). Larger values
+    /// detect finer relations but demand more accurate inputs and reject spurious
+    /// ones more strictly. The returned relation is sign-normalized (first nonzero
+    /// entry positive) and, for a genuine relation, its entries are the small
+    /// integers you'd expect (e.g. `[2, -1]` for `[ln 2, ln 4]`).
+    pub fn find_integer_relation(xs: &[Float], scale_bits: u64) -> Option<Vec<Int>> {
+        let n = xs.len();
+        if n == 0 {
+            return None;
+        }
+        if n == 1 {
+            return xs[0].is_zero().then(|| alloc::vec![Int::ONE]);
+        }
+        // Lattice rows: row i = eᵢ (weight 1, keeps coefficients small) augmented
+        // with round(2^scale · xᵢ) (weight 2^scale, drives the combination to 0).
+        let pow2 = Rational::from_integer(Int::ONE.mul_2k(scale_bits as u32));
+        let mut basis: Vec<Vec<Int>> = Vec::with_capacity(n);
+        for (i, x) in xs.iter().enumerate() {
+            let r = x.to_rational()?; // non-finite input → give up
+            let mut row = alloc::vec![Int::ZERO; n + 1];
+            row[i] = Int::ONE;
+            row[n] = round_to_int(&Rational::mul(&r, &pow2));
+            basis.push(row);
+        }
+        let reduced = lll_reduce(&basis);
+
+        // The shortest reduced vector's identity part is the candidate relation.
+        // For a lattice of determinant ~2^scale in n dimensions, a *generic*
+        // (relation-free) shortest vector has entries ~2^(scale/n). A genuine
+        // relation makes the shortest vector far shorter — small coefficients and a
+        // near-zero last coordinate (2^scale·Σaᵢxᵢ up to rounding). So accept only
+        // when every entry, including the last, sits well below that generic bound.
+        let short = &reduced[0];
+        let cand = &short[..n];
+        if cand.iter().all(Int::is_zero) {
+            return None;
+        }
+        let threshold_bits = scale_bits / (2 * n as u64);
+        if short
+            .iter()
+            .any(|e| u64::from(e.bit_len()) > threshold_bits)
+        {
+            return None;
+        }
+        Some(normalize_sign(cand.to_vec()))
+    }
+
+    /// Recovers the **minimal polynomial** of the real algebraic number
+    /// approximated by `alpha`, as integer coefficients `[a₀, a₁, …, a_d]` (lowest
+    /// degree first, so `a₀ + a₁·α + … + a_d·αᵈ = 0`), searching degrees
+    /// `1..=max_degree`. Returns the least-degree relation found, or `None`.
+    ///
+    /// `alpha` must be accurate to well beyond `scale_bits` bits for the answer to
+    /// be trustworthy; recovered polynomials should be checked by the caller (e.g.
+    /// evaluate at a sharper approximation, or confirm irreducibility).
+    pub fn minimal_polynomial(
+        alpha: &Float,
+        max_degree: usize,
+        scale_bits: u64,
+    ) -> Option<Vec<Int>> {
+        let prec = alpha.precision();
+        let m = RoundingMode::Nearest;
+        // Powers 1, α, α², …, α^max_degree.
+        let mut powers = Vec::with_capacity(max_degree + 1);
+        powers.push(Float::from_int(&Int::ONE, prec, m));
+        for _ in 1..=max_degree {
+            powers.push(powers.last().unwrap().mul(alpha, prec, m));
+        }
+        (1..=max_degree).find_map(|d| find_integer_relation(&powers[..=d], scale_bits))
+    }
+
+    /// Canonicalizes a relation so its first nonzero entry is positive.
+    fn normalize_sign(mut v: Vec<Int>) -> Vec<Int> {
+        if let Some(first) = v.iter().find(|c| !c.is_zero()) {
+            if first.is_negative() {
+                for c in &mut v {
+                    *c = c.neg();
+                }
+            }
+        }
+        v
+    }
+}

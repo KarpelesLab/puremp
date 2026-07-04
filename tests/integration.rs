@@ -977,3 +977,45 @@ fn large_parse_roundtrip_multi_radix() {
         "10000000000000000000"
     );
 }
+
+#[test]
+fn isqrt_exhaustive_and_large() {
+    // Small values 0..2000: floor-sqrt property.
+    for v in 0u64..2000 {
+        let s = nat(&v.to_string()).isqrt().to_u64().unwrap();
+        assert!(s * s <= v && (s + 1) * (s + 1) > v, "isqrt({v}) = {s}");
+    }
+    // Perfect squares and their neighbours across the 128-bit base boundary and
+    // into the recursive range.
+    for k_str in [
+        "1",
+        "65535",
+        "4294967296",
+        "18446744073709551616",
+        "340282366920938463463374607431768211457", // > 2^128
+        "99999999999999999999999999999999999999999999999999",
+    ] {
+        let k = int(k_str).magnitude();
+        let sq = k.mul(&k);
+        assert_eq!(sq.isqrt(), k, "isqrt(k²) for k={k_str}");
+        // (k² - 1) has floor-sqrt k-1
+        let below = sq.checked_sub(&Nat::one()).unwrap();
+        assert_eq!(
+            below.isqrt(),
+            k.checked_sub(&Nat::one()).unwrap(),
+            "isqrt(k²-1)"
+        );
+        // (k² + 2k) < (k+1)², floor-sqrt k
+        let above = sq.add(&k).add(&k);
+        assert_eq!(above.isqrt(), k, "isqrt(k²+2k)");
+    }
+    // Very large irregular value: verify the invariant s² ≤ n < (s+1)².
+    let n = int("7")
+        .pow(3000)
+        .mul(&int("11").pow(1500))
+        .add(&int("123456789"))
+        .magnitude();
+    let s = n.isqrt();
+    assert!(s.mul(&s) <= n);
+    assert!(s.add(&Nat::one()).square() > n);
+}

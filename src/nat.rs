@@ -317,6 +317,24 @@ fn bz_div_3n_2n(a: &Nat, b: &Nat, half: usize) -> (Nat, Nat) {
     (q_int.magnitude(), r_int.magnitude())
 }
 
+/// Integer square root of a `u128` (base case of [`Nat::isqrt`]).
+fn isqrt_u128(v: u128) -> u128 {
+    if v == 0 {
+        return 0;
+    }
+    let bits = 128 - v.leading_zeros();
+    // Seed ≥ √v; Newton from above descends to ⌊√v⌋. `x + v/x` stays near
+    // `2·√v ≤ 2^65`, so it never overflows.
+    let mut x = 1u128 << bits.div_ceil(2);
+    loop {
+        let y = (x + v / x) / 2;
+        if y >= x {
+            return x;
+        }
+        x = y;
+    }
+}
+
 /// `s·a + t·b` as an [`Int`], for the Lehmer cofactor combination.
 fn lincomb(s: i128, a: &crate::int::Int, t: i128, b: &crate::int::Int) -> crate::int::Int {
     use crate::int::Int;
@@ -1155,24 +1173,39 @@ impl Nat {
         result
     }
 
-    /// Returns the floor of the square root, `⌊√self⌋`, via Newton's method.
+    /// Returns the floor of the square root, `⌊√self⌋`.
+    ///
+    /// Recursive "Karatsuba square root": compute the root of the top half,
+    /// scale it up as an approximation, apply one Newton correction, then adjust
+    /// exactly. Each level recurses on a half-size value, so the divisions shrink
+    /// geometrically and the total cost is `O(M(n))` — versus the `O(log n)`
+    /// full-width divisions of plain Newton. The final ±1 correction loops make
+    /// the result exact regardless of the approximation quality.
     pub fn isqrt(&self) -> Nat {
-        if self.is_zero() {
-            return Nat::zero();
+        let b = self.bit_len();
+        if b <= 128 {
+            return Nat::from_u128(isqrt_u128(self.to_u128().expect("<= 128 bits")));
         }
-        if self.bit_len() <= 2 {
-            // values 1..=3 all have isqrt 1
-            return Nat::one();
+        // Recurse on the top ~half: n1 = self >> 2c has ~b/2 bits.
+        let c = b / 4;
+        let s1 = self.shr(2 * c).isqrt();
+        let s0 = s1.shl(c); // approximation, s0 <= ⌊√self⌋
+        // One Newton step: x = (s0 + self/s0) / 2.
+        let (q, _) = self.div_rem(&s0).expect("s0 is non-zero");
+        let mut x = s0.add(&q).shr(1);
+        // Exact adjustment (each loop runs O(1) times given the error bound).
+        while x.square().cmp_ref(self) == Ordering::Greater {
+            x = x.checked_sub(&Nat::one()).expect("x >= 1");
         }
-        let mut x = Nat::one().shl(self.bit_len().div_ceil(2));
         loop {
-            let (q, _) = self.div_rem(&x).expect("x is non-zero");
-            let y = x.add(&q).shr(1);
-            if y.cmp_ref(&x) != Ordering::Less {
-                return x;
+            let x1 = x.add(&Nat::one());
+            if x1.square().cmp_ref(self) != Ordering::Greater {
+                x = x1;
+            } else {
+                break;
             }
-            x = y;
         }
+        x
     }
 
     /// Returns the floor of the `k`th root, `⌊self^(1/k)⌋`, for `k >= 1`, by

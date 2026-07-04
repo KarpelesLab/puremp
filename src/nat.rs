@@ -752,23 +752,48 @@ fn add_at(out: &mut [Limb], offset: usize, val: &[Limb]) {
 }
 
 /// Computes `a·u + b·v` (guaranteed non-negative by the Lehmer invariant) on
-/// naturals with explicit signs, avoiding the per-step `Int` clones of [`lincomb`].
+/// naturals with explicit signs, in one fused pass with a signed 128-bit
+/// carry — no intermediate products or sign case allocations.
+/// Requires `|a|, |b| < 2^63` (they are i64 cofactors at every call site).
 fn lincomb_pos(a: i128, u: &Nat, b: i128, v: &Nat) -> Nat {
-    let au = Nat::from_u128(a.unsigned_abs()).mul(u);
-    let bv = Nat::from_u128(b.unsigned_abs()).mul(v);
-    let (mut pos, mut neg) = (Nat::zero(), Nat::zero());
-    if a >= 0 {
-        pos = au
+    let (am, bm) = (a.unsigned_abs() as u64, b.unsigned_abs() as u64);
+    debug_assert!(a.unsigned_abs() >> 63 == 0 && b.unsigned_abs() >> 63 == 0);
+    let n = u.limbs.len().max(v.limbs.len()) + 2;
+    let ul = |i: usize| u.limbs.get(i).copied().unwrap_or(0);
+    let vl = |i: usize| v.limbs.get(i).copied().unwrap_or(0);
+    let mut out = Vec::with_capacity(n);
+    if a >= 0 && b >= 0 {
+        // Both terms add: unsigned accumulate (products < 2^127 each).
+        let mut carry: u128 = 0;
+        for i in 0..n {
+            let acc = am as u128 * ul(i) as u128 + bm as u128 * vl(i) as u128 + carry;
+            out.push(acc as Limb);
+            carry = acc >> LIMB_BITS;
+        }
+        debug_assert_eq!(carry, 0, "lincomb carry escaped");
     } else {
-        neg = au
+        // Exactly one term is negative; orient as m₁·w₁ − m₂·w₂ ≥ 0 and let a
+        // signed carry ripple (|product| < 2^127, so the i128 never overflows).
+        let (m1, m2, flip) = if a >= 0 {
+            (am, bm, false)
+        } else {
+            (bm, am, true)
+        };
+        let mut carry: i128 = 0;
+        for i in 0..n {
+            let (w1, w2) = if flip { (vl(i), ul(i)) } else { (ul(i), vl(i)) };
+            let p = m1 as i128 * w1 as i128 - m2 as i128 * w2 as i128 + carry;
+            out.push(p as Limb);
+            carry = p >> LIMB_BITS; // arithmetic: sign-extends the borrow
+        }
+        assert_eq!(
+            carry, 0,
+            "lincomb result is non-negative by the Lehmer invariant"
+        );
     }
-    if b >= 0 {
-        pos = pos.add(&bv);
-    } else {
-        neg = neg.add(&bv);
-    }
-    pos.checked_sub(&neg)
-        .expect("lincomb result is non-negative by the Lehmer invariant")
+    let mut r = Nat { limbs: out };
+    r.normalize();
+    r
 }
 
 /// An arbitrary-precision natural number (a non-negative integer).
@@ -1366,23 +1391,40 @@ impl Nat {
             let mut x = u.shr(shift).to_u64().unwrap_or(0);
             let mut y = v.shr(shift).to_u64().unwrap_or(0);
 
-            // Single-precision partial Euclid, accumulating [[a,b],[c,d]].
-            let (mut a, mut b, mut c, mut d) = (1i128, 0i128, 0i128, 1i128);
+            // Single-precision partial Euclid, accumulating [[a,b],[c,d]] in
+            // machine words: an i128 quotient lowers to a slow division
+            // libcall, while Lehmer's invariants keep every quantity inside a
+            // u64/i64. Any sign or overflow violation simply breaks to the
+            // (always correct) multi-precision fallback below.
+            let (mut a, mut b, mut c, mut d) = (1i64, 0i64, 0i64, 1i64);
             loop {
-                let (yc, yd) = (y as i128 + c, y as i128 + d);
-                if yc == 0 || yd == 0 {
+                let (yc, yd) = (y as i128 + c as i128, y as i128 + d as i128);
+                if yc <= 0 || yd <= 0 {
                     break;
                 }
-                let q = (x as i128 + a) / yc;
-                if q != (x as i128 + b) / yd {
+                // x < 2^63 and |a| ≤ i64::MAX, so x+a fits a u64 when ≥ 0.
+                let (xa, xb) = (x as i128 + a as i128, x as i128 + b as i128);
+                if xa < 0 || xb < 0 {
+                    break;
+                }
+                let q = (xa as u64) / (yc as u64);
+                if q != (xb as u64) / (yd as u64) {
                     break; // Lehmer's exactness test failed
                 }
-                let (na, nb) = (c, d);
-                (c, d) = (a - q * c, b - q * d);
-                (a, b) = (na, nb);
-                let ny = x as i128 - q * y as i128;
+                let Ok(qi) = i64::try_from(q) else { break };
+                let (Some(nc), Some(nd)) = (
+                    qi.checked_mul(c).and_then(|t| a.checked_sub(t)),
+                    qi.checked_mul(d).and_then(|t| b.checked_sub(t)),
+                ) else {
+                    break;
+                };
+                (a, b) = (c, d);
+                (c, d) = (nc, nd);
+                // ny = x − q·y, non-negative by construction (same bits as the
+                // former i128 computation).
+                let ny = (x as u128).wrapping_sub(q as u128 * y as u128) as u64;
                 x = y;
-                y = ny as u64;
+                y = ny;
             }
 
             if b == 0 {
@@ -1392,8 +1434,8 @@ impl Nat {
             } else {
                 // Apply the matrix to the full operands (result stays positive),
                 // borrowing `u`/`v` rather than cloning them into `Int`.
-                let nu = lincomb_pos(a, &u, b, &v);
-                let nv = lincomb_pos(c, &u, d, &v);
+                let nu = lincomb_pos(a as i128, &u, b as i128, &v);
+                let nv = lincomb_pos(c as i128, &u, d as i128, &v);
                 u = nu;
                 v = nv;
                 if u.cmp_ref(&v) == Ordering::Less {

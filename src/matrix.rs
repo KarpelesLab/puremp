@@ -329,15 +329,34 @@ impl Matrix<crate::rational::Rational> {
 
     /// Returns the exact determinant. Panics if the matrix is not square.
     pub fn determinant(&self) -> crate::rational::Rational {
+        use crate::int::Int;
         use crate::rational::Rational;
         assert!(self.is_square(), "determinant: matrix must be square");
         let n = self.rows;
         if n == 0 {
             return Rational::ONE;
         }
-        let mut data = self.data.clone();
-        let (pivots, det) = Self::eliminate(&mut data, n, n);
-        if pivots < n { Rational::ZERO } else { det }
+        // Clear denominators row by row into an integer matrix (scaling row i by
+        // sᵢ = lcm of its denominators multiplies the determinant by sᵢ), then use
+        // the fraction-free integer Bareiss determinant — whose intermediate
+        // entries stay bounded (Hadamard) — instead of rational Gaussian
+        // elimination, which suffers numerator/denominator blow-up.
+        let mut int_data = alloc::vec::Vec::with_capacity(n * n);
+        let mut scale = Int::ONE;
+        for i in 0..n {
+            let mut s = Int::ONE;
+            for j in 0..n {
+                s = s.lcm(self.get(i, j).denominator());
+            }
+            for j in 0..n {
+                let e = self.get(i, j);
+                let factor = s.div_exact(e.denominator()); // exact: denominator | s
+                int_data.push(e.numerator().mul(&factor));
+            }
+            scale = scale.mul(&s);
+        }
+        let int_det = Matrix::<Int>::new(n, n, int_data).determinant();
+        Rational::new(int_det, scale)
     }
 
     /// Returns the rank (number of linearly independent rows).

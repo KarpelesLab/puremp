@@ -1664,22 +1664,80 @@ impl Nat {
 
     /// Divides by a single-limb value, returning `(quotient, remainder)`.
     ///
-    /// The divisor must be non-zero. This is the primitive behind decimal
-    /// formatting; full multi-limb division is a later milestone.
+    /// The divisor must be non-zero. Uses a precomputed Möller–Granlund
+    /// reciprocal so the per-limb step is two multiplications instead of a
+    /// (libcall) 128-by-64-bit hardware division.
     fn divmod_small(&self, d: Limb) -> (Nat, Limb) {
         debug_assert!(d != 0, "divmod_small by zero");
-        let dd = d as u128;
-        let mut rem: u128 = 0;
-        let mut q = alloc::vec![0 as Limb; self.limbs.len()];
-        for i in (0..self.limbs.len()).rev() {
-            let cur = (rem << LIMB_BITS) | self.limbs[i] as u128;
-            q[i] = (cur / dd) as Limb;
-            rem = cur % dd;
+        let n = self.limbs.len();
+        if n == 0 {
+            return (Nat::zero(), 0);
         }
-        let mut n = Nat { limbs: q };
-        n.normalize();
-        (n, rem as Limb)
+        // Normalize the divisor (top bit set); the dividend is scaled by the
+        // same 2^s on the fly, which scales the remainder and leaves the
+        // quotient unchanged.
+        let s = d.leading_zeros();
+        let dn = d << s;
+        let v = recip_2by1(dn);
+        let mut q = alloc::vec![0 as Limb; n];
+        // Running remainder of the scaled dividend; the initial value is the
+        // top limb's overflow bits (< 2^s ≤ 2^63 ≤ dn).
+        let mut rem: Limb = if s == 0 {
+            0
+        } else {
+            self.limbs[n - 1] >> (LIMB_BITS - s)
+        };
+        for i in (0..n).rev() {
+            let lo = if s == 0 || i == 0 {
+                0
+            } else {
+                self.limbs[i - 1] >> (LIMB_BITS - s)
+            };
+            let cur = (self.limbs[i] << s) | lo;
+            let (qi, r) = div_2by1(rem, cur, dn, v);
+            q[i] = qi;
+            rem = r;
+        }
+        let mut nq = Nat { limbs: q };
+        nq.normalize();
+        (nq, rem >> s)
     }
+}
+
+/// Möller–Granlund reciprocal of a normalized (top bit set) divisor:
+/// `v = ⌊(2^128 − 1)/d⌋ − 2^64`. The one hardware 128-bit division here is
+/// amortized over every limb of the dividend.
+#[inline]
+fn recip_2by1(d: Limb) -> Limb {
+    debug_assert!(
+        d >> (LIMB_BITS - 1) == 1,
+        "reciprocal needs a normalized divisor"
+    );
+    // The quotient is in [2^64, 2^65), so truncating to u64 subtracts 2^64.
+    (u128::MAX / d as u128) as Limb
+}
+
+/// Divides `hi·2^64 + lo` by the normalized divisor `d` given its reciprocal
+/// `v` (see [`recip_2by1`]), returning `(quotient, remainder)`. Requires
+/// `hi < d`, so the quotient fits one limb (Möller–Granlund Algorithm 4).
+#[inline]
+fn div_2by1(hi: Limb, lo: Limb, d: Limb, v: Limb) -> (Limb, Limb) {
+    debug_assert!(hi < d, "2-by-1 quotient must fit a limb");
+    // Candidate quotient q1 = high limb of v·hi + (hi, lo), plus one; it is
+    // never more than one too large after the first correction below.
+    let q = (v as u128) * (hi as u128) + (((hi as u128) << LIMB_BITS) | lo as u128);
+    let mut q1 = ((q >> LIMB_BITS) as Limb).wrapping_add(1);
+    let q0 = q as Limb;
+    let mut r = lo.wrapping_sub(q1.wrapping_mul(d));
+    if r > q0 {
+        q1 = q1.wrapping_sub(1);
+        r = r.wrapping_add(d);
+    }
+    if r >= d {
+        q1 += 1;
+        r -= d;
+    }
+    (q1, r)
 }
 
 impl Nat {

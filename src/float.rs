@@ -1424,18 +1424,73 @@ fn atan_series(x: &Float, w: u64) -> Float {
     sum
 }
 
-/// π via Machin's formula, `16·atan(1/5) − 4·atan(1/239)`, at precision `w`.
-fn pi_at(w: u64) -> Float {
-    let a1 = atan_series(&rflt(1, 5, w), w);
-    let a2 = atan_series(&rflt(1, 239, w), w);
-    iflt(16, w)
-        .mul(&a1, w, NEAR)
-        .sub(&iflt(4, w).mul(&a2, w, NEAR), w, NEAR)
+/// `⌊atan(1/q)·2^n⌋` (up to a few ulps low) by the Taylor series in scaled
+/// integer arithmetic: every term is produced by single-limb divisions, far
+/// cheaper than per-term Float operations. Requires `q² ≤ u64::MAX`.
+///
+/// Each truncated division loses < 1 ulp and the series has `n/log2(q²)`
+/// terms, so the total error stays well under the guard bits the callers add.
+fn atan_recip_scaled(q: u64, n: u64) -> Nat {
+    let q2 = q * q;
+    // x_k = 2^n / q^(2k+1); the alternating partial sums stay non-negative.
+    let mut x = Nat::one()
+        .shl(n)
+        .div_rem(&Nat::from_u64(q))
+        .expect("q > 0")
+        .0;
+    let mut sum = x.clone();
+    let mut k = 1u64;
+    let mut sub = true;
+    loop {
+        x = x.div_rem(&Nat::from_u64(q2)).expect("q² > 0").0;
+        if x.is_zero() {
+            break;
+        }
+        let term = x.div_rem(&Nat::from_u64(2 * k + 1)).expect("2k+1 > 0").0;
+        sum = if sub {
+            sum.checked_sub(&term)
+                .expect("alternating partial sums are non-negative")
+        } else {
+            sum.add(&term)
+        };
+        sub = !sub;
+        k += 1;
+    }
+    sum
 }
 
-/// ln 2 via `2·atanh(1/3)` at precision `w`.
+/// π via Machin's formula, `16·atan(1/5) − 4·atan(1/239)`, at precision `w`,
+/// evaluated in scaled integer arithmetic.
+fn pi_at(w: u64) -> Float {
+    let n = w + 32; // guard bits over the series' truncation error
+    let a1 = atan_recip_scaled(5, n);
+    let a2 = atan_recip_scaled(239, n);
+    let pi_scaled = a1
+        .shl(4)
+        .checked_sub(&a2.shl(2))
+        .expect("16·atan(1/5) > 4·atan(1/239)");
+    Float::round_raw(false, pi_scaled, -(n as i64), w, NEAR).0
+}
+
+/// ln 2 via `2·atanh(1/3) = 2·Σ 1/((2k+1)·3^(2k+1))` at precision `w`,
+/// evaluated in scaled integer arithmetic (all terms positive).
 fn ln2_at(w: u64) -> Float {
-    iflt(2, w).mul(&atanh_series(&rflt(1, 3, w), w), w, NEAR)
+    let n = w + 32;
+    let three = Nat::from_u64(3);
+    let nine = Nat::from_u64(9);
+    let mut x = Nat::one().shl(n).div_rem(&three).expect("3 > 0").0;
+    let mut sum = x.clone();
+    let mut k = 1u64;
+    loop {
+        x = x.div_rem(&nine).expect("9 > 0").0;
+        if x.is_zero() {
+            break;
+        }
+        sum = sum.add(&x.div_rem(&Nat::from_u64(2 * k + 1)).expect("2k+1 > 0").0);
+        k += 1;
+    }
+    // ln 2 = 2 · sum · 2^-n.
+    Float::round_raw(false, sum, 1 - n as i64, w, NEAR).0
 }
 
 /// `e^x` at precision `w` via range reduction `x = k·ln2 + r` and a Taylor sum.

@@ -280,7 +280,8 @@ fn stage2(ctx: &ModCtx, q: &Point, a24: &Nat, primes: &[u64], b1: u64, b2: u64) 
         return None;
     }
     // Giant-step size D ≈ √b2, even so that i·D ± j covers every residue.
-    let mut d = (b2 as f64).sqrt() as u64;
+    // Integer sqrt keeps this `no_std`-clean (no `f64::sqrt`).
+    let mut d = b2.isqrt();
     d = d.max(2) & !1; // even, ≥ 2
     let half = d / 2;
 

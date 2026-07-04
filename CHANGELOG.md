@@ -7,6 +7,22 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/KarpelesLab/puremp/compare/v0.2.0...v0.2.1) - 2026-07-04
+
+### Added
+
+- *(complex)* complete the operator set — all owned/borrowed combinations
+- *(padic)* fixed-precision p-adic numbers (ℤ_p / ℚ_p)
+- *(dlog)* add discrete-logarithm solving (BSGS + Pollard's rho)
+- *(lattice)* add PSLQ integer-relation detection
+- *(float)* add erf/erfc and Riemann zeta special functions
+
+### Other
+
+- promote dlog, p-adic, PSLQ, and ζ/erf from roadmap candidates to shipped
+- remove accidentally-committed agent memory dir
+- remove accidentally-committed agent memory dir
+
 ## [0.2.0](https://github.com/KarpelesLab/puremp/compare/v0.1.9...v0.2.0) - 2026-07-04
 
 ### Added

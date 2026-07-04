@@ -103,6 +103,7 @@ int main(void) {
 | `interval` | ✔ | `Interval` — outward-rounded interval arithmetic (implies `float`) |
 | `ball` | ✔ | `Ball` — midpoint–radius (mid-rad) rigorous arithmetic, Arb-style (implies `interval`) |
 | `algebraic` | ✔ | `Quadratic` (ℚ(√d)) and general real `Algebraic` numbers |
+| `identify` | ✔ | Inverse symbolic calculator (`identify`, `machin_like`) via PSLQ (implies `lattice` + `float`) |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
 | `num-traits` | | Implements `num-traits` interfaces for `Int`/`Rational`/`Nat`/`Decimal`/`Complex` |
 | `ffi` | | The C ABI module (`include/puremp.h`) |
@@ -237,12 +238,22 @@ this list.
   large arguments) — all correctly rounded via the Ziv strategy. Still candidate:
   Γ / `lgamma` (Stirling by **rectangular splitting**, ~2√n full multiplications;
   Johansson, arXiv:2109.08392) and Bessel functions (MCA §4.7.1).
-- **Discrete logarithm** *(shipped, `dlog` feature)* — baby-step/giant-step and
-  Pollard's rho for logs (`dlog::discrete_log`, `ModInt::discrete_log`; HAC §3.6),
-  `factorize`-style automatic dispatch by group-order size.
+- **Discrete logarithm** *(shipped, `dlog` feature)* — baby-step/giant-step,
+  Pollard's rho, and **Pohlig–Hellman** for logs (`dlog::{discrete_log,
+  pohlig_hellman}`, `ModInt::discrete_log`; HAC §3.6). The dispatcher factors the
+  group order and, when it is smooth/composite, solves each prime-power subgroup
+  and CRT-combines — cost `Σ eᵢ√pᵢ` instead of `√order`.
 - **`p`-adic numbers** *(shipped, `padic` feature)* — `Padic`, fixed-precision
   ℤ_p / ℚ_p as `p^v·u` (unit `u`), with valuation-aware `+ − × ÷`, digit
   expansion, and Hensel-lifted `sqrt`.
+- **Experimental math** *(shipped, `identify` feature)* — an inverse symbolic
+  calculator `identify(x)` recognizes a float as a small rational combination of
+  `π, e, ln2, γ, Catalan, ζ(3), √2, …` via PSLQ (returns a `Display`-able closed
+  form such as `π²/6`), and `machin_like` rediscovers `π/4` arctangent identities.
+- **Rigorous solving with `Ball`** *(shipped, `ball` feature)* — monotone ball
+  transcendentals (`Ball::exp`/`ln`) and `bisect_root`, which returns a `Ball`
+  provably enclosing a root once a sign change is *certified* on the bracket
+  (interval intermediate-value theorem).
 
 ## License
 

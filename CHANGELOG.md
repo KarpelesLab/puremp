@@ -7,6 +7,34 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/KarpelesLab/puremp/compare/v0.1.5...v0.1.6) - 2026-07-04
+
+### Other
+
+- Nat-native Lehmer cofactor combination — gcd ~28% faster
+- direct add-into-place recombination for Toom-3/Toom-4 (~10-24%)
+- low-half multiply in Montgomery reduction (~12% faster modpow)
+- direct add-into-place recombination in Karatsuba multiply
+- retune multiplication crossovers — division ~24% faster
+- division-free Goldilocks reduction + fix NTT crossover threshold
+- update known-optimizations (isqrt SqrtRem and BZ padding now done)
+- k-ary windowed modular exponentiation (~14% faster modpow)
+- split-loop add/sub with a bulk-copy tail
+- power-of-two block padding for Burnikel–Ziegler division; tune threshold
+- recursive (Karatsuba) integer square root — isqrt ~8.8× faster
+- add CI / crates.io / docs.rs / license badges to the README
+- note isqrt SqrtRem and BZ block-padding as future optimizations
+- drop redundant full-width clones in the division inner loops
+- bounds-check-free schoolbook multiply/square inner loops
+- route Nat::from_str through the fast parser; share to_string power ladder
+- sub-quadratic base-N parsing (from_string ~29× faster)
+- Add fuzz targets for Decimal and Poly
+- Property-based hardening for the extended types; fix Algebraic::signum on zero
+- serde + num-traits coverage for the extended numeric types
+- drop the pre-1.0 status blockquote from the README
+- Remove ROADMAP.md; fold provenance/design into the README
+- Expose real-root finding on Poly<Rational>; share Sturm code with Algebraic
+
 ## [0.1.5](https://github.com/KarpelesLab/puremp/compare/v0.1.4...v0.1.5) - 2026-07-03
 
 ### Other

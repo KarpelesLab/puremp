@@ -881,15 +881,64 @@ impl Nat {
     }
 
     /// Quadratic schoolbook (long) multiplication.
+    ///
+    /// The main loop is an `addmul_2`: each pass adds two multiplier limbs'
+    /// worth of products (`out += (a₀ + a₁·2^64)·b`), halving the passes over
+    /// `out` and keeping two independent limb products in flight per iteration
+    /// instead of one serial multiply-accumulate chain.
     fn mul_schoolbook(&self, rhs: &Nat) -> Nat {
-        let rn = rhs.limbs.len();
-        let mut out = alloc::vec![0 as Limb; self.limbs.len() + rn];
-        for (i, &a) in self.limbs.iter().enumerate() {
+        use crate::limb::DLimb;
+        let a = &self.limbs;
+        let b = &rhs.limbs;
+        let rn = b.len();
+        let mut out = alloc::vec![0 as Limb; a.len() + rn];
+        let mut i = 0;
+        while i + 2 <= a.len() {
+            let (a0, a1) = (a[i], a[i + 1]);
+            // Position i+j collects lo(a0·b[j]) + hi(a0·b[j−1]) + lo(a1·b[j−1])
+            // + hi(a1·b[j−2]) + carry: five limb-sized terms, so the u128
+            // accumulator cannot overflow and the carry out is at most 4.
+            let mut ph0: Limb = 0; // hi(a0·b[j−1])
+            let mut pl1: Limb = 0; // lo(a1·b[j−1])
+            let mut ph1: Limb = 0; // hi(a1·b[j−1])
+            let mut ph1p: Limb = 0; // hi(a1·b[j−2])
+            let mut carry: Limb = 0;
+            let row = &mut out[i..i + rn + 2];
+            for (o, &bj) in row.iter_mut().zip(b) {
+                let p0 = a0 as DLimb * bj as DLimb;
+                let p1 = a1 as DLimb * bj as DLimb;
+                let acc = *o as DLimb
+                    + (p0 as Limb) as DLimb
+                    + ph0 as DLimb
+                    + pl1 as DLimb
+                    + ph1p as DLimb
+                    + carry as DLimb;
+                *o = acc as Limb;
+                carry = (acc >> LIMB_BITS) as Limb;
+                ph0 = (p0 >> LIMB_BITS) as Limb;
+                ph1p = ph1;
+                pl1 = p1 as Limb;
+                ph1 = (p1 >> LIMB_BITS) as Limb;
+            }
+            // Flush the pipeline into the two limbs above the row.
+            let acc = row[rn] as DLimb
+                + ph0 as DLimb
+                + pl1 as DLimb
+                + ph1p as DLimb
+                + carry as DLimb;
+            row[rn] = acc as Limb;
+            let top = row[rn + 1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
+            row[rn + 1] = top as Limb;
+            debug_assert_eq!(top >> LIMB_BITS, 0, "schoolbook top carry escaped");
+            i += 2;
+        }
+        if i < a.len() {
+            // Odd tail: one classic addmul_1 row.
+            let ai = a[i];
             let mut carry = 0;
-            // A single bounds check on the row slice, then none per limb.
             let row = &mut out[i..i + rn];
-            for (o, &b) in row.iter_mut().zip(&rhs.limbs) {
-                let (lo, hi) = mac(*o, a, b, carry);
+            for (o, &bj) in row.iter_mut().zip(b) {
+                let (lo, hi) = mac(*o, ai, bj, carry);
                 *o = lo;
                 carry = hi;
             }

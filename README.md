@@ -144,13 +144,9 @@ core operations and the derived types.
 
 **Known future optimizations** (correct today, just not maximally fast):
 
-- **`isqrt` / `nth_root_floor`** use full-precision Newton (resp. bitwise search),
-  so they perform `O(log n)` full-width divisions; a recursive *Karatsuba square
-  root* (Zimmermann's `SqrtRem`) would bring integer roots to `O(M(n))`.
-- **Burnikel–Ziegler division** bails to Knuth's Algorithm D whenever the block
-  count is odd, so a divisor whose limb count has a large odd factor bottoms out
-  on a larger-than-intended quadratic base; padding the block size to a power of
-  two would keep the recursion balanced.
+- **`nth_root_floor`** (for `k > 2`) still uses a bitwise search with a full
+  `pow(k)` per candidate bit; a Newton/recursive `k`th root would match the
+  `O(M(n))` integer square root.
 - A **half-GCD** for asymptotically faster `Rational` reduction; allocation-
   reducing **scratch buffers** in the recursive multiply/divide code; and a
   **subresultant PRS** to tame Sturm-sequence coefficient growth for high-degree

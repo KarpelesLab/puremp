@@ -62,3 +62,32 @@ fn rational_inverse_solve_rank() {
     assert_eq!(s.rank(), 1);
     assert_eq!(mr(3, 3, &[1, 0, 0, 0, 1, 0, 0, 0, 1]).rank(), 3);
 }
+
+#[test]
+fn fraction_free_inverse_solve_with_pivots() {
+    // Zero leading pivot forces the fraction-free path to bail to the exact
+    // rational fallback — result must still be correct.
+    let m = mr(3, 3, &[0, 1, 2, 1, 0, 3, 4, 5, 0]);
+    let inv = m.inverse().expect("nonsingular");
+    assert_eq!(&m * &inv, Matrix::<Rational>::identity(3));
+    let x = m
+        .solve(&[Rational::from(1), Rational::from(2), Rational::from(3)])
+        .unwrap();
+    // A·x == b
+    for i in 0..3 {
+        let mut acc = Rational::ZERO;
+        for j in 0..3 {
+            acc = acc.add(&m.get(i, j).mul(&x[j]));
+        }
+        assert_eq!(acc, Rational::from((i + 1) as i64));
+    }
+    // Fractional entries + a zero pivot.
+    let mf = mr(2, 2, &[0, 3, 2, 5]).scalar_mul(&Rational::new(1.into(), 3.into()));
+    assert_eq!(
+        &mf * &mf.inverse().unwrap(),
+        Matrix::<Rational>::identity(2)
+    );
+    // Singular matrix still detected.
+    assert!(mr(2, 2, &[1, 2, 2, 4]).inverse().is_none());
+    assert!(mr(2, 2, &[0, 0, 1, 2]).inverse().is_none());
+}

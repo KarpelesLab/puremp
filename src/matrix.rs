@@ -412,6 +412,17 @@ impl Matrix<crate::rational::Rational> {
             }
             data[i * width + n + i] = Rational::ONE;
         }
+        // Fraction-free path (fast); fall back to rational Gauss-Jordan only if a
+        // zero pivot forces a row swap.
+        if let Some(sol) = fraction_free_solve(&data, n, n) {
+            let mut inv = Matrix::zeros(n, n);
+            for i in 0..n {
+                for j in 0..n {
+                    inv.set(i, j, sol[i * n + j].clone());
+                }
+            }
+            return Some(inv);
+        }
         let (pivots, _) = Self::eliminate(&mut data, n, width);
         if pivots < n {
             return None; // singular
@@ -440,12 +451,87 @@ impl Matrix<crate::rational::Rational> {
             }
             data[i * width + n] = b[i].clone();
         }
+        if let Some(sol) = fraction_free_solve(&data, n, 1) {
+            return Some(sol); // already n×1, row-major
+        }
         let (pivots, _) = Self::eliminate(&mut data, n, width);
         if pivots < n {
             return None;
         }
         Some((0..n).map(|i| data[i * width + n].clone()).collect())
     }
+}
+
+/// Solves the augmented rational system `[A | R]` (A in columns `0..n`, the
+/// `extra` right-hand sides in columns `n..n+extra`) fraction-free: clear each
+/// row's denominators to integers, run Bareiss forward elimination (exact
+/// division by the previous pivot keeps intermediate entries Hadamard-bounded
+/// instead of blowing up like rational Gaussian elimination), then
+/// back-substitute in the rationals. Returns the `n × extra` solution row-major,
+/// or `None` if a zero pivot is hit (singular, or would need a row swap) — the
+/// caller falls back to the exact rational path in that case.
+#[cfg(feature = "rational")]
+fn fraction_free_solve(
+    aug: &[crate::rational::Rational],
+    n: usize,
+    extra: usize,
+) -> Option<alloc::vec::Vec<crate::rational::Rational>> {
+    use crate::int::Int;
+    use crate::rational::Rational;
+    let width = n + extra;
+
+    // Clear each row's denominators (including its right-hand sides) → integers.
+    let mut m: alloc::vec::Vec<Int> = alloc::vec::Vec::with_capacity(n * width);
+    for i in 0..n {
+        let mut s = Int::ONE;
+        for j in 0..width {
+            s = s.lcm(aug[i * width + j].denominator());
+        }
+        for j in 0..width {
+            let e = &aug[i * width + j];
+            m.push(e.numerator().mul(&s.div_exact(e.denominator())));
+        }
+    }
+
+    // Bareiss forward elimination (no row swaps — bail to the caller on a zero
+    // pivot so correctness never depends on fraction-free pivoting subtleties).
+    let mut prev = Int::ONE;
+    for k in 0..n {
+        if m[k * width + k].is_zero() {
+            return None;
+        }
+        let mkk = m[k * width + k].clone();
+        for i in k + 1..n {
+            let mik = m[i * width + k].clone();
+            for j in k + 1..width {
+                let num = Int::sub(
+                    &Int::mul(&mkk, &m[i * width + j]),
+                    &Int::mul(&mik, &m[k * width + j]),
+                );
+                m[i * width + j] = num.div_exact(&prev); // exact by the Bareiss identity
+            }
+            m[i * width + k] = Int::ZERO;
+        }
+        prev = mkk;
+    }
+
+    // Rational back-substitution of each right-hand column.
+    let mut x = alloc::vec![Rational::ZERO; n * extra];
+    for c in 0..extra {
+        for i in (0..n).rev() {
+            let mut acc = Rational::from_integer(m[i * width + n + c].clone());
+            for j in i + 1..n {
+                let term = Rational::mul(
+                    &Rational::from_integer(m[i * width + j].clone()),
+                    &x[j * extra + c],
+                );
+                acc = Rational::sub(&acc, &term);
+            }
+            x[i * extra + c] =
+                Rational::div(&acc, &Rational::from_integer(m[i * width + i].clone()));
+        }
+    }
+    Some(x)
 }
 
 macro_rules! matrix_binop {

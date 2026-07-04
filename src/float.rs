@@ -1129,6 +1129,18 @@ impl Float {
         Float::ziv(precision, mode, |w| exp_at(&iflt(1, w), w))
     }
 
+    /// Returns the Euler–Mascheroni constant γ ≈ 0.5772 rounded to `precision`
+    /// bits (Mathematica's `EulerGamma`).
+    pub fn euler_gamma(precision: u64, mode: RoundingMode) -> Float {
+        Float::ziv(precision, mode, gamma_at)
+    }
+
+    /// Returns Catalan's constant G ≈ 0.9160 rounded to `precision` bits
+    /// (Mathematica's `Catalan`).
+    pub fn catalan(precision: u64, mode: RoundingMode) -> Float {
+        Float::ziv(precision, mode, catalan_at)
+    }
+
     // --- functions ---
 
     /// Returns `e^self`, correctly rounded. `exp(±∞)`/`exp(0)` handled per IEEE.
@@ -1575,6 +1587,69 @@ pub(crate) fn round_const_bits(sig: &[u64], total_bits: u64, w: u64) -> Float {
     let drop = sig.len() - keep;
     let mag = Nat::from_limbs(&sig[drop..]);
     Float::round_raw(false, mag, drop as i64 * 64 - total_bits as i64, w, NEAR).0
+}
+
+/// Euler–Mascheroni constant γ via the Brent–McMillan formula
+/// `γ = A(N)/B(N) − ln N`, where `B = Σ (Nᵏ/k!)²` and `A = Σ (Nᵏ/k!)²·Hₖ` with
+/// `Hₖ` the k-th harmonic number. The truncation error is `O(e^{-4N})`, so
+/// `N = ⌈0.18·n⌉` (with `4N > n·ln2`) drives it below `2⁻ⁿ`.
+fn gamma_at(w: u64) -> Float {
+    let n = w + 32;
+    let bign = (n as i64) * 185 / 1024 + 8; // ≈ 0.18·n, so 4N > n·ln2
+    let scale = Int::ONE.mul_2k(n as u32); // 2ⁿ
+    let n2 = Int::from_i64(bign * bign);
+    let mut t = scale.clone(); // T₀ = (N⁰/0!)²·2ⁿ = 2ⁿ
+    let mut b = t.clone(); // B·2ⁿ
+    let mut hs = Int::ZERO; // Hₖ·2ⁿ (H₀ = 0)
+    let mut a = Int::ZERO; // A·2ⁿ
+    let mut k = 1i64;
+    loop {
+        // Tₖ = Tₖ₋₁·N²/k², Hₖ = Hₖ₋₁ + 1/k.
+        t = t.mul(&n2).div_trunc(&Int::from_i64(k * k));
+        if t.is_zero() {
+            break;
+        }
+        hs = hs.add(&scale.div_trunc(&Int::from_i64(k)));
+        b = b.add(&t);
+        // A·2ⁿ += Tₖ·Hₖ = (Tₖ·2ⁿ)·(Hₖ·2ⁿ)/2ⁿ / 2ⁿ.
+        a = a.add(&t.mul(&hs).div_2k_trunc(n as u32));
+        k += 1;
+    }
+    let af = Float::round_raw(false, a.magnitude(), -(n as i64), n, NEAR).0;
+    let bf = Float::round_raw(false, b.magnitude(), -(n as i64), n, NEAR).0;
+    let lnn = Float::from_int(&Int::from_i64(bign), n, NEAR).ln(n, NEAR);
+    af.div(&bf, n, NEAR).sub(&lnn, w, NEAR)
+}
+
+/// Catalan's constant `G = (π/8)·ln(2+√3) + (3/8)·Σ_{k≥0} 1/((2k+1)²·C(2k,k))`.
+/// The sum converges geometrically (`C(2k,k) ~ 4ᵏ`), so `~n/2` terms suffice.
+fn catalan_at(w: u64) -> Float {
+    let n = w + 32;
+    let mut term = Int::ONE.mul_2k(n as u32); // k=0: 1·2ⁿ
+    let mut sum = term.clone();
+    let mut k = 1i64;
+    loop {
+        // termₖ = termₖ₋₁·(2k−1)·k / (2·(2k+1)²).
+        let num = Int::from_i64((2 * k - 1) * k);
+        let den = Int::from_i64(2 * (2 * k + 1) * (2 * k + 1));
+        term = term.mul(&num).div_trunc(&den);
+        if term.is_zero() {
+            break;
+        }
+        sum = sum.add(&term);
+        k += 1;
+    }
+    let s = Float::round_raw(false, sum.magnitude(), -(n as i64), n, NEAR).0;
+    let sqrt3 = Float::from_int(&Int::from_i64(3), n, NEAR).sqrt(n, NEAR);
+    let ln_term = Float::from_int(&Int::from_i64(2), n, NEAR)
+        .add(&sqrt3, n, NEAR)
+        .ln(n, NEAR);
+    let eight = Float::from_int(&Int::from_i64(8), n, NEAR);
+    let term1 = pi_at(n).mul(&ln_term, n, NEAR).div(&eight, n, NEAR);
+    let term2 = s
+        .mul(&Float::from_int(&Int::from_i64(3), n, NEAR), n, NEAR)
+        .div(&eight, n, NEAR);
+    term1.add(&term2, w, NEAR)
 }
 
 fn pi_at(w: u64) -> Float {

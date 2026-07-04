@@ -8,8 +8,13 @@
 //! - [`Matrix<Int>`](Matrix): a fraction-free (Bareiss) integer determinant.
 //! - [`Matrix<Rational>`](Matrix): determinant, inverse, linear solve, and rank
 //!   by exact Gaussian elimination over the rationals.
+//!
+//! For an *arbitrary* [`Field`] component — the finite
+//! fields `GF(p)` / `GF(pᵏ)`, `Float`, … — the same operations are provided
+//! generically by the [`FieldMatrix`] trait (Gaussian elimination with
+//! pivoting). Bring it into scope with `use puremp::FieldMatrix;`.
 
-use crate::ring::Ring;
+use crate::ring::{Field, Ring};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -590,6 +595,243 @@ fn fraction_free_solve(
         }
     }
     Some(x)
+}
+
+/// Generic exact linear algebra over an arbitrary [`Field`], by **Gaussian
+/// elimination with partial pivoting**.
+///
+/// This trait unlocks determinant / inverse / linear-solve / rank for every
+/// [`Matrix<T>`] whose component type `T` is a [`Field`] — in particular the
+/// finite fields `GF(p)` ([`ModInt`](crate::mod_int::ModInt) with a prime
+/// modulus), `GF(pᵏ)` ([`GfElement`](crate::galois::GfElement)), and
+/// [`Float`](crate::float::Float) — none of which have a bespoke inherent
+/// algorithm.
+///
+/// # Coherence with the concrete `Int` / `Rational` algorithms
+///
+/// [`Matrix<Rational>`](Matrix) already exposes *inherent* `determinant`,
+/// `inverse`, `solve`, and `rank` (the optimized fraction-free / Bareiss exact
+/// path). Because `Rational: Field`, this trait is also implemented for it — but
+/// Rust resolves plain method calls to an **inherent method in preference to a
+/// trait method**, so `m.determinant()` on a `Matrix<Rational>` keeps using the
+/// fast Bareiss path. To invoke *this* generic Gaussian implementation on such a
+/// matrix, call it through the trait explicitly, e.g.
+/// `FieldMatrix::determinant(&m)`. ([`Matrix<Int>`](Matrix) is unaffected:
+/// `Int` is not a `Field`, so the trait is not implemented for it.)
+///
+/// Bring the trait into scope with `use puremp::FieldMatrix;` to call these
+/// methods on `Matrix<ModInt>`, `Matrix<GfElement>`, `Matrix<Float>`, etc.
+///
+/// # Caveats
+///
+/// - There is no fraction-free variant here; every step divides by the pivot
+///   using the field's [`Div`](core::ops::Div) / [`Field::inv`], so this path is
+///   meant for fields where that is cheap and exact (finite fields), not for
+///   `Rational` (use its inherent Bareiss path).
+/// - Over [`ModInt`](crate::mod_int::ModInt) the modulus must be **prime** for
+///   the ring to actually be a field; a nonzero non-invertible pivot would
+///   otherwise make division panic.
+pub trait FieldMatrix<T: Field> {
+    /// The determinant, computed as `(∏ pivots) · (−1)^{#row swaps}` after
+    /// forward elimination to upper-triangular form. A wholly-zero pivot column
+    /// means the matrix is singular, so the determinant is the field's zero.
+    /// Panics if the matrix is not square (or is `0 × 0`, which has no sample
+    /// element from which to take the ring's one).
+    fn determinant(&self) -> T;
+
+    /// The inverse via Gauss–Jordan elimination on the augmented `[A | I]`, or
+    /// `None` if `A` is singular. Panics if the matrix is not square.
+    fn inverse(&self) -> Option<Matrix<T>>;
+
+    /// Solves `self · x = b`, returning `x`, or `None` when there is no unique
+    /// solution (a zero pivot column ⇒ singular). Panics if `self` is not square
+    /// or `b` has the wrong length.
+    fn solve(&self, b: &[T]) -> Option<Vec<T>>;
+
+    /// The rank: the number of nonzero pivots produced by row-reducing to row
+    /// echelon form (works for any shape).
+    fn rank(&self) -> usize;
+}
+
+impl<T: Field> FieldMatrix<T> for Matrix<T> {
+    fn determinant(&self) -> T {
+        assert!(self.is_square(), "determinant: matrix must be square");
+        let n = self.rows;
+        let sample = self
+            .data
+            .first()
+            .expect("determinant: empty matrix has no sample element for the ring's one");
+        let zero = sample.zero();
+        let mut det = sample.one();
+        let mut a = self.data.clone();
+        let idx = |i: usize, j: usize| i * n + j;
+        let mut negated = false;
+        for col in 0..n {
+            // Choose any nonzero pivot at or below the diagonal in this column.
+            let piv = match (col..n).find(|&r| !a[idx(r, col)].is_zero()) {
+                Some(p) => p,
+                None => return zero, // whole sub-column zero ⇒ singular
+            };
+            if piv != col {
+                for c in 0..n {
+                    a.swap(idx(col, c), idx(piv, c));
+                }
+                negated = !negated;
+            }
+            let pivot = a[idx(col, col)].clone();
+            det = det * pivot.clone();
+            for r in col + 1..n {
+                let factor = a[idx(r, col)].clone() / pivot.clone();
+                if factor.is_zero() {
+                    continue;
+                }
+                for c in col..n {
+                    let prod = factor.clone() * a[idx(col, c)].clone();
+                    a[idx(r, c)] = a[idx(r, c)].clone() - prod;
+                }
+            }
+        }
+        if negated { -det } else { det }
+    }
+
+    fn inverse(&self) -> Option<Matrix<T>> {
+        assert!(self.is_square(), "inverse: matrix must be square");
+        let n = self.rows;
+        if n == 0 {
+            return Some(self.clone()); // the empty matrix is its own inverse
+        }
+        let sample = &self.data[0];
+        let zero = sample.zero();
+        let one = sample.one();
+        let width = 2 * n;
+        // Augmented [A | I].
+        let mut data = alloc::vec![zero.clone(); n * width];
+        for i in 0..n {
+            for j in 0..n {
+                data[i * width + j] = self.data[i * n + j].clone();
+            }
+            data[i * width + n + i] = one.clone();
+        }
+        for col in 0..n {
+            let piv = (col..n).find(|&r| !data[r * width + col].is_zero())?; // singular
+            if piv != col {
+                for c in 0..width {
+                    data.swap(col * width + c, piv * width + c);
+                }
+            }
+            let pivot = data[col * width + col].clone();
+            // Normalize the pivot row.
+            for c in 0..width {
+                data[col * width + c] = data[col * width + c].clone() / pivot.clone();
+            }
+            // Eliminate the column from every other row.
+            for r in 0..n {
+                if r == col {
+                    continue;
+                }
+                let factor = data[r * width + col].clone();
+                if factor.is_zero() {
+                    continue;
+                }
+                for c in 0..width {
+                    let prod = factor.clone() * data[col * width + c].clone();
+                    data[r * width + c] = data[r * width + c].clone() - prod;
+                }
+            }
+        }
+        let mut inv = Matrix::filled(zero, n, n);
+        for i in 0..n {
+            for j in 0..n {
+                inv.set(i, j, data[i * width + n + j].clone());
+            }
+        }
+        Some(inv)
+    }
+
+    fn solve(&self, b: &[T]) -> Option<Vec<T>> {
+        assert!(self.is_square(), "solve: matrix must be square");
+        let n = self.rows;
+        assert_eq!(b.len(), n, "solve: right-hand side length mismatch");
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        let zero = self.data[0].zero();
+        let width = n + 1;
+        let mut data = alloc::vec![zero.clone(); n * width];
+        for i in 0..n {
+            for j in 0..n {
+                data[i * width + j] = self.data[i * n + j].clone();
+            }
+            data[i * width + n] = b[i].clone();
+        }
+        // Forward-eliminate to upper triangular.
+        for col in 0..n {
+            let piv = (col..n).find(|&r| !data[r * width + col].is_zero())?; // singular
+            if piv != col {
+                for c in 0..width {
+                    data.swap(col * width + c, piv * width + c);
+                }
+            }
+            let pivot = data[col * width + col].clone();
+            for r in col + 1..n {
+                let factor = data[r * width + col].clone() / pivot.clone();
+                if factor.is_zero() {
+                    continue;
+                }
+                for c in col..width {
+                    let prod = factor.clone() * data[col * width + c].clone();
+                    data[r * width + c] = data[r * width + c].clone() - prod;
+                }
+            }
+        }
+        // Back-substitution.
+        let mut x = alloc::vec![zero; n];
+        for i in (0..n).rev() {
+            let mut acc = data[i * width + n].clone();
+            for j in i + 1..n {
+                acc = acc - data[i * width + j].clone() * x[j].clone();
+            }
+            x[i] = acc / data[i * width + i].clone();
+        }
+        Some(x)
+    }
+
+    fn rank(&self) -> usize {
+        if self.rows == 0 || self.cols == 0 {
+            return 0;
+        }
+        let n = self.rows;
+        let width = self.cols;
+        let mut data = self.data.clone();
+        let mut pivots = 0;
+        for col in 0..self.cols {
+            if pivots == n {
+                break;
+            }
+            let piv = match (pivots..n).find(|&r| !data[r * width + col].is_zero()) {
+                Some(p) => p,
+                None => continue,
+            };
+            if piv != pivots {
+                for c in 0..width {
+                    data.swap(pivots * width + c, piv * width + c);
+                }
+            }
+            let pivot = data[pivots * width + col].clone();
+            for r in pivots + 1..n {
+                let factor = data[r * width + col].clone() / pivot.clone();
+                if factor.is_zero() {
+                    continue;
+                }
+                for c in col..width {
+                    let prod = factor.clone() * data[pivots * width + c].clone();
+                    data[r * width + c] = data[r * width + c].clone() - prod;
+                }
+            }
+            pivots += 1;
+        }
+        pivots
+    }
 }
 
 macro_rules! matrix_binop {

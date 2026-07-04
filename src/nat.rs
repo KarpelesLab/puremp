@@ -358,6 +358,98 @@ fn bz_div_3n_2n(a: &Nat, b: &Nat, half: usize) -> (Nat, Nat) {
     (q_int.magnitude(), r_int.magnitude())
 }
 
+/// Recursive square root with remainder (Zimmermann's "Karatsuba square root"):
+/// returns `(s, r)` with `s = ⌊√a⌋` and `r = a − s²`.
+///
+/// Precondition: `a` is normalized so its top limb is `≥ 2^62` (ensured by an
+/// even shift in [`Nat::isqrt`]). With `l = ⌊n/4⌋` that guarantees the root of
+/// the high part satisfies `2·s₁ ≥ 2^(64l)`, so the quotient below fits `l`
+/// limbs (+1) and the correction loops run O(1) times.
+fn sqrt_rem(a: &Nat) -> (Nat, Nat) {
+    let n = a.limbs.len();
+    if n <= 2 {
+        let v = a.to_u128().expect("<= 2 limbs");
+        let s = isqrt_u128(v);
+        return (Nat::from_u128(s), Nat::from_u128(v - s * s));
+    }
+    if n == 3 {
+        // Too small for an l ≥ 1, n ≥ 4l split: one guarded Newton step from a
+        // 128-bit seed, then exact ±1 adjustment (cheap at this size).
+        let b = a.bit_len();
+        let c = b / 4;
+        let seed = a.shr(2 * c).to_u128().expect("~b/2 <= 96 bits");
+        let s0 = Nat::from_u128(isqrt_u128(seed)).shl(c);
+        let q = a.div_rem(&s0).expect("s0 > 0").0;
+        let mut x = s0.add(&q).shr(1);
+        while x.square().cmp_ref(a) == Ordering::Greater {
+            x = x.checked_sub(&Nat::one()).expect("x >= 1");
+        }
+        loop {
+            let x1 = x.add(&Nat::one());
+            if x1.square().cmp_ref(a) != Ordering::Greater {
+                x = x1;
+            } else {
+                break;
+            }
+        }
+        let r = a.checked_sub(&x.square()).expect("x = floor(sqrt(a))");
+        return (x, r);
+    }
+
+    // a = H·B^(2l) + a₁·B^l + a₀ with B = 2^64; recurse on the (normalized)
+    // high part, then one division computes the low half of the root.
+    let l = n / 4;
+    let lbits = l as u64 * LIMB_BITS as u64;
+    let high = Nat::from_limbs(&a.limbs[2 * l..]);
+    let (s1, r1) = sqrt_rem(&high);
+    let a1 = Nat::from_limbs(&a.limbs[l..2 * l]);
+    let a0 = Nat::from_limbs(&a.limbs[..l]);
+    // (q, u) = (r₁·B^l + a₁) divmod 2·s₁; root estimate s = s₁·B^l + q.
+    let (q, u) = r1.shl(lbits).add(&a1).div_rem(&s1.shl(1)).expect("s1 > 0");
+    let mut s = s1.shl(lbits).add(&q);
+    // r = u·B^l + a₀ − q², fixed up so 0 ≤ r ≤ 2s. Both loops run O(1) times
+    // and cost only additions of half-size values — never full-width squarings.
+    let t = u.shl(lbits).add(&a0);
+    let q2 = q.square();
+    let one = Nat::one();
+    match t.checked_sub(&q2) {
+        Some(mut r) => {
+            // Rarely the estimate is one too small: while r > 2s, step s up
+            // (r −= 2s+1 with the old s). Exiting at the first r ≤ 2s makes s
+            // the floor, since r = a − s² is maintained exactly.
+            loop {
+                let d = s.shl(1);
+                if r.cmp_ref(&d) != Ordering::Greater {
+                    return (s, r);
+                }
+                r = r
+                    .checked_sub(&d)
+                    .and_then(|x| x.checked_sub(&one))
+                    .expect("r > 2s in the up-adjustment");
+                s = s.add(&one);
+            }
+        }
+        None => {
+            // Estimate too large (r < 0): while r < 0, step s down (r += 2s−1
+            // with the old s), tracked as the positive deficit q² − t.
+            let mut deficit = q2.checked_sub(&t).expect("t < q2");
+            loop {
+                let d = s
+                    .shl(1)
+                    .checked_sub(&one)
+                    .expect("s >= 1 in the down-adjustment"); // 2s − 1
+                s = s.checked_sub(&one).expect("s >= 1");
+                match d.checked_sub(&deficit) {
+                    Some(r) => return (s, r),
+                    None => {
+                        deficit = deficit.checked_sub(&d).expect("still negative");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Integer square root of a `u128` (base case of [`Nat::isqrt`]).
 fn isqrt_u128(v: u128) -> u128 {
     if v == 0 {
@@ -1550,37 +1642,24 @@ impl Nat {
 
     /// Returns the floor of the square root, `⌊√self⌋`.
     ///
-    /// Recursive "Karatsuba square root": compute the root of the top half,
-    /// scale it up as an approximation, apply one Newton correction, then adjust
-    /// exactly. Each level recurses on a half-size value, so the divisions shrink
-    /// geometrically and the total cost is `O(M(n))` — versus the `O(log n)`
-    /// full-width divisions of plain Newton. The final ±1 correction loops make
-    /// the result exact regardless of the approximation quality.
+    /// Zimmermann's "Karatsuba square root" ([`sqrt_rem`]): the divisions it
+    /// performs are half-size-by-quarter-size (rather than full-width), and the
+    /// remainder is maintained algebraically instead of via full-width squarings,
+    /// for a total cost of `O(M(n))` with small constants.
     pub fn isqrt(&self) -> Nat {
         let b = self.bit_len();
         if b <= 128 {
             return Nat::from_u128(isqrt_u128(self.to_u128().expect("<= 128 bits")));
         }
-        // Recurse on the top ~half: n1 = self >> 2c has ~b/2 bits.
-        let c = b / 4;
-        let s1 = self.shr(2 * c).isqrt();
-        let s0 = s1.shl(c); // approximation, s0 <= ⌊√self⌋
-        // One Newton step: x = (s0 + self/s0) / 2.
-        let (q, _) = self.div_rem(&s0).expect("s0 is non-zero");
-        let mut x = s0.add(&q).shr(1);
-        // Exact adjustment (each loop runs O(1) times given the error bound).
-        while x.square().cmp_ref(self) == Ordering::Greater {
-            x = x.checked_sub(&Nat::one()).expect("x >= 1");
+        // Normalize with an even left shift so the top limb is ≥ 2^62 (the
+        // recursion's precondition); `⌊√(v·4^t)⌋ >> t == ⌊√v⌋` undoes it.
+        let top = *self.limbs.last().expect("non-zero");
+        let sh = (top.leading_zeros() & !1) as u64;
+        if sh == 0 {
+            sqrt_rem(self).0
+        } else {
+            sqrt_rem(&self.shl(sh)).0.shr(sh / 2)
         }
-        loop {
-            let x1 = x.add(&Nat::one());
-            if x1.square().cmp_ref(self) != Ordering::Greater {
-                x = x1;
-            } else {
-                break;
-            }
-        }
-        x
     }
 
     /// Returns the floor of the `k`th root, `⌊self^(1/k)⌋`, for `k >= 1`, by
@@ -2744,6 +2823,46 @@ mod tests {
         let a = common.mul(&Nat::from_u64(7).pow(30));
         let b = common.mul(&Nat::from_u64(11).pow(25));
         assert_eq!(a.gcd_lehmer(&b), common);
+    }
+
+    #[test]
+    fn sqrt_rem_stress() {
+        // Floor property and exact remainder across limb counts (all n mod 4
+        // residues), random values, perfect squares, and off-by-one edges.
+        let mut state = 0x5eed_5eed_5eed_5eedu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let check = |v: &Nat| {
+            let s = v.isqrt();
+            let s2 = s.square();
+            assert!(s2.cmp_ref(v) != Ordering::Greater, "s² <= v for {v:?}");
+            let next_sq = s.add(&Nat::one()).square();
+            assert!(
+                next_sq.cmp_ref(v) == Ordering::Greater,
+                "(s+1)² > v for {v:?}"
+            );
+        };
+        for limbs in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 15, 33, 64, 130] {
+            for _ in 0..8 {
+                let bytes: Vec<u8> = (0..limbs * 8).map(|_| next() as u8).collect();
+                let v = Nat::from_bytes_le(&bytes);
+                if v.is_zero() {
+                    continue;
+                }
+                check(&v);
+                // Perfect square and its neighbours.
+                let sq = v.square();
+                assert_eq!(sq.isqrt(), v, "isqrt of a perfect square");
+                check(&sq.add(&Nat::one()));
+                if let Some(m) = sq.checked_sub(&Nat::one()) {
+                    check(&m);
+                }
+            }
+        }
     }
 
     #[test]

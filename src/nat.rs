@@ -1792,7 +1792,7 @@ impl Nat {
 
     /// Returns the floor of the square root, `⌊√self⌋`.
     ///
-    /// Zimmermann's "Karatsuba square root" ([`sqrt_rem`]): the divisions it
+    /// Zimmermann's "Karatsuba square root" (the internal `sqrt_rem`): the divisions it
     /// performs are half-size-by-quarter-size (rather than full-width), and the
     /// remainder is maintained algebraically instead of via full-width squarings,
     /// for a total cost of `O(M(n))` with small constants.

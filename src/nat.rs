@@ -557,49 +557,117 @@ fn inv_mod_2_64(x: Limb) -> Limb {
     y
 }
 
-/// Montgomery multiplication by the CIOS (Coarsely Integrated Operand Scanning)
-/// method: returns `a·b·R⁻¹ mod m` in `[0, m)`, where `R = 2^(64·m.len())` and
-/// `n0inv = −m⁻¹ mod 2^64`. Multiply and reduction are interleaved word-by-word
-/// through a single `s+2`-word accumulator, so there is no full-width product or
-/// per-step allocation. Requires an odd modulus with a non-zero top limb, and
-/// `a, b < m` (shorter inputs are zero-extended).
-#[allow(clippy::needless_range_loop)] // index drives t[j], t[j-1] and m[j] together
-fn mont_mul_cios(a: &Nat, b: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
+/// Montgomery multiplication: returns `a·b·R⁻¹ mod m` in `[0, m)`, where
+/// `R = 2^(64·m.len())` and `n0inv = −m⁻¹ mod 2^64`. Computes the full
+/// double-width product with the fast addmul_2 schoolbook (or the sub-quadratic
+/// dispatcher for large moduli), then reduces it in place with paired REDC
+/// steps. Requires an odd modulus with a non-zero top limb and `a, b < m`.
+fn mont_mul(a: &Nat, b: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
     let s = m.len();
-    // Zero-pad `b` to exactly s limbs once, so the hot inner loop is a plain
-    // bounds-check-free zip instead of a checked `get` per limb product.
-    let mut bb: Vec<Limb> = Vec::with_capacity(s);
-    bb.extend_from_slice(&b.limbs);
-    bb.resize(s, 0);
-    let mut t = alloc::vec![0u64; s + 2];
-    for i in 0..s {
-        // t += a[i]·b
-        let ai = a.limbs.get(i).copied().unwrap_or(0) as u128;
-        let mut carry: u128 = 0;
-        for (tj, &bj) in t[..s].iter_mut().zip(&bb) {
-            let sum = *tj as u128 + ai * bj as u128 + carry;
+    let mut t = alloc::vec![0 as Limb; 2 * s + 2];
+    if s < KARATSUBA_THRESHOLD {
+        // Zero-pad `b` to exactly s limbs so the row length is fixed; `a` keeps
+        // its natural length (short operands skip whole rows).
+        let mut bb: Vec<Limb> = Vec::with_capacity(s);
+        bb.extend_from_slice(&b.limbs);
+        bb.resize(s, 0);
+        let la = a.limbs.len();
+        mul_into_schoolbook(&a.limbs, &bb, &mut t[..la + s]);
+    } else {
+        let p = a.mul(b);
+        t[..p.limbs.len()].copy_from_slice(&p.limbs);
+    }
+    redc_in_place(&mut t, m, n0inv);
+    mont_extract(t, s, m)
+}
+
+/// In-place Montgomery reduction of the double-width value in `t` (at least
+/// `2s + 2` limbs): performs the `s` word-level REDC steps two at a time
+/// through the addmul_2 kernel (half the passes over memory, two independent
+/// limb products in flight), leaving `t / B^s < 2m` in `t[s..]`.
+fn redc_in_place(t: &mut [Limb], m: &[Limb], n0inv: Limb) {
+    use crate::limb::DLimb;
+    let s = m.len();
+    debug_assert!(t.len() >= 2 * s + 2, "REDC needs a double-width buffer");
+    let mut i = 0;
+    while i + 2 <= s {
+        // q0 zeroes limb i. After q0·m lands, limb i+1 holds
+        // t[i+1] + carry(position i) + lo(q0·m[1]); q1 zeroes that.
+        let q0 = t[i].wrapping_mul(n0inv);
+        let c0 = (t[i] as DLimb + q0 as DLimb * m[0] as DLimb) >> LIMB_BITS;
+        let t1 = t[i + 1]
+            .wrapping_add(c0 as Limb)
+            .wrapping_add((q0 as DLimb * m[1] as DLimb) as Limb);
+        let q1 = t1.wrapping_mul(n0inv);
+        // t[i..] += (q0 + q1·B)·m: the paired-row kernel of
+        // [`mul_into_schoolbook`], with a carry ripple above the row.
+        let mut ph0: Limb = 0;
+        let mut pl1: Limb = 0;
+        let mut ph1: Limb = 0;
+        let mut ph1p: Limb = 0;
+        let mut carry: Limb = 0;
+        let (row, rest) = t[i..].split_at_mut(s);
+        for (o, &mj) in row.iter_mut().zip(m) {
+            let p0 = q0 as DLimb * mj as DLimb;
+            let p1 = q1 as DLimb * mj as DLimb;
+            let acc = *o as DLimb
+                + (p0 as Limb) as DLimb
+                + ph0 as DLimb
+                + pl1 as DLimb
+                + ph1p as DLimb
+                + carry as DLimb;
+            *o = acc as Limb;
+            carry = (acc >> LIMB_BITS) as Limb;
+            ph0 = (p0 >> LIMB_BITS) as Limb;
+            ph1p = ph1;
+            pl1 = p1 as Limb;
+            ph1 = (p1 >> LIMB_BITS) as Limb;
+        }
+        // Flush the pipeline into the two limbs above the row, then ripple.
+        let acc = rest[0] as DLimb + ph0 as DLimb + pl1 as DLimb + ph1p as DLimb + carry as DLimb;
+        rest[0] = acc as Limb;
+        let acc2 = rest[1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
+        rest[1] = acc2 as Limb;
+        let mut carry = (acc2 >> LIMB_BITS) as Limb;
+        for o in rest[2..].iter_mut() {
+            if carry == 0 {
+                break;
+            }
+            let sum = *o as DLimb + carry as DLimb;
+            *o = sum as Limb;
+            carry = (sum >> LIMB_BITS) as Limb;
+        }
+        debug_assert_eq!(carry, 0, "REDC carry escaped the buffer");
+        i += 2;
+    }
+    if i < s {
+        // Odd tail: one classic single REDC row.
+        let mi = t[i].wrapping_mul(n0inv) as DLimb;
+        let mut carry: DLimb = 0;
+        let (row, rest) = t[i..].split_at_mut(s);
+        for (tj, &mj) in row.iter_mut().zip(m) {
+            let sum = *tj as DLimb + mi * mj as DLimb + carry;
             *tj = sum as Limb;
             carry = sum >> LIMB_BITS;
         }
-        let sum = t[s] as u128 + carry;
-        t[s] = sum as Limb;
-        t[s + 1] = (sum >> LIMB_BITS) as Limb;
-
-        // Reduce one word: t += (t[0]·n0inv)·m, then shift right by one word.
-        let mi = t[0].wrapping_mul(n0inv) as u128;
-        let mut carry = (t[0] as u128 + mi * m[0] as u128) >> LIMB_BITS; // low word → 0
-        for j in 1..s {
-            let sum = t[j] as u128 + mi * m[j] as u128 + carry;
-            t[j - 1] = sum as Limb;
-            carry = sum >> LIMB_BITS;
+        let mut carry = carry as Limb;
+        for tj in rest.iter_mut() {
+            if carry == 0 {
+                break;
+            }
+            let sum = *tj as DLimb + carry as DLimb;
+            *tj = sum as Limb;
+            carry = (sum >> LIMB_BITS) as Limb;
         }
-        let sum = t[s] as u128 + carry;
-        t[s - 1] = sum as Limb;
-        t[s] = t[s + 1].wrapping_add((sum >> LIMB_BITS) as Limb);
+        debug_assert_eq!(carry, 0, "REDC carry escaped the buffer");
     }
-    // t holds an `s+1`-word value < 2m; one conditional subtraction canonicalizes.
+}
+
+/// Extracts the REDC result from `t[s..]` (a value `< 2m`), applying the one
+/// conditional subtraction that brings it into `[0, m)`.
+fn mont_extract(t: Vec<Limb>, s: usize, m: &[Limb]) -> Nat {
     let mut result = Nat {
-        limbs: t[..=s].to_vec(),
+        limbs: t[s..].to_vec(),
     };
     result.normalize();
     let m_nat = Nat { limbs: m.to_vec() };
@@ -687,49 +755,20 @@ fn sqr_into(a: &[Limb], t: &mut [Limb]) {
 }
 
 /// Montgomery squaring: returns `a²·R⁻¹ mod m` in `[0, m)` (same contract as
-/// [`mont_mul_cios`] with both operands equal). Computes the full double-width
-/// square with the fast symmetric squaring, then reduces it in place with `s`
-/// word-level REDC steps — about 25% fewer limb multiplications than the
-/// general interleaved CIOS product.
+/// [`mont_mul`] with both operands equal). Computes the full double-width
+/// square with the fast symmetric squaring — about half the limb products of a
+/// general multiply — then reduces it in place with paired REDC steps.
 fn mont_sqr(a: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
     let s = m.len();
-    let mut t = alloc::vec![0 as Limb; 2 * s + 1];
+    let mut t = alloc::vec![0 as Limb; 2 * s + 2];
     if a.limbs.len() < KARATSUBA_THRESHOLD {
         sqr_into(&a.limbs, &mut t);
     } else {
         let sq = a.square();
         t[..sq.limbs.len()].copy_from_slice(&sq.limbs);
     }
-    for i in 0..s {
-        // Zero word i: t += (t[i]·n0inv)·m·B^i.
-        let mi = t[i].wrapping_mul(n0inv) as u128;
-        let mut carry: u128 = 0;
-        let (row, rest) = t[i..].split_at_mut(s);
-        for (tj, &mj) in row.iter_mut().zip(m) {
-            let sum = *tj as u128 + mi * mj as u128 + carry;
-            *tj = sum as Limb;
-            carry = sum >> LIMB_BITS;
-        }
-        for tj in rest.iter_mut() {
-            if carry == 0 {
-                break;
-            }
-            let sum = *tj as u128 + carry;
-            *tj = sum as Limb;
-            carry = sum >> LIMB_BITS;
-        }
-        debug_assert_eq!(carry, 0, "REDC carry escaped the buffer");
-    }
-    // t / B^s is an (s+1)-word value < 2m; one conditional subtraction.
-    let mut result = Nat {
-        limbs: t[s..].to_vec(),
-    };
-    result.normalize();
-    let m_nat = Nat { limbs: m.to_vec() };
-    if result.cmp_ref(&m_nat) != Ordering::Less {
-        result = result.checked_sub(&m_nat).expect("result < 2m");
-    }
-    result
+    redc_in_place(&mut t, m, n0inv);
+    mont_extract(t, s, m)
 }
 
 /// Adds the limbs of `val` into `out` starting at limb `offset`, propagating the
@@ -2119,24 +2158,24 @@ impl Nat {
         let n0inv = inv_mod_2_64(m[0]).wrapping_neg(); // −m⁻¹ mod 2^64
 
         // R = 2^(64k); R² mod m converts a residue into Montgomery form via one
-        // CIOS multiply. `1` in Montgomery form is R mod m = CIOS(1, R²).
+        // Montgomery multiply. `1` in Montgomery form is R mod m = mont_mul(1, R²).
         let r = Nat::one().shl(k as u64 * LIMB_BITS as u64);
         let r2 = r.mul(&r).div_rem(modulus).expect("non-zero").1;
 
         let base_mod = self.div_rem(modulus).expect("non-zero").1;
-        let base = mont_mul_cios(&base_mod, &r2, m, n0inv);
-        let one_mont = mont_mul_cios(&Nat::one(), &r2, m, n0inv);
+        let base = mont_mul(&base_mod, &r2, m, n0inv);
+        let one_mont = mont_mul(&Nat::one(), &r2, m, n0inv);
         // The windowed ladder squares via `mulmod(&r, &r)`; detect that aliasing
         // and take the cheaper dedicated Montgomery squaring.
         let result = modpow_windowed(base, one_mont, exp, |a, b| {
             if core::ptr::eq(a, b) {
                 mont_sqr(a, m, n0inv)
             } else {
-                mont_mul_cios(a, b, m, n0inv)
+                mont_mul(a, b, m, n0inv)
             }
         });
-        // Back out of Montgomery form: value = CIOS(result, 1).
-        mont_mul_cios(&result, &Nat::one(), m, n0inv)
+        // Back out of Montgomery form: value = mont_mul(result, 1).
+        mont_mul(&result, &Nat::one(), m, n0inv)
     }
 
     /// Returns the smallest prime strictly greater than `self`, found by

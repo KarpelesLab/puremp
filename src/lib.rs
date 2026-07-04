@@ -128,6 +128,9 @@ mod poly_factor;
 #[cfg(feature = "lattice")]
 pub mod lattice;
 
+#[cfg(feature = "dlog")]
+pub mod dlog;
+
 #[cfg(feature = "algebraic")]
 pub mod quadratic;
 
@@ -189,6 +192,9 @@ pub use matrix::Matrix;
 
 #[cfg(feature = "lattice")]
 pub use lattice::{lll_reduce, lll_reduce_delta};
+
+#[cfg(feature = "dlog")]
+pub use dlog::{bsgs, discrete_log, pollard_rho};
 
 #[cfg(feature = "algebraic")]
 pub use algebraic::Algebraic;

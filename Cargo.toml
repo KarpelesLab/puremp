@@ -51,6 +51,9 @@ poly = ["alloc"]
 matrix = ["alloc"]
 # LLL lattice basis reduction over integer lattices (exact rational Gram-Schmidt).
 lattice = ["rational"]
+# Discrete logarithms modulo n (baby-step giant-step + Pollard's rho). Built on
+# `Int`/`ModInt`.
+dlog = ["int"]
 # Optional arbitrary-precision binary floats (`Float`) with directed rounding,
 # aiming at MPFR-class correct rounding. Built on `Int`/`Rational` (decimal I/O
 # reuses exact rationals), but NOT part of the integer/rational core contract.

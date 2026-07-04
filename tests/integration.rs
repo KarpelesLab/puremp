@@ -4,7 +4,7 @@
 //! another arbitrary-precision tool). No arithmetic oracle crate is used — the
 //! crate ships no foreign code, and the same discipline extends to its tests.
 
-use puremp::{Int, Nat, Rational, Sign};
+use puremp::{Int, Nat, Rational, SeedRng, Sign};
 
 fn nat(s: &str) -> Nat {
     s.parse().expect("valid natural literal")
@@ -701,31 +701,70 @@ fn primality_testing() {
 
 #[test]
 fn next_prime_works() {
-    use puremp::RandomSource;
-    struct Lcg(u64);
-    impl RandomSource for Lcg {
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
-            for b in dest.iter_mut() {
-                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *b = (self.0 >> 33) as u8;
-            }
-        }
-    }
-    let mut rng = Lcg(12345);
-    assert_eq!(int("0").next_prime(&mut rng).to_string(), "2");
-    assert_eq!(int("2").next_prime(&mut rng).to_string(), "3");
-    assert_eq!(int("7").next_prime(&mut rng).to_string(), "11");
-    assert_eq!(int("100").next_prime(&mut rng).to_string(), "101");
+    // Deterministic (Baillie–PSW); no RNG.
+    assert_eq!(int("0").next_prime().to_string(), "2");
+    assert_eq!(int("2").next_prime().to_string(), "3");
+    assert_eq!(int("7").next_prime().to_string(), "11");
+    assert_eq!(int("100").next_prime().to_string(), "101");
     // Next prime after a large power of ten (10^30 + 57 is the known answer).
-    let p = int("1000000000000000000000000000000").next_prime(&mut rng);
+    let p = int("1000000000000000000000000000000").next_prime();
     assert_eq!(p.to_string(), "1000000000000000000000000000057");
-    assert!(p.magnitude().is_probable_prime(40, &mut rng));
+    assert!(p.is_prime_bpsw());
 
     // prev_prime
-    assert_eq!(int("11").prev_prime(&mut rng).unwrap().to_string(), "7");
-    assert_eq!(int("3").prev_prime(&mut rng).unwrap().to_string(), "2");
-    assert!(int("2").prev_prime(&mut rng).is_none());
-    assert_eq!(int("100").prev_prime(&mut rng).unwrap().to_string(), "97");
+    assert_eq!(int("11").prev_prime().unwrap().to_string(), "7");
+    assert_eq!(int("3").prev_prime().unwrap().to_string(), "2");
+    assert!(int("2").prev_prime().is_none());
+    assert_eq!(int("100").prev_prime().unwrap().to_string(), "97");
+}
+
+#[test]
+fn number_theory_helpers() {
+    // FactorInteger[360] = {{2,3},{3,2},{5,1}}
+    assert_eq!(
+        int("360")
+            .factor_exponents()
+            .iter()
+            .map(|(p, e)| (p.to_string(), *e))
+            .collect::<Vec<_>>(),
+        vec![("2".into(), 3u32), ("3".into(), 2), ("5".into(), 1)]
+    );
+    // EulerPhi
+    assert_eq!(int("1").euler_phi().to_string(), "1");
+    assert_eq!(int("36").euler_phi().to_string(), "12");
+    assert_eq!(int("1000000").euler_phi().to_string(), "400000");
+    // Divisors[28] = {1,2,4,7,14,28}
+    assert_eq!(
+        int("28")
+            .divisors()
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>(),
+        vec!["1", "2", "4", "7", "14", "28"]
+    );
+    // DivisorSigma
+    assert_eq!(int("28").divisor_count().to_string(), "6"); // σ₀
+    assert_eq!(int("28").divisor_sigma(1).to_string(), "56"); // perfect number
+    assert_eq!(int("6").divisor_sigma(2).to_string(), "50"); // 1+4+9+36
+    // MoebiusMu
+    assert_eq!(int("1").moebius_mu(), 1);
+    assert_eq!(int("30").moebius_mu(), -1); // 2·3·5, ω=3
+    assert_eq!(int("6").moebius_mu(), 1); // 2·3, ω=2
+    assert_eq!(int("12").moebius_mu(), 0); // 2²·3
+    // radical (square-free kernel)
+    assert_eq!(int("360").radical().to_string(), "30"); // 2·3·5
+    assert_eq!(int("1").radical().to_string(), "1");
+}
+
+#[test]
+fn seed_rng_reproducible() {
+    // Seedable, no host entropy; same seed → same prime (reproducible).
+    let p1 = Int::random_prime(64, &mut SeedRng::new(42));
+    let p2 = Int::random_prime(64, &mut SeedRng::new(42));
+    assert_eq!(p1, p2);
+    assert!(p1.is_prime_bpsw());
+    assert_eq!(p1.bit_len(), 64);
+    assert_ne!(p1, Int::random_prime(64, &mut SeedRng::new(43)));
 }
 
 #[test]

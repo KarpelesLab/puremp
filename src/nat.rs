@@ -2304,8 +2304,9 @@ impl Nat {
     }
 
     /// Returns the smallest prime strictly greater than `self`, found by
-    /// scanning odd candidates with the Miller–Rabin test.
-    pub fn next_prime(&self, rng: &mut impl crate::random::RandomSource) -> Nat {
+    /// scanning odd candidates with the deterministic Baillie–PSW test. No RNG
+    /// needed.
+    pub fn next_prime(&self) -> Nat {
         let two = Nat::from_u64(2);
         if self.cmp_ref(&two) == Ordering::Less {
             return two; // next prime after 0 or 1
@@ -2315,7 +2316,7 @@ impl Nat {
             c = c.add(&Nat::one()); // start at an odd candidate ≥ 3
         }
         loop {
-            if c.is_probable_prime(40, rng) {
+            if c.is_prime_bpsw() {
                 return c;
             }
             c = c.add(&two);
@@ -2323,8 +2324,8 @@ impl Nat {
     }
 
     /// Returns the largest prime strictly less than `self`, or `None` if there
-    /// is none (`self <= 2`).
-    pub fn prev_prime(&self, rng: &mut impl crate::random::RandomSource) -> Option<Nat> {
+    /// is none (`self <= 2`). Uses the deterministic Baillie–PSW test; no RNG.
+    pub fn prev_prime(&self) -> Option<Nat> {
         let two = Nat::from_u64(2);
         if self.cmp_ref(&two) != Ordering::Greater {
             return None;
@@ -2340,7 +2341,7 @@ impl Nat {
             if c.cmp_ref(&two) == Ordering::Less {
                 return Some(two);
             }
-            if c.is_probable_prime(40, rng) {
+            if c.is_prime_bpsw() {
                 return Some(c);
             }
             c = c.checked_sub(&two).unwrap_or_else(Nat::zero);

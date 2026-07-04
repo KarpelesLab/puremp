@@ -537,6 +537,114 @@ impl Int {
             .collect()
     }
 
+    /// Prime factorization of `|self|` as `(prime, exponent)` pairs, sorted by
+    /// prime (empty for `0`/`±1`). This is Mathematica's `FactorInteger`.
+    pub fn factor_exponents(&self) -> alloc::vec::Vec<(Int, u32)> {
+        let mut out: alloc::vec::Vec<(Int, u32)> = alloc::vec::Vec::new();
+        for p in self.factorize() {
+            match out.last_mut() {
+                Some((q, e)) if *q == p => *e += 1,
+                _ => out.push((p, 1)),
+            }
+        }
+        out
+    }
+
+    /// Euler's totient `φ(|self|)`: the count of integers in `[1, n]` coprime to
+    /// `n`, via `∏ pᵢ^{eᵢ−1}·(pᵢ−1)`. `φ(1) = 1`; `φ(0) = 0` by convention.
+    pub fn euler_phi(&self) -> Int {
+        if self.is_zero() {
+            return Int::ZERO;
+        }
+        let mut phi = Int::ONE;
+        for (p, e) in self.factor_exponents() {
+            phi = phi.mul(&p.pow(e - 1)).mul(&p.sub(&Int::ONE));
+        }
+        phi
+    }
+
+    /// The positive divisors of `|self|`, sorted ascending (empty for `0`;
+    /// `[1]` for `±1`).
+    pub fn divisors(&self) -> alloc::vec::Vec<Int> {
+        if self.is_zero() {
+            return alloc::vec::Vec::new();
+        }
+        let mut divs = alloc::vec![Int::ONE];
+        for (p, e) in self.factor_exponents() {
+            let base = divs.clone();
+            let mut pk = Int::ONE;
+            for _ in 0..e {
+                pk = pk.mul(&p);
+                for d in &base {
+                    divs.push(d.mul(&pk));
+                }
+            }
+        }
+        divs.sort();
+        divs
+    }
+
+    /// Number of positive divisors, `∏(eᵢ+1)` — Mathematica's `DivisorSigma[0,n]`
+    /// / `DivisorCount`. `0` for `self == 0`.
+    pub fn divisor_count(&self) -> Int {
+        if self.is_zero() {
+            return Int::ZERO;
+        }
+        let mut c = Int::ONE;
+        for (_, e) in self.factor_exponents() {
+            c = c.mul(&Int::from_i64((e + 1) as i64));
+        }
+        c
+    }
+
+    /// Divisor function `σₖ(n) = Σ_{d|n} dᵏ` — Mathematica's `DivisorSigma[k,n]`.
+    /// `σ₀` is the divisor count, `σ₁` the sum of divisors. `0` for `self == 0`.
+    pub fn divisor_sigma(&self, k: u32) -> Int {
+        if self.is_zero() {
+            return Int::ZERO;
+        }
+        if k == 0 {
+            return self.divisor_count();
+        }
+        let mut sigma = Int::ONE;
+        for (p, e) in self.factor_exponents() {
+            // Σ_{j=0}^{e} p^{jk} = (p^{k(e+1)} − 1) / (p^k − 1).
+            let pk = p.pow(k);
+            let num = pk.pow(e + 1).sub(&Int::ONE);
+            sigma = sigma.mul(&num.div_trunc(&pk.sub(&Int::ONE)));
+        }
+        sigma
+    }
+
+    /// Möbius function `μ(n)`: `0` if `n` is divisible by a square `> 1`, else
+    /// `(−1)^ω` where `ω` is the number of distinct primes. `μ(1) = 1`; `μ(0) = 0`.
+    pub fn moebius_mu(&self) -> i32 {
+        if self.is_zero() {
+            return 0;
+        }
+        let mut sign = 1i32;
+        for (_, e) in self.factor_exponents() {
+            if e > 1 {
+                return 0;
+            }
+            sign = -sign;
+        }
+        sign
+    }
+
+    /// The radical (square-free kernel) of `|self|`: the product of its distinct
+    /// prime factors. `rad(1) = 1`; `rad(0) = 0`.
+    pub fn radical(&self) -> Int {
+        if self.is_zero() {
+            return Int::ZERO;
+        }
+        let mut r = Int::ONE;
+        for (p, _) in self.factor_exponents() {
+            r = r.mul(&p);
+        }
+        r
+    }
+
     /// Generates a uniformly random prime with exactly `bits` bits (`bits >= 2`),
     /// verified with Baillie–PSW.
     pub fn random_prime(bits: u32, rng: &mut impl crate::random::RandomSource) -> Int {
@@ -560,20 +668,21 @@ impl Int {
     }
 
     /// Returns the smallest prime strictly greater than `self` (at least 2).
-    pub fn next_prime(&self, rng: &mut impl crate::random::RandomSource) -> Int {
+    /// Deterministic (Baillie–PSW); no RNG needed.
+    pub fn next_prime(&self) -> Int {
         if self < &Int::from_i64(2) {
             return Int::from_i64(2);
         }
-        Int::from(self.magnitude().next_prime(rng))
+        Int::from(self.magnitude().next_prime())
     }
 
     /// Returns the largest prime strictly less than `self`, or `None` if there
-    /// is none (`self <= 2`).
-    pub fn prev_prime(&self, rng: &mut impl crate::random::RandomSource) -> Option<Int> {
+    /// is none (`self <= 2`). Deterministic (Baillie–PSW); no RNG needed.
+    pub fn prev_prime(&self) -> Option<Int> {
         if self <= &Int::from_i64(2) {
             return None;
         }
-        self.magnitude().prev_prime(rng).map(Int::from)
+        self.magnitude().prev_prime().map(Int::from)
     }
 
     /// Extended GCD: returns `(g, x, y)` with `g == self·x + b·y` and `g ≥ 0`.

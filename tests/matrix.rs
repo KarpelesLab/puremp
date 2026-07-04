@@ -76,8 +76,8 @@ fn fraction_free_inverse_solve_with_pivots() {
     // A·x == b
     for i in 0..3 {
         let mut acc = Rational::ZERO;
-        for j in 0..3 {
-            acc = acc.add(&m.get(i, j).mul(&x[j]));
+        for (j, xj) in x.iter().enumerate() {
+            acc = acc.add(&m.get(i, j).mul(xj));
         }
         assert_eq!(acc, Rational::from((i + 1) as i64));
     }

@@ -180,11 +180,6 @@ available drafts) is the umbrella reference for much of this list.
   converging steps; a large implicit constant means it *complements* binary
   splitting, winning only at very high precision. Brent (1976); Borwein & Borwein,
   *Pi and the AGM*; MCA §4.8.
-- **Half-GCD** for subquadratic `Rational` reduction — a recursive 2×2 cofactor
-  matrix HGCD, `O(M(n)·log n)` vs. the current `~O(n²)` Lehmer. The canonical
-  clean-room reference is Möller's left-to-right variant (its stop condition
-  removes the back-up steps, "much simpler to implement"); only wins at very large
-  operand sizes. Möller, *Math. Comp.* 77 (2008); MCA §1.6.
 
 **Candidate new capabilities** (new operations / types):
 

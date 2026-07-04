@@ -470,19 +470,22 @@ fn inv_mod_2_64(x: Limb) -> Limb {
 /// through a single `s+2`-word accumulator, so there is no full-width product or
 /// per-step allocation. Requires an odd modulus with a non-zero top limb, and
 /// `a, b < m` (shorter inputs are zero-extended).
-#[allow(clippy::needless_range_loop)] // index drives t[j], t[j-1], m[j] and the padded b[j] together
+#[allow(clippy::needless_range_loop)] // index drives t[j], t[j-1] and m[j] together
 fn mont_mul_cios(a: &Nat, b: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
     let s = m.len();
-    let ga = |i: usize| a.limbs.get(i).copied().unwrap_or(0) as u128;
-    let gb = |i: usize| b.limbs.get(i).copied().unwrap_or(0) as u128;
+    // Zero-pad `b` to exactly s limbs once, so the hot inner loop is a plain
+    // bounds-check-free zip instead of a checked `get` per limb product.
+    let mut bb: Vec<Limb> = Vec::with_capacity(s);
+    bb.extend_from_slice(&b.limbs);
+    bb.resize(s, 0);
     let mut t = alloc::vec![0u64; s + 2];
     for i in 0..s {
         // t += a[i]·b
-        let ai = ga(i);
+        let ai = a.limbs.get(i).copied().unwrap_or(0) as u128;
         let mut carry: u128 = 0;
-        for j in 0..s {
-            let sum = t[j] as u128 + ai * gb(j) + carry;
-            t[j] = sum as Limb;
+        for (tj, &bj) in t[..s].iter_mut().zip(&bb) {
+            let sum = *tj as u128 + ai * bj as u128 + carry;
+            *tj = sum as Limb;
             carry = sum >> LIMB_BITS;
         }
         let sum = t[s] as u128 + carry;
@@ -504,6 +507,129 @@ fn mont_mul_cios(a: &Nat, b: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
     // t holds an `s+1`-word value < 2m; one conditional subtraction canonicalizes.
     let mut result = Nat {
         limbs: t[..=s].to_vec(),
+    };
+    result.normalize();
+    let m_nat = Nat { limbs: m.to_vec() };
+    if result.cmp_ref(&m_nat) != Ordering::Less {
+        result = result.checked_sub(&m_nat).expect("result < 2m");
+    }
+    result
+}
+
+/// Schoolbook squaring of `a` into the zeroed buffer `t` (`t.len() >= 2·a.len()`):
+/// accumulate the strictly-upper triangle of cross products, then double it and
+/// add the diagonal `aᵢ²` terms in one fused carry pass.
+///
+/// Triangle rows are processed two at a time (the same `addmul_2` shape as
+/// [`Nat::mul_schoolbook`]): rows `i` and `i+1` share the tail `a[i+2..]`, so
+/// `t += (aᵢ + aᵢ₊₁·2^64)·a[i+2..]` plus the lone `aᵢ·aᵢ₊₁` product.
+fn sqr_into(a: &[Limb], t: &mut [Limb]) {
+    use crate::limb::DLimb;
+    let n = a.len();
+    if n == 0 {
+        return;
+    }
+    let mut i = 0;
+    while i + 2 <= n {
+        let (a0, a1) = (a[i], a[i + 1]);
+        // The lone cross product aᵢ·aᵢ₊₁ sits at position 2i+1.
+        let p = a0 as DLimb * a1 as DLimb;
+        add_at(t, 2 * i + 1, &[p as Limb, (p >> LIMB_BITS) as Limb]);
+        // Both rows' shared tail a[i+2..] lands at base position 2i+2.
+        let b = &a[i + 2..];
+        let rn = b.len();
+        let mut ph0: Limb = 0;
+        let mut pl1: Limb = 0;
+        let mut ph1: Limb = 0;
+        let mut ph1p: Limb = 0;
+        let mut carry: Limb = 0;
+        let row = &mut t[2 * i + 2..i + n + 2];
+        for (o, &bj) in row.iter_mut().zip(b) {
+            let p0 = a0 as DLimb * bj as DLimb;
+            let p1 = a1 as DLimb * bj as DLimb;
+            let acc = *o as DLimb
+                + (p0 as Limb) as DLimb
+                + ph0 as DLimb
+                + pl1 as DLimb
+                + ph1p as DLimb
+                + carry as DLimb;
+            *o = acc as Limb;
+            carry = (acc >> LIMB_BITS) as Limb;
+            ph0 = (p0 >> LIMB_BITS) as Limb;
+            ph1p = ph1;
+            pl1 = p1 as Limb;
+            ph1 = (p1 >> LIMB_BITS) as Limb;
+        }
+        if rn > 0 {
+            let acc =
+                row[rn] as DLimb + ph0 as DLimb + pl1 as DLimb + ph1p as DLimb + carry as DLimb;
+            row[rn] = acc as Limb;
+            let top = row[rn + 1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
+            row[rn + 1] = top as Limb;
+            debug_assert_eq!(top >> LIMB_BITS, 0, "square top carry escaped");
+        }
+        i += 2;
+    }
+    // Fused finish: t[k] = 2·cross[k] + diagonal, one carry pass over 2n limbs.
+    let mut hi_bit: Limb = 0;
+    let mut carry: DLimb = 0;
+    for (k, tk) in t[..2 * n].iter_mut().enumerate() {
+        let c = *tk;
+        let doubled = (c << 1) | hi_bit;
+        hi_bit = c >> (LIMB_BITS - 1);
+        // Diagonal aᵢ² contributes its low limb at 2i, high limb at 2i+1.
+        let ai = a[k / 2];
+        let sq = ai as DLimb * ai as DLimb;
+        let add = if k & 1 == 0 {
+            sq as Limb
+        } else {
+            (sq >> LIMB_BITS) as Limb
+        };
+        let sum = doubled as DLimb + add as DLimb + carry;
+        *tk = sum as Limb;
+        carry = sum >> LIMB_BITS;
+    }
+    debug_assert_eq!(carry, 0, "square carry escaped the buffer");
+    debug_assert_eq!(hi_bit, 0, "square doubling bit escaped the buffer");
+}
+
+/// Montgomery squaring: returns `a²·R⁻¹ mod m` in `[0, m)` (same contract as
+/// [`mont_mul_cios`] with both operands equal). Computes the full double-width
+/// square with the fast symmetric squaring, then reduces it in place with `s`
+/// word-level REDC steps — about 25% fewer limb multiplications than the
+/// general interleaved CIOS product.
+fn mont_sqr(a: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
+    let s = m.len();
+    let mut t = alloc::vec![0 as Limb; 2 * s + 1];
+    if a.limbs.len() < KARATSUBA_THRESHOLD {
+        sqr_into(&a.limbs, &mut t);
+    } else {
+        let sq = a.square();
+        t[..sq.limbs.len()].copy_from_slice(&sq.limbs);
+    }
+    for i in 0..s {
+        // Zero word i: t += (t[i]·n0inv)·m·B^i.
+        let mi = t[i].wrapping_mul(n0inv) as u128;
+        let mut carry: u128 = 0;
+        let (row, rest) = t[i..].split_at_mut(s);
+        for (tj, &mj) in row.iter_mut().zip(m) {
+            let sum = *tj as u128 + mi * mj as u128 + carry;
+            *tj = sum as Limb;
+            carry = sum >> LIMB_BITS;
+        }
+        for tj in rest.iter_mut() {
+            if carry == 0 {
+                break;
+            }
+            let sum = *tj as u128 + carry;
+            *tj = sum as Limb;
+            carry = sum >> LIMB_BITS;
+        }
+        debug_assert_eq!(carry, 0, "REDC carry escaped the buffer");
+    }
+    // t / B^s is an (s+1)-word value < 2m; one conditional subtraction.
+    let mut result = Nat {
+        limbs: t[s..].to_vec(),
     };
     result.normalize();
     let m_nat = Nat { limbs: m.to_vec() };
@@ -921,11 +1047,8 @@ impl Nat {
                 ph1 = (p1 >> LIMB_BITS) as Limb;
             }
             // Flush the pipeline into the two limbs above the row.
-            let acc = row[rn] as DLimb
-                + ph0 as DLimb
-                + pl1 as DLimb
-                + ph1p as DLimb
-                + carry as DLimb;
+            let acc =
+                row[rn] as DLimb + ph0 as DLimb + pl1 as DLimb + ph1p as DLimb + carry as DLimb;
             row[rn] = acc as Limb;
             let top = row[rn + 1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
             row[rn + 1] = top as Limb;
@@ -962,88 +1085,13 @@ impl Nat {
         }
     }
 
-    /// Symmetric schoolbook squaring: accumulate the strictly-upper triangle of
-    /// cross products once, double it, then add the diagonal `aᵢ²` terms.
-    ///
-    /// Triangle rows are processed two at a time (the same `addmul_2` shape as
-    /// [`Nat::mul_schoolbook`]): rows `i` and `i+1` share the tail `a[i+2..]`,
-    /// so `cross += (aᵢ + aᵢ₊₁·2^64)·a[i+2..]` plus the lone `aᵢ·aᵢ₊₁` product.
+    /// Symmetric schoolbook squaring (see [`sqr_into`]).
     fn square_schoolbook(&self) -> Nat {
-        use crate::limb::DLimb;
-        let a = &self.limbs;
-        let n = a.len();
-        let mut cross = alloc::vec![0 as Limb; 2 * n];
-        let mut i = 0;
-        while i + 2 <= n {
-            let (a0, a1) = (a[i], a[i + 1]);
-            // The lone cross product aᵢ·aᵢ₊₁ sits at position 2i+1.
-            let p = a0 as DLimb * a1 as DLimb;
-            add_at(&mut cross, 2 * i + 1, &[p as Limb, (p >> LIMB_BITS) as Limb]);
-            // Both rows' shared tail a[i+2..] lands at base position 2i+2.
-            let b = &a[i + 2..];
-            let rn = b.len();
-            let mut ph0: Limb = 0;
-            let mut pl1: Limb = 0;
-            let mut ph1: Limb = 0;
-            let mut ph1p: Limb = 0;
-            let mut carry: Limb = 0;
-            let row = &mut cross[2 * i + 2..i + n + 2];
-            for (o, &bj) in row.iter_mut().zip(b) {
-                let p0 = a0 as DLimb * bj as DLimb;
-                let p1 = a1 as DLimb * bj as DLimb;
-                let acc = *o as DLimb
-                    + (p0 as Limb) as DLimb
-                    + ph0 as DLimb
-                    + pl1 as DLimb
-                    + ph1p as DLimb
-                    + carry as DLimb;
-                *o = acc as Limb;
-                carry = (acc >> LIMB_BITS) as Limb;
-                ph0 = (p0 >> LIMB_BITS) as Limb;
-                ph1p = ph1;
-                pl1 = p1 as Limb;
-                ph1 = (p1 >> LIMB_BITS) as Limb;
-            }
-            if rn > 0 {
-                let acc = row[rn] as DLimb
-                    + ph0 as DLimb
-                    + pl1 as DLimb
-                    + ph1p as DLimb
-                    + carry as DLimb;
-                row[rn] = acc as Limb;
-                let top = row[rn + 1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
-                row[rn + 1] = top as Limb;
-                debug_assert_eq!(top >> LIMB_BITS, 0, "square top carry escaped");
-            }
-            i += 2;
-        }
-        let mut result = {
-            let mut c = Nat { limbs: cross };
-            c.normalize();
-            c.shl(1) // 2·(sum of cross products)
-        };
-
-        // Add the diagonal squares aᵢ² at position 2i.
-        let mut diag = alloc::vec![0 as Limb; 2 * n];
-        for i in 0..n {
-            let sq = self.limbs[i] as u128 * self.limbs[i] as u128;
-            let (lo, hi) = (sq as Limb, (sq >> LIMB_BITS) as Limb);
-            let (s0, c0) = adc(diag[2 * i], lo, 0);
-            diag[2 * i] = s0;
-            let (s1, mut carry) = adc(diag[2 * i + 1], hi, c0);
-            diag[2 * i + 1] = s1;
-            let mut k = 2 * i + 2;
-            while carry != 0 && k < 2 * n {
-                let (s, c) = adc(diag[k], 0, carry);
-                diag[k] = s;
-                carry = c;
-                k += 1;
-            }
-        }
-        let mut diag = Nat { limbs: diag };
-        diag.normalize();
-        result = result.add(&diag);
-        result
+        let mut out = alloc::vec![0 as Limb; 2 * self.limbs.len()];
+        sqr_into(&self.limbs, &mut out);
+        let mut n = Nat { limbs: out };
+        n.normalize();
+        n
     }
 
     /// Karatsuba squaring: three half-size squarings.
@@ -1773,7 +1821,15 @@ impl Nat {
         let base_mod = self.div_rem(modulus).expect("non-zero").1;
         let base = mont_mul_cios(&base_mod, &r2, m, n0inv);
         let one_mont = mont_mul_cios(&Nat::one(), &r2, m, n0inv);
-        let result = modpow_windowed(base, one_mont, exp, |a, b| mont_mul_cios(a, b, m, n0inv));
+        // The windowed ladder squares via `mulmod(&r, &r)`; detect that aliasing
+        // and take the cheaper dedicated Montgomery squaring.
+        let result = modpow_windowed(base, one_mont, exp, |a, b| {
+            if core::ptr::eq(a, b) {
+                mont_sqr(a, m, n0inv)
+            } else {
+                mont_mul_cios(a, b, m, n0inv)
+            }
+        });
         // Back out of Montgomery form: value = CIOS(result, 1).
         mont_mul_cios(&result, &Nat::one(), m, n0inv)
     }

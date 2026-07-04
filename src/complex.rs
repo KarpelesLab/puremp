@@ -159,7 +159,9 @@ where
 
 macro_rules! complex_binop {
     ($tr:ident, $m:ident, $bound:path, $atr:ident, $am:ident) => {
-        impl<T> core::ops::$tr for Complex<T>
+        // All four owned/borrowed operand combinations, so `a op b`, `a op &b`,
+        // `&a op b`, and `&a op &b` all work.
+        impl<T> core::ops::$tr<Complex<T>> for Complex<T>
         where
             T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + $bound,
         {
@@ -167,6 +169,26 @@ macro_rules! complex_binop {
             #[inline]
             fn $m(self, rhs: Complex<T>) -> Complex<T> {
                 Complex::$m(&self, &rhs)
+            }
+        }
+        impl<T> core::ops::$tr<&Complex<T>> for Complex<T>
+        where
+            T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + $bound,
+        {
+            type Output = Complex<T>;
+            #[inline]
+            fn $m(self, rhs: &Complex<T>) -> Complex<T> {
+                Complex::$m(&self, rhs)
+            }
+        }
+        impl<T> core::ops::$tr<Complex<T>> for &Complex<T>
+        where
+            T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + $bound,
+        {
+            type Output = Complex<T>;
+            #[inline]
+            fn $m(self, rhs: Complex<T>) -> Complex<T> {
+                Complex::$m(self, &rhs)
             }
         }
         impl<T> core::ops::$tr<&Complex<T>> for &Complex<T>
@@ -179,13 +201,22 @@ macro_rules! complex_binop {
                 Complex::$m(self, rhs)
             }
         }
-        impl<T> core::ops::$atr for Complex<T>
+        impl<T> core::ops::$atr<Complex<T>> for Complex<T>
         where
             T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + $bound,
         {
             #[inline]
             fn $am(&mut self, rhs: Complex<T>) {
                 *self = Complex::$m(self, &rhs);
+            }
+        }
+        impl<T> core::ops::$atr<&Complex<T>> for Complex<T>
+        where
+            T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + $bound,
+        {
+            #[inline]
+            fn $am(&mut self, rhs: &Complex<T>) {
+                *self = Complex::$m(self, rhs);
             }
         }
     };
@@ -206,6 +237,16 @@ where
     #[inline]
     fn neg(self) -> Complex<T> {
         Complex::neg(&self)
+    }
+}
+impl<T> core::ops::Neg for &Complex<T>
+where
+    T: Clone + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + Neg<Output = T>,
+{
+    type Output = Complex<T>;
+    #[inline]
+    fn neg(self) -> Complex<T> {
+        Complex::neg(self)
     }
 }
 

@@ -72,3 +72,29 @@ fn sin_cos() {
         (one.re.to_f64(), one.im.to_f64())
     );
 }
+
+#[test]
+fn all_operator_combinations() {
+    let a = cx(1.0, 2.0);
+    let b = cx(3.0, 1.0);
+    let expect = cx(4.0, 3.0); // a + b
+    // all four owned/borrowed combinations of each operator
+    assert!(cclose(&(a.clone() + b.clone()), 4.0, 3.0));
+    assert!(cclose(&(a.clone() + &b), 4.0, 3.0));
+    assert!(cclose(&(&a + b.clone()), 4.0, 3.0));
+    assert!(cclose(&(&a + &b), 4.0, 3.0));
+    assert!(cclose(&(&a - &b), -2.0, 1.0));
+    assert!(cclose(&(a.clone() - &b), -2.0, 1.0));
+    assert!(cclose(&(&a * &b), 1.0, 7.0)); // (1+2i)(3+i) = 1+7i
+    assert!(cclose(&(&a / &b), 0.5, 0.5)); // (1+2i)/(3+i) = 0.5+0.5i
+    assert!(cclose(&(-&a), -1.0, -2.0));
+    assert!(cclose(&(-a.clone()), -1.0, -2.0));
+    // assign forms, owned and borrowed rhs
+    let mut c = a.clone();
+    c += &b;
+    assert!(cclose(&c, 4.0, 3.0));
+    let mut d = a.clone();
+    d *= b.clone();
+    assert!(cclose(&d, 1.0, 7.0));
+    let _ = expect;
+}

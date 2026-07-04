@@ -28,7 +28,7 @@ name = "puremp"
 # `float` is a separable layer (not part of the core contract) but is enabled
 # by default for convenience; disable it with `--no-default-features`
 # (optionally re-enabling `rational`/`cli`).
-default = ["std", "rational", "float", "dyadic", "padic", "decimal", "complex", "poly", "interval", "matrix", "lattice", "algebraic", "cli"]
+default = ["std", "rational", "float", "dyadic", "padic", "decimal", "complex", "poly", "interval", "ball", "matrix", "lattice", "algebraic", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -62,6 +62,8 @@ dlog = ["int"]
 float = ["int", "rational"]
 # Interval arithmetic (`Interval`) with outward-rounded `Float` endpoints.
 interval = ["float"]
+# Ball (midpoint-radius) rigorous arithmetic (`Ball`), Arb-style. Built on `Interval`.
+ball = ["interval"]
 # Algebraic numbers: exact ℚ(√d) (`Quadratic`) and general real `Algebraic`.
 algebraic = ["rational", "poly", "matrix", "float"]
 

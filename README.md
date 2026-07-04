@@ -101,6 +101,7 @@ int main(void) {
 | `matrix` | ✔ | `Matrix<T>` — dense matrices with exact linear algebra |
 | `lattice` | ✔ | `lll_reduce` — exact LLL lattice basis reduction (implies `rational`) |
 | `interval` | ✔ | `Interval` — outward-rounded interval arithmetic (implies `float`) |
+| `ball` | ✔ | `Ball` — midpoint–radius (mid-rad) rigorous arithmetic, Arb-style (implies `interval`) |
 | `algebraic` | ✔ | `Quadratic` (ℚ(√d)) and general real `Algebraic` numbers |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
 | `num-traits` | | Implements `num-traits` interfaces for `Int`/`Rational`/`Nat`/`Decimal`/`Complex` |

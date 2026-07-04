@@ -25,6 +25,7 @@
 //! - [`Matrix`] — dense matrices with exact determinant/inverse/solve
 //!   (`matrix`).
 //! - [`Interval`] — outward-rounded interval arithmetic (`interval`).
+//! - [`Ball`] — midpoint–radius (mid-rad) rigorous arithmetic, Arb-style (`ball`).
 //! - [`Padic`] — fixed-precision `p`-adic numbers in `ℚ_p` (`padic`).
 //! - [`Quadratic`] / [`Algebraic`] — exact quadratic irrationals `ℚ(√d)` and
 //!   general real algebraic numbers (`algebraic`).
@@ -156,6 +157,9 @@ pub mod fixed_float;
 #[cfg(feature = "interval")]
 pub mod interval;
 
+#[cfg(feature = "ball")]
+pub mod ball;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
@@ -213,6 +217,8 @@ pub use fixed_float::FixedFloat;
 #[cfg(feature = "float")]
 pub use float::{Float, RoundingMode};
 
+#[cfg(feature = "ball")]
+pub use ball::Ball;
 #[cfg(feature = "interval")]
 pub use interval::Interval;
 

@@ -257,6 +257,25 @@ impl Rational {
         self.num.div_trunc(&self.den)
     }
 
+    /// Returns the nearest integer, rounding halves to even (banker's rounding,
+    /// matching Mathematica's `Round`). E.g. `5/2 → 2`, `7/2 → 4`, `-5/2 → -2`.
+    pub fn round(&self) -> Int {
+        let floor = self.num.div_floor(&self.den);
+        let rem = self.num.sub(&floor.mul(&self.den)); // 0 ≤ rem < den
+        let twice = rem.mul(&Int::from_i64(2));
+        match twice.cmp(&self.den) {
+            core::cmp::Ordering::Less => floor,
+            core::cmp::Ordering::Greater => floor.add(&Int::ONE),
+            core::cmp::Ordering::Equal => {
+                if floor.is_even() {
+                    floor
+                } else {
+                    floor.add(&Int::ONE)
+                }
+            }
+        }
+    }
+
     /// Returns `Some(n)` if this value is the integer `n`, else `None`.
     pub fn to_integer(&self) -> Option<Int> {
         self.is_integer().then(|| self.num.clone())

@@ -224,6 +224,13 @@ impl Quadratic {
         let root = Float::from_int(&self.d, work, mode).sqrt(work, mode);
         a.add(&b.mul(&root, work, mode), precision, mode)
     }
+
+    /// Approximates this value as an `f64` (~53 bits). Panics if `d < 0` (not
+    /// real).
+    pub fn to_f64(&self) -> f64 {
+        self.to_float(53, crate::float::RoundingMode::Nearest)
+            .to_f64()
+    }
 }
 
 impl PartialEq for Quadratic {

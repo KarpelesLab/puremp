@@ -245,6 +245,51 @@ impl Algebraic {
             let r = self.hi.clone();
             return Algebraic::from_rational(r);
         }
+        self.collapse_if_rational()
+    }
+
+    /// Detects a rational value even when the isolating interval hasn't landed on
+    /// it (e.g. `√2·√2` sits as the root `2` of `x²−4`). By the rational-root
+    /// theorem a root `p/q` of the cleared integer polynomial has `q` dividing its
+    /// leading coefficient `L`; refining the interval below `1/(2|L|)` leaves at
+    /// most one candidate numerator per divisor `q` of `|L|`, which we test.
+    fn collapse_if_rational(self) -> Algebraic {
+        if self.lo == self.hi {
+            return self;
+        }
+        let deg = match self.poly.degree() {
+            Some(d) if d >= 1 => d,
+            _ => return self,
+        };
+        // Cleared integer leading coefficient L = lead·lcm(denominators).
+        let mut lcm = Int::ONE;
+        for i in 0..=deg {
+            let d = self.poly.coeff(i).denominator().clone();
+            let g = lcm.gcd(&d);
+            lcm = lcm.div_trunc(&g).mul(&d);
+        }
+        let lead = &self.poly.coeff(deg);
+        let l_int = lead.numerator().mul(&lcm).div_trunc(lead.denominator());
+        let l_abs = l_int.abs();
+        // Bound the divisor search (keeps this cheap; value is correct regardless).
+        if l_abs > Int::from_i64(1 << 20) {
+            return self;
+        }
+        // Refine a clone so (hi − lo)·|L| < 1/2: ≤ one integer p in (lo·q, hi·q].
+        let width = Rational::new(Int::ONE, l_abs.mul(&Int::from_i64(2)));
+        let mut a = self.clone();
+        a.refine_below(&width);
+        if a.lo == a.hi {
+            return Algebraic::from_rational(a.hi);
+        }
+        for q in l_abs.divisors() {
+            let qr = Rational::from_integer(q.clone());
+            let p = Rational::mul(&a.hi, &qr).floor(); // ⌊hi·q⌋
+            let cand = Rational::new(p, q);
+            if cand > a.lo && cand <= a.hi && eval_sign(&self.poly, &cand) == 0 {
+                return Algebraic::from_rational(cand);
+            }
+        }
         self
     }
 
@@ -339,6 +384,12 @@ impl Algebraic {
             a.refine();
         }
         Float::from_rational(&a.lo.add(&a.hi).div(&q_i64(2)), precision, mode)
+    }
+
+    /// Approximates this algebraic number as an `f64` (~53 bits, round-to-nearest).
+    pub fn to_f64(&self) -> f64 {
+        self.to_float(53, crate::float::RoundingMode::Nearest)
+            .to_f64()
     }
 
     /// Returns `-self`.
@@ -668,6 +719,17 @@ impl Algebraic {
         assert!(self.signum() >= 0, "Algebraic::sqrt: negative radicand");
         if self.signum() == 0 {
             return Algebraic::from_rational(Rational::ZERO);
+        }
+        // Exact rational root (perfect square p/q): return it directly. This also
+        // dodges the isolation loop's blind spot where the bracket lands its
+        // excluded lower endpoint exactly on a rational root.
+        if self.is_rational()
+            && let (Some(sn), Some(sd)) = (
+                self.lo.numerator().sqrt_exact(),
+                self.lo.denominator().sqrt_exact(),
+            )
+        {
+            return Algebraic::from_rational(Rational::new(sn, sd));
         }
         // √α is a root of p(x²); isolate it near the float square root.
         let sub = compose_square(&self.poly);

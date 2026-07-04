@@ -240,6 +240,26 @@ impl Float {
         self.round_impl(precision, mode).0
     }
 
+    /// Largest integer `≤ self` (`⌊self⌋`), or `None` if `self` is NaN/∞.
+    pub fn floor(&self) -> Option<Int> {
+        self.to_rational().map(|r| r.floor())
+    }
+
+    /// Smallest integer `≥ self` (`⌈self⌉`), or `None` if `self` is NaN/∞.
+    pub fn ceil(&self) -> Option<Int> {
+        self.to_rational().map(|r| r.ceil())
+    }
+
+    /// `self` truncated toward zero, or `None` if `self` is NaN/∞.
+    pub fn trunc(&self) -> Option<Int> {
+        self.to_rational().map(|r| r.trunc())
+    }
+
+    /// Nearest integer, ties to even (Mathematica's `Round`), or `None` if NaN/∞.
+    pub fn round_to_int(&self) -> Option<Int> {
+        self.to_rational().map(|r| r.round())
+    }
+
     fn round_impl(&self, precision: u64, mode: RoundingMode) -> (Float, Ordering) {
         match &self.repr {
             Repr::NaN => (Float::nan(precision), Ordering::Equal),
@@ -1066,7 +1086,7 @@ impl Float {
 
     /// Rounds a finite value to the nearest integer (ties toward +∞ via
     /// `floor(x + 1/2)`), returned as an [`Int`].
-    fn round_to_int(&self) -> Int {
+    fn round_half_up_to_int(&self) -> Int {
         let w = self.precision + 2;
         let shifted = self.add(&rflt(1, 2, w), w, NEAR);
         shifted
@@ -1652,7 +1672,7 @@ fn exp_at(x: &Float, w: u64) -> Float {
     let j = w.isqrt().max(1);
     let n = w + j + 8;
     let ln2 = ln2_at(n);
-    let k = x.div(&ln2, n, NEAR).round_to_int();
+    let k = x.div(&ln2, n, NEAR).round_half_up_to_int();
     let ki = k.to_i64().unwrap_or(0);
     let r = x.sub(&Float::from_int(&k, n, NEAR).mul(&ln2, n, NEAR), n, NEAR);
     let r = r.scale_pow2(-(j as i64)); // exact
@@ -1725,7 +1745,7 @@ fn sin_cos_at(x: &Float, w: u64) -> (Float, Float) {
     let pi = pi_at(w);
     let half_pi = pi.scale_pow2(-1);
     // q = round(x / (π/2)); r = x − q·(π/2) ∈ [−π/4, π/4].
-    let q = x.div(&half_pi, w, NEAR).round_to_int();
+    let q = x.div(&half_pi, w, NEAR).round_half_up_to_int();
     let r = x.sub(
         &Float::from_int(&q, w, NEAR).mul(&half_pi, w, NEAR),
         w,

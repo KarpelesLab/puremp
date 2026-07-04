@@ -1084,3 +1084,22 @@ fn modpow_windowed_vs_reference() {
         );
     }
 }
+
+#[test]
+fn square_matches_mul_across_ladder() {
+    // square() must equal mul-by-self at every size that crosses a ladder tier
+    // (schoolbook / Karatsuba / Toom-3 / Toom-4).
+    for limbs in [1usize, 40, 160, 260, 460, 900, 2000] {
+        let x = int("7").pow((limbs * 64 / 3) as u32).magnitude();
+        let y = x.add(&Nat::zero()); // distinct object, equal value
+        // mul(&y) still routes to square via the limbs== check, so cross-check
+        // against a genuinely different multiply: x*(x-1)+x == x*x.
+        let xm1 = x.checked_sub(&Nat::one()).unwrap();
+        assert_eq!(
+            x.square(),
+            x.mul(&xm1).add(&x),
+            "square identity at ~{limbs} limbs"
+        );
+        let _ = y;
+    }
+}

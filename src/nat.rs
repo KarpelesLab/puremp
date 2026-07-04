@@ -27,13 +27,13 @@ use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 // Toom-4 until ~28k limbs. Re-measure per platform to retune.
 
 /// Operands with fewer than this many limbs use schoolbook multiplication.
-const KARATSUBA_THRESHOLD: usize = 160;
+const KARATSUBA_THRESHOLD: usize = 128;
 
 /// Operands with at least this many limbs use Toom-3 (above Karatsuba).
-const TOOM3_THRESHOLD: usize = 256;
+const TOOM3_THRESHOLD: usize = 2400;
 
 /// Operands with at least this many limbs use Toom-4 (above Toom-3).
-const TOOM4_THRESHOLD: usize = 448;
+const TOOM4_THRESHOLD: usize = 3000;
 
 /// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
 const LEHMER_THRESHOLD: usize = 16;
@@ -2269,16 +2269,22 @@ mod tests {
             Nat::from_bytes_le(&bytes)
         };
         let bench = |f: &dyn Fn() -> Nat| {
-            let mut r = f();
-            let t = Instant::now();
-            for _ in 0..7 {
-                r = f();
+            let mut best = core::time::Duration::MAX;
+            let _ = f();
+            for _ in 0..6 {
+                let t = Instant::now();
+                let mut r = f();
+                for _ in 0..7 {
+                    r = f();
+                }
+                let _ = r.limbs.len();
+                best = best.min(t.elapsed() / 8);
             }
-            let _ = r.limbs.len();
-            t.elapsed() / 7
+            best
         };
         for &sz in &[
-            48usize, 96, 160, 224, 320, 448, 640, 1024, 1600, 4000, 8000, 16000,
+            48usize, 96, 112, 128, 160, 224, 320, 448, 640, 800, 1024, 1600, 2400, 3200, 4000,
+            8000, 16000,
         ] {
             let a = mkbig(sz);
             let b = mkbig(sz + 1);

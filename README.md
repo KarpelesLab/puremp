@@ -175,11 +175,6 @@ available drafts) is the umbrella reference for much of this list.
   path finds the reducing prime-log combination with an f64 Babai nearest-plane,
   which caps its winning range; a higher-precision Babai over more primes (and an
   extension to `sin`/`cos`) would widen it. Johansson, arXiv:2207.02501.
-- **Sharper Newton building blocks** — power-series square root in `(4/3)·M(n)`
-  (from ~1.83) and reciprocal in `(13/9)·M(n)` (from 1.5) via a third-order
-  iteration whose extra term is nearly free; feeds `Float::sqrt`, reciprocal, and
-  Newton nth-root. Harvey, *Faster algorithms for the square root and reciprocal
-  of power series* (arXiv:0910.1926).
 - **AGM-based transcendentals** — π and `log`/`exp` via the arithmetic–geometric
   mean (Brent–Salamin / Gauss–Legendre), `O(M(n)·log n)` in ~2·lg n quadratically
   converging steps; a large implicit constant means it *complements* binary
@@ -190,8 +185,6 @@ available drafts) is the umbrella reference for much of this list.
   clean-room reference is Möller's left-to-right variant (its stop condition
   removes the back-up steps, "much simpler to implement"); only wins at very large
   operand sizes. Möller, *Math. Comp.* 77 (2008); MCA §1.6.
-- **Subresultant PRS** to tame Sturm-sequence coefficient growth for high-degree
-  `Algebraic` operations (Collins–Brown; MCA §2.4).
 
 **Candidate new capabilities** (new operations / types):
 

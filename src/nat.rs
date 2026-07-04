@@ -488,10 +488,24 @@ fn add_at(out: &mut [Limb], offset: usize, val: &[Limb]) {
     }
 }
 
-/// `s·a + t·b` as an [`Int`], for the Lehmer cofactor combination.
-fn lincomb(s: i128, a: &crate::int::Int, t: i128, b: &crate::int::Int) -> crate::int::Int {
-    use crate::int::Int;
-    Int::from_i128(s).mul(a).add(&Int::from_i128(t).mul(b))
+/// Computes `a·u + b·v` (guaranteed non-negative by the Lehmer invariant) on
+/// naturals with explicit signs, avoiding the per-step `Int` clones of [`lincomb`].
+fn lincomb_pos(a: i128, u: &Nat, b: i128, v: &Nat) -> Nat {
+    let au = Nat::from_u128(a.unsigned_abs()).mul(u);
+    let bv = Nat::from_u128(b.unsigned_abs()).mul(v);
+    let (mut pos, mut neg) = (Nat::zero(), Nat::zero());
+    if a >= 0 {
+        pos = au
+    } else {
+        neg = au
+    }
+    if b >= 0 {
+        pos = pos.add(&bv);
+    } else {
+        neg = neg.add(&bv);
+    }
+    pos.checked_sub(&neg)
+        .expect("lincomb result is non-negative by the Lehmer invariant")
 }
 
 /// An arbitrary-precision natural number (a non-negative integer).
@@ -1061,8 +1075,6 @@ impl Nat {
     /// full operands, doing far fewer multi-precision divisions than plain
     /// Euclid. Precondition: both operands non-zero.
     fn gcd_lehmer(&self, rhs: &Nat) -> Nat {
-        use crate::int::Int;
-
         let mut u = self.clone();
         let mut v = rhs.clone();
         if u.cmp_ref(&v) == Ordering::Less {
@@ -1098,12 +1110,12 @@ impl Nat {
                 let (_, r) = u.div_rem(&v).expect("v is non-zero");
                 u = core::mem::replace(&mut v, r);
             } else {
-                // Apply the matrix to the full operands (result stays positive).
-                let (ui, vi) = (Int::from(u.clone()), Int::from(v.clone()));
-                let nu = lincomb(a, &ui, b, &vi);
-                let nv = lincomb(c, &ui, d, &vi);
-                u = nu.magnitude();
-                v = nv.magnitude();
+                // Apply the matrix to the full operands (result stays positive),
+                // borrowing `u`/`v` rather than cloning them into `Int`.
+                let nu = lincomb_pos(a, &u, b, &v);
+                let nv = lincomb_pos(c, &u, d, &v);
+                u = nu;
+                v = nv;
                 if u.cmp_ref(&v) == Ordering::Less {
                     core::mem::swap(&mut u, &mut v);
                 }

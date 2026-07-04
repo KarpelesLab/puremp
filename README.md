@@ -108,8 +108,8 @@ int main(void) {
 | `cli` | ✔ | The `puremp` binary |
 
 Beyond the base types, `Int`/`Rational` provide a number-theory toolkit —
-`factorize` (trial division → Pollard rho → Lenstra ECM), `sqrt_mod`
-(Tonelli–Shanks), `jacobi`/`legendre`, `crt`, `random_prime`,
+`factorize` (trial division → Pollard rho → Lenstra ECM → quadratic sieve),
+`sqrt_mod` (Tonelli–Shanks), `jacobi`/`legendre`, `crt`, `random_prime`,
 `factorial`/`binomial`/`fibonacci`, and continued-fraction `approximate` — plus
 `ModInt` for modular arithmetic.
 
@@ -195,14 +195,19 @@ this list.
 
 **Candidate new capabilities** (new operations / types):
 
-- **Integer factorization beyond trial division + Pollard rho** — Lenstra's
-  **ECM** (shipped: Montgomery-curve arithmetic in projective `(X : Z)`
+- **Integer factorization beyond trial division + Pollard rho** — both shipped.
+  Lenstra's **ECM** (Montgomery-curve arithmetic in projective `(X : Z)`
   coordinates, Suyama parameterization, two-stage with a baby-step/giant-step
-  continuation; the best method whose cost scales with the *factor* size, so
-  `factorize` now reaches medium factors rho is too slow for) — next, the
-  **quadratic sieve** for the 40–100-digit balanced-semiprime range.
+  continuation) covers medium factors, its cost scaling with the *factor* size;
+  the single-polynomial **quadratic sieve** (factor base of quadratic residues,
+  a log-sieve with trial-division confirmation, `GF(2)` linear algebra by
+  Gaussian elimination) covers *balanced* semiprimes into the mid-40-digit
+  range, its cost scaling with `n`. `factorize` escalates trial division → rho
+  → ECM → QS automatically. The next step — pushing the sieve toward 100
+  digits — is the self-initializing multiple-polynomial variant (**SIQS**),
+  whose small per-polynomial intervals lift the single-polynomial memory limit.
   Zimmermann's ECM survey; Crandall & Pomerance, *Prime Numbers: A
-  Computational Perspective*; the HAC.
+  Computational Perspective*; Pomerance, *A Tale of Two Sieves*; the HAC.
 - **Primality *proving*** — upgrade probabilistic Miller–Rabin to a certificate
   via **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁵)`, fast
   variant `Õ((log N)⁴)`) or the deterministic **APR-CL**.

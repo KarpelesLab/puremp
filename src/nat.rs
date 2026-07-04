@@ -2373,12 +2373,14 @@ impl Nat {
     /// Returns the prime factorization of `self` as a sorted list of prime
     /// factors *with multiplicity* (empty for `0` and `1`).
     ///
-    /// The pipeline escalates by factor size: trial division clears tiny
-    /// factors, Pollard's rho splits small ones (up to ~15 digits), and
-    /// Lenstra's elliptic-curve method reaches medium factors (roughly 20–40
-    /// digits) whose cost scales with the factor rather than `self`. Each split
-    /// factor is confirmed prime with Baillie–PSW. Genuinely hard semiprimes
-    /// with two large balanced factors remain expensive, as always.
+    /// The pipeline escalates by difficulty: trial division clears tiny
+    /// factors, Pollard's rho splits small ones (up to ~15 digits), the
+    /// quadratic sieve handles balanced semiprimes into the mid-40-digit range
+    /// (its cost scaling with `self`), and Lenstra's elliptic-curve method
+    /// reaches medium factors of larger numbers (its cost scaling with the
+    /// factor). Each split factor is confirmed prime with Baillie–PSW.
+    /// Genuinely hard inputs — two large balanced factors beyond the sieve's
+    /// range — remain expensive, as always.
     pub fn factorize(&self) -> Vec<Nat> {
         let mut factors = Vec::new();
         if self.is_zero() || self.is_one() {
@@ -2540,15 +2542,25 @@ impl Reciprocal {
 /// as a guaranteed-terminating last resort for anything left.
 fn split_composite(n: &Nat) -> Nat {
     // Rho is cheapest for small factors; cap its work so a hard composite
-    // escalates to ECM rather than grinding.
+    // escalates rather than grinding.
     if let Some(f) = pollard_rho(n, Some(1 << 20)) {
         return f;
     }
+    // For a balanced semiprime within the single-polynomial sieve's range
+    // (~≤ 45 digits), the quadratic sieve is faster and more reliable than
+    // ECM, whose cost would depend on the (large) factor rather than on `n`.
+    if n.bit_len() <= 152
+        && let Some(f) = crate::qsieve::qs_factor(n)
+    {
+        return f;
+    }
+    // ECM reaches medium factors of larger `n` (its cost scales with the
+    // factor, so a big `n` with a moderate factor is cheap).
     if let Some(f) = crate::ecm::ecm_factor(n) {
         return f;
     }
-    // Neither reached it (a large balanced semiprime): fall back to an
-    // unbounded rho, which always terminates though it may be slow.
+    // Last resort (guaranteed to terminate, though impractically slow for a
+    // large balanced semiprime — genuinely hard, as documented).
     pollard_rho(n, None).expect("unbounded rho returns a factor")
 }
 

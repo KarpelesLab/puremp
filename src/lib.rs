@@ -92,6 +92,9 @@ pub mod random;
 #[cfg(feature = "int")]
 mod ecm;
 
+#[cfg(feature = "int")]
+mod qsieve;
+
 #[cfg(feature = "num-traits")]
 mod num_traits_impls;
 

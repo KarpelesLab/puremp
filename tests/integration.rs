@@ -876,6 +876,17 @@ fn factorization_and_random_prime() {
     let prod = n.factorize().iter().fold(Int::ONE, |a, p| a.mul(p));
     assert_eq!(prod, n);
 
+    // A balanced ~21-digit semiprime (two 11-digit primes): well past Pollard
+    // rho's fast range, split by the elliptic-curve stage.
+    let p = int("10000000019");
+    let q = int("99999999977");
+    assert!(p.is_prime_bpsw() && q.is_prime_bpsw());
+    let hard = p.mul(&q);
+    let hf = hard.factorize();
+    assert_eq!(hf.len(), 2);
+    assert_eq!(hf[0].mul(&hf[1]), hard);
+    assert!(hf.iter().all(|f| f.is_prime_bpsw()));
+
     // random_prime
     struct Lcg(u64);
     impl RandomSource for Lcg {

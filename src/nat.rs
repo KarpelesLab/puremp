@@ -2373,10 +2373,12 @@ impl Nat {
     /// Returns the prime factorization of `self` as a sorted list of prime
     /// factors *with multiplicity* (empty for `0` and `1`).
     ///
-    /// Small factors are removed by trial division; the rest are split with
-    /// Pollard's rho and confirmed prime with Baillie–PSW. Practical for numbers
-    /// with factors up to ~20 digits; genuinely hard semiprimes are, as always,
-    /// hard.
+    /// The pipeline escalates by factor size: trial division clears tiny
+    /// factors, Pollard's rho splits small ones (up to ~15 digits), and
+    /// Lenstra's elliptic-curve method reaches medium factors (roughly 20–40
+    /// digits) whose cost scales with the factor rather than `self`. Each split
+    /// factor is confirmed prime with Baillie–PSW. Genuinely hard semiprimes
+    /// with two large balanced factors remain expensive, as always.
     pub fn factorize(&self) -> Vec<Nat> {
         let mut factors = Vec::new();
         if self.is_zero() || self.is_one() {
@@ -2405,7 +2407,7 @@ impl Nat {
             }
             d += 2;
         }
-        // Split whatever remains with Pollard's rho.
+        // Split whatever remains, escalating rho → ECM per composite.
         let mut stack = Vec::new();
         if !n.is_one() {
             stack.push(n);
@@ -2415,7 +2417,7 @@ impl Nat {
                 factors.push(m);
                 continue;
             }
-            let factor = pollard_rho(&m);
+            let factor = split_composite(&m);
             let cofactor = m.div_rem(&factor).expect("non-zero").0;
             stack.push(factor);
             stack.push(cofactor);
@@ -2532,15 +2534,36 @@ impl Reciprocal {
     }
 }
 
+/// Splits the odd composite `n > 1` (already stripped of factors ≤ 4096) into a
+/// non-trivial factor, escalating by expected factor size: bounded Pollard rho
+/// for small factors, then Lenstra's ECM for medium ones, then an unbounded rho
+/// as a guaranteed-terminating last resort for anything left.
+fn split_composite(n: &Nat) -> Nat {
+    // Rho is cheapest for small factors; cap its work so a hard composite
+    // escalates to ECM rather than grinding.
+    if let Some(f) = pollard_rho(n, Some(1 << 20)) {
+        return f;
+    }
+    if let Some(f) = crate::ecm::ecm_factor(n) {
+        return f;
+    }
+    // Neither reached it (a large balanced semiprime): fall back to an
+    // unbounded rho, which always terminates though it may be slow.
+    pollard_rho(n, None).expect("unbounded rho returns a factor")
+}
+
 /// Pollard's rho: returns a non-trivial factor of the odd composite `n > 1`
 /// (Floyd cycle detection over `f(x) = x² + c mod n`, retrying with larger `c`).
-fn pollard_rho(n: &Nat) -> Nat {
+/// With `budget = Some(k)`, gives up after about `k` iterations across all
+/// polynomials and returns `None`; `budget = None` searches until it succeeds.
+fn pollard_rho(n: &Nat, budget: Option<u64>) -> Option<Nat> {
     if n.is_even() {
-        return Nat::from_u64(2);
+        return Some(Nat::from_u64(2));
     }
     let one = Nat::one();
     let recip = Reciprocal::new(n);
     let mut c = 1u64;
+    let mut spent = 0u64;
     loop {
         let f = |x: &Nat| recip.reduce(&x.square().add(&Nat::from_u64(c)));
         let (mut x, mut y) = (Nat::from_u64(2), Nat::from_u64(2));
@@ -2558,9 +2581,15 @@ fn pollard_rho(n: &Nat) -> Nat {
             } else {
                 diff.gcd(n)
             };
+            spent += 1;
+            if let Some(limit) = budget
+                && spent >= limit
+            {
+                return None;
+            }
         }
         if d != *n {
-            return d;
+            return Some(d);
         }
         c += 1; // cycle without a factor: try a different polynomial
     }

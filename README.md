@@ -108,9 +108,10 @@ int main(void) {
 | `cli` | ✔ | The `puremp` binary |
 
 Beyond the base types, `Int`/`Rational` provide a number-theory toolkit —
-`factorize`, `sqrt_mod` (Tonelli–Shanks), `jacobi`/`legendre`, `crt`,
-`random_prime`, `factorial`/`binomial`/`fibonacci`, and continued-fraction
-`approximate` — plus `ModInt` for modular arithmetic.
+`factorize` (trial division → Pollard rho → Lenstra ECM), `sqrt_mod`
+(Tonelli–Shanks), `jacobi`/`legendre`, `crt`, `random_prime`,
+`factorial`/`binomial`/`fibonacci`, and continued-fraction `approximate` — plus
+`ModInt` for modular arithmetic.
 
 The exact-algebra layers stack on top of these:
 
@@ -193,10 +194,13 @@ this list.
 **Candidate new capabilities** (new operations / types):
 
 - **Integer factorization beyond trial division + Pollard rho** — Lenstra's
-  **ECM** (elliptic-curve method, the best method whose cost scales with the
-  *factor* size, using Montgomery-curve arithmetic), then the **quadratic sieve**
-  for the 40–100-digit range. Zimmermann's ECM survey; Crandall & Pomerance,
-  *Prime Numbers: A Computational Perspective*; the HAC.
+  **ECM** (shipped: Montgomery-curve arithmetic in projective `(X : Z)`
+  coordinates, Suyama parameterization, two-stage with a baby-step/giant-step
+  continuation; the best method whose cost scales with the *factor* size, so
+  `factorize` now reaches medium factors rho is too slow for) — next, the
+  **quadratic sieve** for the 40–100-digit balanced-semiprime range.
+  Zimmermann's ECM survey; Crandall & Pomerance, *Prime Numbers: A
+  Computational Perspective*; the HAC.
 - **Primality *proving*** — upgrade probabilistic Miller–Rabin to a certificate
   via **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁵)`, fast
   variant `Õ((log N)⁴)`) or the deterministic **APR-CL**.

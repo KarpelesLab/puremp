@@ -1103,3 +1103,48 @@ fn square_matches_mul_across_ladder() {
         let _ = y;
     }
 }
+
+#[test]
+fn modpow_random_differential() {
+    // Independent reference (right-to-left binary), checked against modpow over
+    // many random bases/exponents/moduli of varied sizes and parities — this
+    // stresses the CIOS Montgomery path (odd moduli) and the Barrett path (even).
+    fn ref_modpow(mut base: Int, exp: &Int, m: &Int) -> Int {
+        let mut result = Int::ONE;
+        base = base.rem_euclid(m);
+        let bits = exp.magnitude().bit_len();
+        for i in 0..bits {
+            if exp.magnitude().bit(i) {
+                result = result.mul(&base).rem_euclid(m);
+            }
+            base = base.mul(&base).rem_euclid(m);
+        }
+        result
+    }
+    let mut s: u64 = 0xF00D_CAFE;
+    let mut rng_int = |bits: u32, s: &mut u64| -> Int {
+        let mut v = Int::ZERO;
+        let limbs = (bits / 64 + 1).max(1);
+        for _ in 0..limbs {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            v = v.mul(&Int::from_u64(u64::MAX)).add(&Int::from_u64(*s));
+        }
+        v.abs()
+    };
+    for _ in 0..400 {
+        let bits = 32 + (s % 800) as u32;
+        let mut m = rng_int(bits, &mut s).add(&Int::from(2));
+        // Test both odd (Montgomery) and even (Barrett) moduli.
+        if s & 1 == 0 && m.is_odd() {
+            m = m.add(&Int::ONE);
+        }
+        let base = rng_int(bits, &mut s);
+        let exp = rng_int(1 + (s % 400) as u32, &mut s);
+        assert_eq!(
+            base.modpow(&exp, &m),
+            ref_modpow(base.clone(), &exp, &m),
+            "modpow mismatch (odd_mod={})",
+            m.is_odd()
+        );
+    }
+}

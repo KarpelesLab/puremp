@@ -425,32 +425,6 @@ fn modpow_windowed(base: Nat, one: Nat, exp: &Nat, mulmod: impl Fn(&Nat, &Nat) -
     result.expect("bits > 0 guarantees at least one window")
 }
 
-impl Nat {
-    /// Returns the low `k` limbs of `self · rhs` (i.e. the product mod `2^(64k)`),
-    /// computing only the needed columns. Used by Montgomery reduction, where the
-    /// upper half of the `t·m'` product is discarded anyway.
-    fn mul_low_limbs(&self, rhs: &Nat, k: usize) -> Nat {
-        let mut out = alloc::vec![0 as Limb; k];
-        let a_lim = self.limbs.len().min(k);
-        for i in 0..a_lim {
-            let a = self.limbs[i];
-            let mut carry = 0;
-            let cols = (k - i).min(rhs.limbs.len());
-            let row = &mut out[i..i + cols];
-            for (o, &b) in row.iter_mut().zip(&rhs.limbs[..cols]) {
-                let (lo, hi) = mac(*o, a, b, carry);
-                *o = lo;
-                carry = hi;
-            }
-            // A carry out of the truncated row is discarded (belongs to a higher
-            // limb we don't keep).
-        }
-        let mut n = Nat { limbs: out };
-        n.normalize();
-        n
-    }
-}
-
 /// Recombines Toom coefficients `Σ cᵢ·2^(64·k·i)` into a single [`Nat`], writing
 /// each (non-negative) coefficient at whole-limb offset `k·i` with carry
 /// propagation. Cheaper than a chain of `mul_2k`/`add`.
@@ -466,6 +440,67 @@ fn recombine_coeffs(product_limbs: usize, k: usize, coeffs: &[crate::int::Int]) 
     let mut n = Nat { limbs: out };
     n.normalize();
     n
+}
+
+/// Modular inverse of an odd `x` modulo `2^64`, by Newton's iteration
+/// (`y ← y·(2 − x·y)`), which doubles the number of correct low bits each step.
+#[inline]
+fn inv_mod_2_64(x: Limb) -> Limb {
+    debug_assert!(x & 1 == 1, "inverse mod 2^64 requires an odd input");
+    // Seed correct to 5 bits, then 5 → 10 → 20 → 40 → 80 (≥ 64) bits.
+    let mut y = x.wrapping_mul(3) ^ 2;
+    for _ in 0..4 {
+        y = y.wrapping_mul(2u64.wrapping_sub(x.wrapping_mul(y)));
+    }
+    y
+}
+
+/// Montgomery multiplication by the CIOS (Coarsely Integrated Operand Scanning)
+/// method: returns `a·b·R⁻¹ mod m` in `[0, m)`, where `R = 2^(64·m.len())` and
+/// `n0inv = −m⁻¹ mod 2^64`. Multiply and reduction are interleaved word-by-word
+/// through a single `s+2`-word accumulator, so there is no full-width product or
+/// per-step allocation. Requires an odd modulus with a non-zero top limb, and
+/// `a, b < m` (shorter inputs are zero-extended).
+fn mont_mul_cios(a: &Nat, b: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
+    let s = m.len();
+    let ga = |i: usize| a.limbs.get(i).copied().unwrap_or(0) as u128;
+    let gb = |i: usize| b.limbs.get(i).copied().unwrap_or(0) as u128;
+    let mut t = alloc::vec![0u64; s + 2];
+    for i in 0..s {
+        // t += a[i]·b
+        let ai = ga(i);
+        let mut carry: u128 = 0;
+        for j in 0..s {
+            let sum = t[j] as u128 + ai * gb(j) + carry;
+            t[j] = sum as Limb;
+            carry = sum >> LIMB_BITS;
+        }
+        let sum = t[s] as u128 + carry;
+        t[s] = sum as Limb;
+        t[s + 1] = (sum >> LIMB_BITS) as Limb;
+
+        // Reduce one word: t += (t[0]·n0inv)·m, then shift right by one word.
+        let mi = t[0].wrapping_mul(n0inv) as u128;
+        let mut carry = (t[0] as u128 + mi * m[0] as u128) >> LIMB_BITS; // low word → 0
+        for j in 1..s {
+            let sum = t[j] as u128 + mi * m[j] as u128 + carry;
+            t[j - 1] = sum as Limb;
+            carry = sum >> LIMB_BITS;
+        }
+        let sum = t[s] as u128 + carry;
+        t[s - 1] = sum as Limb;
+        t[s] = t[s + 1].wrapping_add((sum >> LIMB_BITS) as Limb);
+    }
+    // t holds an `s+1`-word value < 2m; one conditional subtraction canonicalizes.
+    let mut result = Nat {
+        limbs: t[..=s].to_vec(),
+    };
+    result.normalize();
+    let m_nat = Nat { limbs: m.to_vec() };
+    if result.cmp_ref(&m_nat) != Ordering::Less {
+        result = result.checked_sub(&m_nat).expect("result < 2m");
+    }
+    result
 }
 
 /// Adds the limbs of `val` into `out` starting at limb `offset`, propagating the
@@ -1607,36 +1642,21 @@ impl Nat {
 
     /// Montgomery-reduction modpow for an odd `modulus > 1`.
     fn modpow_montgomery(&self, exp: &Nat, modulus: &Nat) -> Nat {
-        use crate::int::Int;
-
         let k = modulus.limbs.len();
-        let rbits = k as u64 * LIMB_BITS as u64;
-        // R = 2^(64k); m' = −m^{-1} mod R; R² mod m for conversion into the domain.
-        let r = Nat::one().shl(rbits);
-        let minv = Int::from(modulus.clone())
-            .modinv(&Int::from(r.clone()))
-            .expect("odd modulus is invertible mod 2^k")
-            .magnitude();
-        let m_prime = r.checked_sub(&minv).unwrap_or_else(Nat::zero);
+        let m = modulus.limbs.as_slice(); // exactly k words, top non-zero, odd
+        let n0inv = inv_mod_2_64(m[0]).wrapping_neg(); // −m⁻¹ mod 2^64
+
+        // R = 2^(64k); R² mod m converts a residue into Montgomery form via one
+        // CIOS multiply. `1` in Montgomery form is R mod m = CIOS(1, R²).
+        let r = Nat::one().shl(k as u64 * LIMB_BITS as u64);
         let r2 = r.mul(&r).div_rem(modulus).expect("non-zero").1;
 
-        // REDC(t) = (t + ((t mod R)·m' mod R)·m) / R, conditionally reduced.
-        let redc = |t: &Nat| -> Nat {
-            // u = (t mod R)·m' mod R — only the low k limbs are needed.
-            let u = t.mul_low_limbs(&m_prime, k);
-            let s = t.add(&u.mul(modulus)).shr(rbits);
-            if s.cmp_ref(modulus) != Ordering::Less {
-                s.checked_sub(modulus).expect("s >= m")
-            } else {
-                s
-            }
-        };
-
         let base_mod = self.div_rem(modulus).expect("non-zero").1;
-        let base = redc(&base_mod.mul(&r2)); // into Montgomery form
-        let one_mont = r.div_rem(modulus).expect("non-zero").1; // 1 in Montgomery form
-        let result = modpow_windowed(base, one_mont, exp, |a, b| redc(&a.mul(b)));
-        redc(&result) // back out of Montgomery form
+        let base = mont_mul_cios(&base_mod, &r2, m, n0inv);
+        let one_mont = mont_mul_cios(&Nat::one(), &r2, m, n0inv);
+        let result = modpow_windowed(base, one_mont, exp, |a, b| mont_mul_cios(a, b, m, n0inv));
+        // Back out of Montgomery form: value = CIOS(result, 1).
+        mont_mul_cios(&result, &Nat::one(), m, n0inv)
     }
 
     /// Returns the smallest prime strictly greater than `self`, found by
@@ -2173,6 +2193,17 @@ impl core::ops::MulAssign for Nat {
 mod tests {
     use super::*;
     use core::str::FromStr;
+
+    #[test]
+    fn inv_mod_2_64_is_correct() {
+        let mut x = 1u64;
+        for _ in 0..100_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1) | 1; // odd
+            assert_eq!(x.wrapping_mul(inv_mod_2_64(x)), 1, "inverse of {x}");
+        }
+        assert_eq!(inv_mod_2_64(1), 1);
+        assert_eq!(3u64.wrapping_mul(inv_mod_2_64(3)), 1);
+    }
 
     #[test]
     fn goldilocks_reduce_matches_modulo() {

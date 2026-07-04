@@ -25,6 +25,7 @@
 //! - [`Matrix`] — dense matrices with exact determinant/inverse/solve
 //!   (`matrix`).
 //! - [`Interval`] — outward-rounded interval arithmetic (`interval`).
+//! - [`Padic`] — fixed-precision `p`-adic numbers in `ℚ_p` (`padic`).
 //! - [`Quadratic`] / [`Algebraic`] — exact quadratic irrationals `ℚ(√d)` and
 //!   general real algebraic numbers (`algebraic`).
 //!
@@ -110,6 +111,9 @@ pub mod mod_int;
 #[cfg(feature = "dyadic")]
 pub mod dyadic;
 
+#[cfg(feature = "padic")]
+pub mod padic;
+
 #[cfg(feature = "decimal")]
 pub mod decimal;
 
@@ -177,6 +181,9 @@ pub use mod_int::ModInt;
 
 #[cfg(feature = "dyadic")]
 pub use dyadic::Dyadic;
+
+#[cfg(feature = "padic")]
+pub use padic::Padic;
 
 #[cfg(feature = "decimal")]
 pub use decimal::{Decimal, Rounding};

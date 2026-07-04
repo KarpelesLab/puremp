@@ -193,10 +193,12 @@ freely available drafts) is the umbrella reference for most of this list.
   by **Berlekamp–Zassenhaus** (over ℤ, hence ℚ by Gauss's lemma), with **van
   Hoeij**'s LLL-knapsack recombination replacing the exponential `2ⁿ` step for
   polynomial-time factoring. Strengthens the `Poly`/`Algebraic` layer.
-- **Special functions** for `Float` — Γ / `lgamma` (Stirling series with argument
-  reduction, MCA §4.5), the Riemann ζ (Euler–Maclaurin / Borwein), `erf`/`erfc`
-  (incomplete-Γ series), Bessel functions (MCA §4.7.1), and Euler's constant γ
-  (Brent–McMillan, binary-split), all correctly rounded.
+- **Special functions** for `Float` — Γ / `lgamma` (Stirling series evaluated by
+  **rectangular splitting**, ~2√n full multiplications; Johansson, arXiv:2109.08392,
+  2021), the Riemann ζ (Euler–Maclaurin / Borwein), `erf`/`erfc` (incomplete-Γ
+  series), Bessel functions (MCA §4.7.1), and Euler's constant γ (Brent–McMillan
+  B3 via Bessel I₀/K₀, binary-split; the fastest known method), all correctly
+  rounded.
 - **Discrete logarithm** (baby-step/giant-step, Pollard rho for DLP) and
   **`p`-adic numbers** (ℤ_p/ℚ_p) as new exact-arithmetic types.
 

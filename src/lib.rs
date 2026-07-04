@@ -116,6 +116,9 @@ pub mod poly;
 #[cfg(feature = "matrix")]
 pub mod matrix;
 
+#[cfg(all(feature = "poly", feature = "rational"))]
+mod poly_factor;
+
 #[cfg(feature = "lattice")]
 pub mod lattice;
 

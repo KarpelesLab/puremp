@@ -186,13 +186,15 @@ freely available drafts) is the umbrella reference for most of this list.
 - **Primality *proving*** — upgrade probabilistic Miller–Rabin to a certificate
   via **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁵)`, fast
   variant `Õ((log N)⁴)`) or the deterministic **APR-CL**.
-- **Building on the `lattice` LLL** (now shipped) — integer-relation detection
-  (**PSLQ**), `Algebraic` minimal-polynomial recovery from a numeric approximation,
-  and Diophantine approximation.
-- **Polynomial factorization** over 𝔽ₚ and ℚ — Cantor–Zassenhaus (mod p) lifted
-  by **Berlekamp–Zassenhaus** (over ℤ, hence ℚ by Gauss's lemma), with **van
-  Hoeij**'s LLL-knapsack recombination replacing the exponential `2ⁿ` step for
-  polynomial-time factoring. Strengthens the `Poly`/`Algebraic` layer.
+- **Building on the `lattice` LLL** (shipped, with `find_integer_relation` and
+  `minimal_polynomial` on top) — **PSLQ** integer relations and Diophantine
+  approximation as further refinements.
+- **`Poly::factor`** (shipped) factors rational polynomials over ℚ by
+  Berlekamp–Zassenhaus — square-free decomposition (Yun), Cantor–Zassenhaus mod
+  `p`, Hensel lifting, and trial recombination. Still open: **van Hoeij**'s
+  LLL-knapsack recombination, which replaces the worst-case-exponential subset
+  search with a polynomial-time lattice step (matters for many-modular-factor
+  inputs like Swinnerton–Dyer polynomials).
 - **Special functions** for `Float` — Γ / `lgamma` (Stirling series evaluated by
   **rectangular splitting**, ~2√n full multiplications; Johansson, arXiv:2109.08392,
   2021), the Riemann ζ (Euler–Maclaurin / Borwein), `erf`/`erfc` (incomplete-Γ

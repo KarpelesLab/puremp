@@ -964,20 +964,58 @@ impl Nat {
 
     /// Symmetric schoolbook squaring: accumulate the strictly-upper triangle of
     /// cross products once, double it, then add the diagonal `aᵢ²` terms.
+    ///
+    /// Triangle rows are processed two at a time (the same `addmul_2` shape as
+    /// [`Nat::mul_schoolbook`]): rows `i` and `i+1` share the tail `a[i+2..]`,
+    /// so `cross += (aᵢ + aᵢ₊₁·2^64)·a[i+2..]` plus the lone `aᵢ·aᵢ₊₁` product.
     fn square_schoolbook(&self) -> Nat {
-        let n = self.limbs.len();
+        use crate::limb::DLimb;
+        let a = &self.limbs;
+        let n = a.len();
         let mut cross = alloc::vec![0 as Limb; 2 * n];
-        for i in 0..n {
-            let mut carry = 0;
-            let ai = self.limbs[i];
-            // Row `cross[2i+1 .. i+n]` zips with the tail `self.limbs[i+1..]`.
-            let row = &mut cross[2 * i + 1..i + n];
-            for (o, &b) in row.iter_mut().zip(&self.limbs[i + 1..]) {
-                let (lo, hi) = mac(*o, ai, b, carry);
-                *o = lo;
-                carry = hi;
+        let mut i = 0;
+        while i + 2 <= n {
+            let (a0, a1) = (a[i], a[i + 1]);
+            // The lone cross product aᵢ·aᵢ₊₁ sits at position 2i+1.
+            let p = a0 as DLimb * a1 as DLimb;
+            add_at(&mut cross, 2 * i + 1, &[p as Limb, (p >> LIMB_BITS) as Limb]);
+            // Both rows' shared tail a[i+2..] lands at base position 2i+2.
+            let b = &a[i + 2..];
+            let rn = b.len();
+            let mut ph0: Limb = 0;
+            let mut pl1: Limb = 0;
+            let mut ph1: Limb = 0;
+            let mut ph1p: Limb = 0;
+            let mut carry: Limb = 0;
+            let row = &mut cross[2 * i + 2..i + n + 2];
+            for (o, &bj) in row.iter_mut().zip(b) {
+                let p0 = a0 as DLimb * bj as DLimb;
+                let p1 = a1 as DLimb * bj as DLimb;
+                let acc = *o as DLimb
+                    + (p0 as Limb) as DLimb
+                    + ph0 as DLimb
+                    + pl1 as DLimb
+                    + ph1p as DLimb
+                    + carry as DLimb;
+                *o = acc as Limb;
+                carry = (acc >> LIMB_BITS) as Limb;
+                ph0 = (p0 >> LIMB_BITS) as Limb;
+                ph1p = ph1;
+                pl1 = p1 as Limb;
+                ph1 = (p1 >> LIMB_BITS) as Limb;
             }
-            cross[i + n] = carry;
+            if rn > 0 {
+                let acc = row[rn] as DLimb
+                    + ph0 as DLimb
+                    + pl1 as DLimb
+                    + ph1p as DLimb
+                    + carry as DLimb;
+                row[rn] = acc as Limb;
+                let top = row[rn + 1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
+                row[rn + 1] = top as Limb;
+                debug_assert_eq!(top >> LIMB_BITS, 0, "square top carry escaped");
+            }
+            i += 2;
         }
         let mut result = {
             let mut c = Nat { limbs: cross };

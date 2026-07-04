@@ -160,6 +160,9 @@ pub mod interval;
 #[cfg(feature = "ball")]
 pub mod ball;
 
+#[cfg(feature = "ball")]
+pub mod ball_solve;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
@@ -219,6 +222,8 @@ pub use float::{Float, RoundingMode};
 
 #[cfg(feature = "ball")]
 pub use ball::Ball;
+#[cfg(feature = "ball")]
+pub use ball_solve::bisect_root;
 #[cfg(feature = "interval")]
 pub use interval::Interval;
 

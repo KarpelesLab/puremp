@@ -213,6 +213,42 @@ impl Ball {
         Ball::from_interval(&self.to_interval().sqrt(), self.precision())
     }
 
+    /// The exponential `e^self`.
+    ///
+    /// `exp` is monotone increasing, so the enclosure is built from the
+    /// endpoints: `exp(lower)` rounded *down* and `exp(upper)` rounded *up*
+    /// rigorously bracket the range, and the resulting interval is rebuilt into a
+    /// ball (exactly as [`Ball::sqrt`] does through the interval form). Finite for
+    /// every finite ball.
+    pub fn exp(&self) -> Ball {
+        let p = self.precision();
+        let lo = self.lower().exp(p, DOWN);
+        let hi = self.upper().exp(p, UP);
+        Ball::from_interval(&Interval::new(lo, hi, p), p)
+    }
+
+    /// The natural logarithm `ln(self)`.
+    ///
+    /// Domain: the ball must be *strictly positive* — its lower endpoint must be
+    /// `> 0`. `ln` is monotone increasing on its domain, so the enclosure is the
+    /// endpoint bracket `[ln(lower) (rounded down), ln(upper) (rounded up)]`.
+    ///
+    /// If the ball is not strictly positive (`lower() ≤ 0`, so it touches or
+    /// crosses the branch point at `0`) the result is *indeterminate*: a ball with
+    /// a NaN midpoint and `+∞` radius, matching how [`Ball::div`] reports an
+    /// unusable enclosure.
+    pub fn ln(&self) -> Ball {
+        let p = self.precision();
+        if self.lower().sign() != Sign::Positive {
+            // Not strictly positive: ln is undefined at/below zero. Report an
+            // unbounded, indeterminate enclosure rather than a bogus value.
+            return Ball::new(Float::nan(p), Float::infinity(RAD_PREC));
+        }
+        let lo = self.lower().ln(p, DOWN);
+        let hi = self.upper().ln(p, UP);
+        Ball::from_interval(&Interval::new(lo, hi, p), p)
+    }
+
     /// The inf–sup [`Interval`] enclosing this ball.
     pub fn to_interval(&self) -> Interval {
         Interval::new(self.lower(), self.upper(), self.precision())

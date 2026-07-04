@@ -23,9 +23,8 @@ use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 // Multiplication crossovers, tuned from `measure_mul_crossovers` (see the test
 // module) with the addmul_2 schoolbook loop. The faster basecase pushes every
 // crossover up: Karatsuba from ~128 limbs, Toom-3 from ~1.4k, Toom-4 from ~6k.
-// Even with the division-free Goldilocks reduction, the single-prime NTT's
-// power-of-two transform steps keep it slower than the smoothly-scaling Toom
-// ladder until ~11k limbs. Re-measure per platform to retune.
+// The NTT hand-off is decided per-shape by `ntt_worthwhile` rather than a
+// single size threshold. Re-measure per platform to retune.
 
 /// Operands with fewer than this many limbs use schoolbook multiplication.
 const KARATSUBA_THRESHOLD: usize = 128;
@@ -39,8 +38,49 @@ const TOOM4_THRESHOLD: usize = 6000;
 /// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
 const LEHMER_THRESHOLD: usize = 16;
 
-/// Operands with at least this many limbs use NTT multiplication (above Toom-4).
-const NTT_THRESHOLD: usize = 11000;
+/// The digit width (bytes) and transform length [`mul_ntt`] uses for a product
+/// totalling `total_bytes` of operand, or `None` if even 1-byte digits would
+/// overflow the coefficient bound `n·2^(16·bpd) < p` (operands beyond ~2^51
+/// bits). Wider digits shorten the transform, so try 3-byte digits first.
+fn ntt_shape(total_bytes: usize) -> Option<(usize, usize)> {
+    for bpd in (1usize..=3).rev() {
+        let need = total_bytes.div_ceil(bpd) + 2;
+        let n = need.next_power_of_two();
+        if (n as u128) << (16 * bpd as u32) < GOLDILOCKS as u128 {
+            return Some((bpd, n));
+        }
+    }
+    None
+}
+
+/// Decides whether the Goldilocks NTT beats the Toom ladder for a product of
+/// the given operand sizes (in limbs). The transform length is a power of two,
+/// so the NTT's cost is a step function of the input size: it wins while the
+/// transform is well filled and loses again just past each doubling, which a
+/// single size threshold cannot express. Squares need only two forward/inverse
+/// transforms instead of three, which lowers the bar. (Cutoffs measured on
+/// Apple Silicon; re-measure per platform to retune.)
+fn ntt_worthwhile(la: usize, lb: usize, square: bool) -> bool {
+    let min = la.min(lb);
+    let total_bytes = (la + lb) * 8;
+    let Some((bpd, n)) = ntt_shape(total_bytes) else {
+        return false;
+    };
+    match bpd {
+        // 24-bit digits keep the transform short; the NTT wins across the
+        // whole window once the operands leave the mid Toom range.
+        3 => min >= 3500,
+        // 16-bit digits: only with a well-filled transform.
+        2 => {
+            let need = total_bytes.div_ceil(2) + 2;
+            let fill_pct = need * 100 / n;
+            min >= if square { 7000 } else { 8000 } && fill_pct >= if square { 72 } else { 88 }
+        }
+        // 8-bit digits (astronomical operands): deep Toom recursion has long
+        // lost to the transform by then.
+        _ => true,
+    }
+}
 
 // --- Number-theoretic transform over the Goldilocks field 2^64 − 2^32 + 1 ---
 //
@@ -190,40 +230,31 @@ fn to_digits(x: &Nat, bpd: usize) -> Vec<u64> {
 /// inputs, shrinking to 1 (then falling back to Toom-4 only for astronomically
 /// large operands), so no multi-prime CRT is needed in practice.
 fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
-    // Rough transform length with 2-byte digits (4 per limb).
-    let approx = (a.limbs.len() + b.limbs.len()) * 4 + 2;
-    let mut est = 1usize;
-    while est < approx {
-        est <<= 1;
-    }
-    // Pick the largest digit width whose coefficients stay below the prime.
-    let bpd = if (est as u128) << 32 < GOLDILOCKS as u128 {
-        2
-    } else {
-        1
+    // Fall back only if even 1-byte digits would overflow (operands beyond
+    // ~2^51 bits).
+    let total_bytes = (a.limbs.len() + b.limbs.len()) * 8;
+    let Some((bpd, n)) = ntt_shape(total_bytes) else {
+        return a.mul_toom4(b);
     };
 
     let da = to_digits(a, bpd);
-    let db = to_digits(b, bpd);
-    let need = da.len() + db.len();
-    let mut n = 1usize;
-    while n < need {
-        n <<= 1;
-    }
-    // Coefficient bound: n · (2^(8·bpd))². Fall back only if even 1-byte digits
-    // would overflow (operands beyond ~2^51 bits).
-    if (n as u128) << (16 * bpd as u32) >= GOLDILOCKS as u128 {
-        return a.mul_toom4(b);
-    }
-
     let mut fa = alloc::vec![0u64; n];
-    let mut fb = alloc::vec![0u64; n];
     fa[..da.len()].copy_from_slice(&da);
-    fb[..db.len()].copy_from_slice(&db);
     ntt(&mut fa, false);
-    ntt(&mut fb, false);
-    for (x, y) in fa.iter_mut().zip(&fb) {
-        *x = gf_mul(*x, *y);
+    // Squaring (the dispatcher may route equal operands here): one forward
+    // transform instead of two.
+    if core::ptr::eq(a, b) || a.limbs == b.limbs {
+        for x in fa.iter_mut() {
+            *x = gf_mul(*x, *x);
+        }
+    } else {
+        let db = to_digits(b, bpd);
+        let mut fb = alloc::vec![0u64; n];
+        fb[..db.len()].copy_from_slice(&db);
+        ntt(&mut fb, false);
+        for (x, y) in fa.iter_mut().zip(&fb) {
+            *x = gf_mul(*x, *y);
+        }
     }
     ntt(&mut fa, true);
 
@@ -1019,12 +1050,12 @@ impl Nat {
             self.mul_schoolbook(rhs)
         } else if min_len < TOOM3_THRESHOLD {
             self.mul_karatsuba(rhs)
+        } else if ntt_worthwhile(self.limbs.len(), rhs.limbs.len(), false) {
+            mul_ntt(self, rhs)
         } else if min_len < TOOM4_THRESHOLD {
             self.mul_toom3(rhs)
-        } else if min_len < NTT_THRESHOLD {
-            self.mul_toom4(rhs)
         } else {
-            mul_ntt(self, rhs)
+            self.mul_toom4(rhs)
         }
     }
 
@@ -1362,13 +1393,17 @@ fn kara_scratch_len(n: usize) -> usize {
 
 impl Nat {
     /// Returns `self²`, using a symmetric schoolbook or Karatsuba squaring
-    /// (roughly half the limb multiplications of the general `mul`).
+    /// (roughly half the limb multiplications of the general `mul`), or the
+    /// NTT where its two-transform squaring wins (see [`ntt_worthwhile`]).
     pub fn square(&self) -> Nat {
-        if self.is_zero() {
+        let n = self.limbs.len();
+        if n == 0 {
             return Nat::zero();
         }
-        if self.limbs.len() < KARATSUBA_THRESHOLD {
+        if n < KARATSUBA_THRESHOLD {
             self.square_schoolbook()
+        } else if ntt_worthwhile(n, n, true) {
+            mul_ntt(self, self)
         } else {
             self.square_karatsuba()
         }

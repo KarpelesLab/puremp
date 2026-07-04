@@ -28,7 +28,7 @@ name = "puremp"
 # `float` is a separable layer (not part of the core contract) but is enabled
 # by default for convenience; disable it with `--no-default-features`
 # (optionally re-enabling `rational`/`cli`).
-default = ["std", "rational", "float", "dyadic", "padic", "decimal", "complex", "poly", "interval", "ball", "matrix", "lattice", "algebraic", "cli"]
+default = ["std", "rational", "float", "dyadic", "padic", "decimal", "complex", "poly", "interval", "ball", "matrix", "lattice", "identify", "algebraic", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -53,6 +53,9 @@ poly = ["alloc"]
 matrix = ["alloc"]
 # LLL lattice basis reduction over integer lattices (exact rational Gram-Schmidt).
 lattice = ["rational"]
+# Experimental-math tools: inverse symbolic calculator (`identify`) and
+# Machin-like formula discovery (`machin_like`), built on PSLQ + `Float`.
+identify = ["lattice", "float"]
 # Discrete logarithms modulo n (baby-step giant-step + Pollard's rho). Built on
 # `Int`/`ModInt`.
 dlog = ["int"]

@@ -133,6 +133,9 @@ mod poly_factor;
 #[cfg(feature = "lattice")]
 pub mod lattice;
 
+#[cfg(feature = "identify")]
+pub mod identify;
+
 #[cfg(feature = "dlog")]
 pub mod dlog;
 
@@ -206,6 +209,9 @@ pub use matrix::Matrix;
 
 #[cfg(feature = "lattice")]
 pub use lattice::{lll_reduce, lll_reduce_delta};
+
+#[cfg(feature = "identify")]
+pub use identify::{Identification, identify, identify_with, machin_like};
 
 #[cfg(feature = "dlog")]
 pub use dlog::{bsgs, discrete_log, pohlig_hellman, pollard_rho};

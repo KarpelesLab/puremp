@@ -1405,6 +1405,85 @@ impl Float {
         })
     }
 
+    /// Returns the error function `erf(self) = (2/√π)∫₀ˣ e^{−t²} dt`, correctly
+    /// rounded. `erf` is odd, `erf(±0) = ±0` and `erf(±∞) = ±1`.
+    ///
+    /// Moderate arguments use the all-positive (Kummer) series
+    /// `erf(x) = (2/√π) e^{−x²} Σ_{n≥0} 2ⁿ x^{2n+1} / (1·3·5···(2n+1))`
+    /// (DLMF §7.6, no cancellation); large arguments use `1 − erfc(|x|)` via the
+    /// DLMF §7.9 continued fraction.
+    pub fn erf(&self, precision: u64, mode: RoundingMode) -> Float {
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(neg) => Float::from_int(
+                if *neg { &Int::MINUS_ONE } else { &Int::ONE },
+                precision,
+                mode,
+            ),
+            Repr::Zero(_) => Float::zero_signed(self.is_sign_negative(), precision),
+            Repr::Normal { .. } => {
+                let x = self.clone();
+                Float::ziv(precision, mode, move |w| erf_at(&x.round(w, NEAR), w))
+            }
+        }
+    }
+
+    /// Returns the complementary error function `erfc(self) = 1 − erf(self)`,
+    /// correctly rounded. `erfc(0) = 1`, `erfc(+∞) = 0`, `erfc(−∞) = 2`.
+    ///
+    /// For small `|x|` this is `1 − erf(|x|)` (adjusted for sign); for large
+    /// `|x|` the DLMF §7.9 continued fraction is used directly, avoiding the
+    /// catastrophic cancellation of `1 − erf` when `erf(x) ≈ 1`.
+    pub fn erfc(&self, precision: u64, mode: RoundingMode) -> Float {
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(false) => Float::zero(precision),
+            Repr::Inf(true) => Float::from_int(&Int::from_i64(2), precision, mode),
+            Repr::Zero(_) => Float::from_int(&Int::ONE, precision, mode),
+            Repr::Normal { .. } => {
+                let x = self.clone();
+                Float::ziv(precision, mode, move |w| erfc_at(&x.round(w, NEAR), w))
+            }
+        }
+    }
+
+    /// Returns the Riemann zeta function `ζ(self)` for a real argument, correctly
+    /// rounded. Uses Borwein's acceleration of the alternating eta function
+    /// `η(s) = Σ_{k≥1} (−1)^{k−1} k^{−s} = (1 − 2^{1−s}) ζ(s)` (P. Borwein, 2000;
+    /// Cohen–Rodriguez-Villegas–Zagier, 2000), converging geometrically with
+    /// `~0.4·precision` terms, then `ζ(s) = η(s)/(1 − 2^{1−s})`.
+    ///
+    /// # Domain
+    /// Supported for real `s > 0`, `s ≠ 1`. At the pole `s = 1` returns `+∞`;
+    /// `ζ(0) = −1/2` is returned exactly; `s < 0` (and `−∞`) return NaN
+    /// (unsupported — the functional equation is not implemented). `ζ(+∞) = 1`.
+    /// Near `s = 1` the factor `1 − 2^{1−s}` is tiny, so extra working precision
+    /// is spent to keep the result correctly rounded.
+    pub fn zeta(&self, precision: u64, mode: RoundingMode) -> Float {
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(false) => Float::from_int(&Int::ONE, precision, mode),
+            Repr::Inf(true) => Float::nan(precision),
+            // ζ(0) = −1/2.
+            Repr::Zero(_) => Float::from_rational(
+                &Rational::new(Int::MINUS_ONE, Int::from_i64(2)),
+                precision,
+                mode,
+            ),
+            Repr::Normal { neg: true, .. } => Float::nan(precision),
+            Repr::Normal { .. } => {
+                // ζ has a simple pole at s = 1.
+                if self.partial_cmp(&Float::from_int(&Int::ONE, self.precision, NEAR))
+                    == Some(Ordering::Equal)
+                {
+                    return Float::infinity(precision);
+                }
+                let s = self.clone();
+                Float::ziv(precision, mode, move |w| zeta_at(&s.round(w, NEAR), w))
+            }
+        }
+    }
+
     /// Sign as `i64` (`-1`/`0`/`1`), for internal use.
     fn signum_i(&self) -> i64 {
         match self.sign() {
@@ -1941,4 +2020,182 @@ fn atan_at(x: &Float, w: u64) -> Float {
         result = pi_at(w).scale_pow2(-1).sub(&result, w, NEAR);
     }
     if neg { result.neg() } else { result }
+}
+
+// Above these `x²` bounds a method switches: the Kummer series stays cheap and
+// stable while it must carry ~1.44·x² extra bits (its terms peak near e^{x²}),
+// and the continued fraction converges quickly only once x is not small.
+/// Use the Kummer series for `erf` while `x² ≤` this; else `1 − erfc` (CF).
+const ERF_SERIES_MAX_X2: i64 = 25;
+/// Compute `erfc = 1 − erf(series)` while `x² ≤` this; else the CF directly.
+const ERFC_SERIES_MAX_X2: i64 = 4;
+
+/// `⌈x²⌉` as an `i64`, saturating to `i64::MAX` when it overflows (only reached
+/// for enormous arguments, which every caller routes to the "large" branch).
+fn ceil_sq_i64(x: &Float, w: u64) -> i64 {
+    x.mul(x, w, NEAR)
+        .ceil()
+        .and_then(|i| i.to_i64())
+        .unwrap_or(i64::MAX)
+}
+
+/// `erf(x)` for finite non-zero `x` at working precision `w`. Odd in `x`.
+fn erf_at(x: &Float, w: u64) -> Float {
+    let neg = x.is_sign_negative();
+    let a = x.abs();
+    let res = if ceil_sq_i64(&a, w) <= ERF_SERIES_MAX_X2 {
+        erf_series(&a, w)
+    } else {
+        // erf(a) = 1 − erfc(a); erfc is tiny here, so no cancellation.
+        iflt(1, w).sub(&erfc_cf(&a, w), w, NEAR)
+    };
+    if neg { res.neg() } else { res }
+}
+
+/// `erfc(x)` for finite non-zero `x` at working precision `w`.
+fn erfc_at(x: &Float, w: u64) -> Float {
+    let neg = x.is_sign_negative();
+    let a = x.abs();
+    let core = if ceil_sq_i64(&a, w) <= ERFC_SERIES_MAX_X2 {
+        // Small a: erfc(a) = 1 − erf(a); erf(a) is well below 1, mild cancel.
+        iflt(1, w).sub(&erf_series(&a, w), w, NEAR)
+    } else {
+        erfc_cf(&a, w)
+    };
+    // erfc(−a) = 2 − erfc(a).
+    if neg {
+        iflt(2, w).sub(&core, w, NEAR)
+    } else {
+        core
+    }
+}
+
+/// `erf(a)` for `a ≥ 0` via the all-positive Kummer series
+/// `erf(a) = (2/√π) e^{−a²} Σ_{n≥0} 2ⁿ a^{2n+1}/(1·3·5···(2n+1))` (DLMF 7.6.2).
+///
+/// The sum `S = Σ …` is accumulated in scaled-integer arithmetic (every value an
+/// integer multiple of `2^-n`, like [`exp_at`]); its terms peak near `e^{a²}`, so
+/// the scale carries `⌈1.44·a²⌉` bits beyond `w` to keep the result accurate.
+fn erf_series(a: &Float, w: u64) -> Float {
+    let a2c = ceil_sq_i64(a, w).max(0) as u64;
+    // 1.4427 ≈ log₂ e, so a2c·185/128 ≥ a²·log₂ e bounds the peak-term growth.
+    let n = w + a2c.saturating_mul(185) / 128 + 16;
+    // Term ratio tₙ/tₙ₋₁ = 2a²/(2n+1); t₀ = a. Everything scaled by 2ⁿ.
+    let as_ = scaled_int(a, n as i64).magnitude();
+    let two_a2 = as_.square().shr(n).shl(1); // 2a² · 2ⁿ
+    let mut term = as_.clone();
+    let mut sum = as_;
+    let mut k = 1u64;
+    loop {
+        term = term
+            .mul(&two_a2)
+            .shr(n)
+            .div_rem(&Nat::from_u64(2 * k + 1))
+            .expect("odd > 0")
+            .0;
+        if term.is_zero() {
+            break;
+        }
+        sum = sum.add(&term);
+        k += 1;
+    }
+    let s = Float::round_raw(false, sum, -(n as i64), n, NEAR).0;
+    // erf = (2/√π)·e^{−a²}·S.
+    let sqrtpi = pi_at(n).sqrt(n, NEAR);
+    let factor = iflt(2, n).div(&sqrtpi, n, NEAR);
+    let em = a.mul(a, n, NEAR).neg().exp(n, NEAR);
+    factor.mul(&em, n, NEAR).mul(&s, n, NEAR).round(w, NEAR)
+}
+
+/// `erfc(a)` for `a > 0` via the continued fraction (DLMF 7.9.3)
+/// `√π e^{a²} erfc(a) = 1/(a + ½/(a + 1/(a + 3⁄2/(a + …))))`, evaluated by the
+/// modified Lentz algorithm. Converges quickly for the `a > 2` callers.
+fn erfc_cf(a: &Float, w: u64) -> Float {
+    let n = w + 16;
+    let one = iflt(1, n);
+    let tiny = one.scale_pow2(-4 * (n as i64)); // stand-in for a zero pivot
+    let x = a.round(n, NEAR);
+    let stop = one.scale_pow2(-(w as i64) - 4);
+    // f = b₀ + a₁/(b₁ + a₂/(b₂ + …)) with b₀ = 0, bⱼ = x, a₁ = 1,
+    // aⱼ = (j−1)/2 for j ≥ 2.
+    let mut f = tiny.clone();
+    let mut c = f.clone();
+    let mut d = Float::zero(n);
+    let mut j = 1u64;
+    let cap = 8 * w + 200;
+    loop {
+        let aj = if j == 1 {
+            one.clone()
+        } else {
+            rflt((j - 1) as i64, 2, n)
+        };
+        d = x.add(&aj.mul(&d, n, NEAR), n, NEAR);
+        if d.is_zero() {
+            d = tiny.clone();
+        }
+        d = one.div(&d, n, NEAR);
+        c = x.add(&aj.div(&c, n, NEAR), n, NEAR);
+        if c.is_zero() {
+            c = tiny.clone();
+        }
+        let delta = c.mul(&d, n, NEAR);
+        f = f.mul(&delta, n, NEAR);
+        let conv = delta.sub(&one, n, NEAR).abs().partial_cmp(&stop) == Some(Ordering::Less);
+        j += 1;
+        if conv || j > cap {
+            break;
+        }
+    }
+    // erfc(a) = e^{−a²}/√π · f.
+    let sqrtpi = pi_at(n).sqrt(n, NEAR);
+    let em = a.mul(a, n, NEAR).neg().exp(n, NEAR);
+    em.div(&sqrtpi, n, NEAR).mul(&f, n, NEAR).round(w, NEAR)
+}
+
+/// `ζ(s)` for real `s > 0`, `s ≠ 1`, at working precision `w`.
+///
+/// Computes the alternating eta function `η(s) = Σ_{k≥0} (−1)ᵏ (k+1)^{−s}` by the
+/// Cohen–Rodriguez-Villegas–Zagier / Borwein acceleration (error `≤ (3+√8)^{−N}`
+/// for the totally-monotonic terms `(k+1)^{−s}`, `s > 0`), then returns
+/// `ζ(s) = η(s)/(1 − 2^{1−s})`.
+fn zeta_at(s: &Float, w: u64) -> Float {
+    // Terms decay like (3+√8)^{−N}, log₂(3+√8) ≈ 2.543; N·2/5 > (w+16)/2.543.
+    let nt = ((w + 16) * 2 / 5 + 4) as i128;
+    // Exact d = ((3+√8)ᴺ + (3−√8)ᴺ)/2: Dₖ = 6Dₖ₋₁ − Dₖ₋₂, D₀ = 2, D₁ = 6.
+    let mut dprev = Int::from_i64(2);
+    let mut dcur = Int::from_i64(6);
+    let six = Int::from_i64(6);
+    for _ in 2..=nt {
+        let next = dcur.mul(&six).sub(&dprev);
+        dprev = dcur;
+        dcur = next;
+    }
+    let d_int = dcur.div_trunc(&Int::from_i64(2));
+    let df = Float::from_int(&d_int, w, NEAR);
+
+    let neg_s = s.neg();
+    let ln2 = ln2_at(w);
+    // CVZ Algorithm 1: b := −1, c := −d, s := 0; loop; η ≈ Σ cₖ aₖ / d.
+    let mut b = Float::from_int(&Int::MINUS_ONE, w, NEAR);
+    let mut c = df.neg();
+    let mut sum = Float::zero(w);
+    for k in 0..nt {
+        c = b.sub(&c, w, NEAR);
+        // aₖ = (k+1)^{−s} = exp(−s·ln(k+1)).
+        let base = Float::from_int(&Int::from_i128(k + 1), w, NEAR);
+        let ak = neg_s.mul(&base.ln(w, NEAR), w, NEAR).exp(w, NEAR);
+        sum = sum.add(&c.mul(&ak, w, NEAR), w, NEAR);
+        // b ← b·(k+N)(k−N)·2 / ((2k+1)(k+1)).
+        let num = (k + nt) * (k - nt) * 2;
+        let den = (2 * k + 1) * (k + 1);
+        b = b
+            .mul(&Float::from_int(&Int::from_i128(num), w, NEAR), w, NEAR)
+            .div(&Float::from_int(&Int::from_i128(den), w, NEAR), w, NEAR);
+    }
+    let eta = sum.div(&df, w, NEAR);
+    // ζ(s) = η(s) / (1 − 2^{1−s}); 2^{1−s} = exp((1−s)·ln2).
+    let one = iflt(1, w);
+    let two_pow = one.sub(s, w, NEAR).mul(&ln2, w, NEAR).exp(w, NEAR);
+    let factor = one.sub(&two_pow, w, NEAR);
+    eta.div(&factor, w, NEAR)
 }

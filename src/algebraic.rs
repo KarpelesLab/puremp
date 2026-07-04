@@ -25,11 +25,15 @@
 //! # Performance
 //!
 //! Operations are exact but not cheap: a binary operation on degree-`m` and
-//! degree-`n` values builds an `mn × mn` matrix and a degree-`mn` resultant, and
-//! the Sturm sequence over ℚ suffers the classical polynomial-remainder-sequence
-//! coefficient growth. This is fine for modest degrees (sums/products of a few
-//! square roots) but grows quickly beyond that; a subresultant PRS would tame the
-//! coefficient blow-up and is a natural future optimization.
+//! degree-`n` values builds an `mn × mn` matrix and a degree-`mn` resultant. The
+//! Sturm sequences and polynomial GCDs are computed by the **subresultant PRS** on
+//! primitive integer polynomials (see
+//! [`Poly::sturm_chain`](crate::poly::Poly::sturm_chain) and
+//! [`Poly::subresultant_gcd`](crate::poly::Poly::subresultant_gcd)), which keeps
+//! the intermediate coefficients polynomially bounded instead of suffering the
+//! naive rational-remainder-sequence blow-up. This is fine for modest degrees
+//! (sums/products of a few square roots) but the `mn × mn` matrix work still grows
+//! quickly beyond that.
 
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -613,7 +617,7 @@ impl Ord for Algebraic {
         let mut a = self.clone();
         let mut b = other.clone();
         // Shared squarefree gcd chain, for detecting equality of the two roots.
-        let g = squarefree(&a.poly.gcd(&b.poly));
+        let g = squarefree(&a.poly.subresultant_gcd(&b.poly));
         let has_common = g.degree().unwrap_or(0) >= 1;
         let g_chain = has_common.then(|| sturm_chain(&g));
         for _ in 0..4096 {

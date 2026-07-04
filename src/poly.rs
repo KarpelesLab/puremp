@@ -393,31 +393,309 @@ pub fn sturm_count(chain: &[Poly<Rational>], lo: &Rational, hi: &Rational) -> us
     sturm_variations(chain, lo).saturating_sub(sturm_variations(chain, hi))
 }
 
+// ===========================================================================
+// Subresultant polynomial remainder sequence (integer arithmetic).
+//
+// The naive remainder sequence over ℚ (Euclid for `gcd`, and `pᵢ = −(pᵢ₋₂ mod
+// pᵢ₋₁)` for Sturm chains) suffers the classical coefficient blow-up: the
+// rational coefficients grow exponentially in numerator and denominator size.
+//
+// The *subresultant* PRS (Collins 1967; Brown & Traub; Cohen, *A Course in
+// Computational Algebraic Number Theory* §3.3; Ducos 2000) instead works on
+// primitive integer polynomials, replacing each Euclidean remainder by an exact
+// pseudo-remainder scaled down by the subresultant coefficient. Concretely, with
+// `δ = deg Rᵢ₋₁ − deg Rᵢ`,
+//
+//     Rᵢ₊₁ = prem(Rᵢ₋₁, Rᵢ) / (g · h^δ),
+//
+// where `prem(A, B) = lc(B)^{deg A − deg B + 1}·A mod B` is the integer
+// pseudo-remainder and `g`, `h` (the `ψ` sequence) are updated by
+// `g ← lc(Rᵢ₋₁)`, `h ← g^δ / h^{δ−1}`. Every division is exact and the
+// coefficients stay polynomially bounded (Hadamard, not exponential).
+//
+// This module keeps integer polynomials as `Vec<Int>`, low-to-high, with
+// trailing zeros trimmed (empty = zero polynomial).
+// ===========================================================================
+
+/// Degree of an integer polynomial, or `None` for the zero polynomial.
+#[cfg(feature = "rational")]
+fn ip_deg(p: &[crate::int::Int]) -> Option<usize> {
+    p.iter().rposition(|c| !c.is_zero())
+}
+
+/// Trims trailing zero coefficients in place-ish (returns the trimmed vector).
+#[cfg(feature = "rational")]
+fn ip_trim(mut p: alloc::vec::Vec<crate::int::Int>) -> alloc::vec::Vec<crate::int::Int> {
+    match ip_deg(&p) {
+        Some(d) => p.truncate(d + 1),
+        None => p.clear(),
+    }
+    p
+}
+
+/// Leading coefficient of a nonzero integer polynomial.
+#[cfg(feature = "rational")]
+fn ip_lead(p: &[crate::int::Int]) -> &crate::int::Int {
+    &p[ip_deg(p).expect("ip_lead: zero polynomial")]
+}
+
+/// Content: the positive gcd of the coefficients (`0` for the zero polynomial).
+#[cfg(feature = "rational")]
+fn ip_content(p: &[crate::int::Int]) -> crate::int::Int {
+    let mut g = crate::int::Int::ZERO;
+    for c in p {
+        g = g.gcd(c);
+    }
+    g
+}
+
+/// Primitive part: divides out the content, keeping the sign of the leading
+/// coefficient (so the result is a *positive* rational multiple of `p`).
+#[cfg(feature = "rational")]
+fn ip_primitive(p: &[crate::int::Int]) -> alloc::vec::Vec<crate::int::Int> {
+    let c = ip_content(p);
+    if c.is_zero() || c.is_one() {
+        return p.to_vec();
+    }
+    p.iter().map(|x| x.div_exact(&c)).collect()
+}
+
+/// Integer pseudo-remainder `prem(a, b) = lc(b)^{deg a − deg b + 1}·a mod b`.
+///
+/// Computed by Knuth's Algorithm R (TAOCP 4.6.1): iterating `deg a − deg b + 1`
+/// times, each time scaling the running remainder by `lc(b)` and cancelling its
+/// leading term against `b`. Requires `deg a ≥ deg b` and `b ≠ 0`.
+#[cfg(feature = "rational")]
+fn ip_prem(a: &[crate::int::Int], b: &[crate::int::Int]) -> alloc::vec::Vec<crate::int::Int> {
+    use crate::int::Int;
+    let n = ip_deg(b).expect("ip_prem: division by zero polynomial");
+    let m = match ip_deg(a) {
+        Some(m) if m >= n => m,
+        _ => return a.to_vec(), // deg a < deg b: zero iterations, prem = a
+    };
+    let l = ip_lead(b).clone();
+    let mut r = a.to_vec();
+    for k in (0..=(m - n)).rev() {
+        // Cancel the leading term of `r` (if present at degree n+k), then scale.
+        if ip_deg(&r) == Some(n + k) {
+            let coef = r[n + k].clone(); // lc(r) *before* scaling
+            for c in r.iter_mut() {
+                *c = Int::mul(c, &l);
+            }
+            for (i, bc) in b.iter().enumerate() {
+                r[k + i] = Int::sub(&r[k + i], &Int::mul(&coef, bc));
+            }
+        } else {
+            for c in r.iter_mut() {
+                *c = Int::mul(c, &l);
+            }
+        }
+        r = ip_trim(r);
+    }
+    r
+}
+
+/// Clears denominators of a `Poly<Rational>` and returns the *primitive* integer
+/// polynomial that is a positive rational multiple of it (empty for zero).
+#[cfg(feature = "rational")]
+fn rational_to_primitive_int(p: &Poly<Rational>) -> alloc::vec::Vec<crate::int::Int> {
+    use crate::int::Int;
+    if p.is_zero() {
+        return alloc::vec::Vec::new();
+    }
+    // L = lcm of all denominators (positive).
+    let mut l = Int::ONE;
+    for c in p.coeffs() {
+        let d = c.denominator();
+        let g = l.gcd(d);
+        l = l.div_exact(&g).mul(d);
+    }
+    // Coefficient i becomes numᵢ · (L / denᵢ), an integer.
+    let ints: alloc::vec::Vec<Int> = p
+        .coeffs()
+        .iter()
+        .map(|c| c.numerator().mul(&l.div_exact(c.denominator())))
+        .collect();
+    ip_primitive(&ints)
+}
+
+/// The subresultant PRS for a Sturm chain, on integer polynomials.
+///
+/// Given `p0`, `p1` that are *positive* rational multiples of `p` and `p′` (a
+/// squarefree `p`), returns integer polynomials `R₀, R₁, …, R_k` where each
+/// `Rᵢ` is a positive rational multiple of the true Sturm polynomial `pᵢ`
+/// (`p₀ = p`, `p₁ = p′`, `pᵢ = −(pᵢ₋₂ mod pᵢ₋₁)`). Being a positive multiple,
+/// `Rᵢ(x)` has the same sign as `pᵢ(x)` at every `x`, so the sequence has an
+/// identical sign-variation count — a genuine Sturm chain — while its
+/// coefficients stay polynomially bounded.
+///
+/// Sign bookkeeping: with `Rᵢ₋₁ = a·pᵢ₋₁`, `Rᵢ = b·pᵢ` (`a, b > 0`),
+/// `rem(Rᵢ₋₁, Rᵢ) = a·rem(pᵢ₋₁, pᵢ) = −a·pᵢ₊₁`, hence
+/// `prem(Rᵢ₋₁, Rᵢ) = −a·lc(Rᵢ)^{δ+1}·pᵢ₊₁`, whose sign is
+/// `−sign(lc Rᵢ)^{δ+1}`. Multiplying by that sign yields a positive multiple of
+/// `pᵢ₊₁`. Dividing by the (positive) subresultant magnitude `g·h^δ` preserves
+/// the sign and keeps coefficients bounded.
+#[cfg(feature = "rational")]
+fn ip_sturm_chain(
+    p0: alloc::vec::Vec<crate::int::Int>,
+    p1: alloc::vec::Vec<crate::int::Int>,
+) -> alloc::vec::Vec<alloc::vec::Vec<crate::int::Int>> {
+    use crate::int::Int;
+    let mut chain = alloc::vec![p0];
+    if ip_deg(&p1).is_none() {
+        return chain; // p constant: derivative is zero, chain is just [p₀].
+    }
+    chain.push(p1);
+    let mut g = Int::ONE;
+    let mut h = Int::ONE;
+    loop {
+        let last = chain.len() - 1;
+        let dega = ip_deg(&chain[last - 1]).expect("sturm: zero in chain");
+        let degb = ip_deg(&chain[last]).expect("sturm: zero in chain");
+        let e = dega - degb; // δ ≥ 1 (remainder degrees strictly decrease)
+        let praw = ip_prem(&chain[last - 1], &chain[last]);
+        if ip_deg(&praw).is_none() {
+            break; // exact division: previous element is (a multiple of) the gcd
+        }
+        // Positive-multiple sign: −sign(lc Rᵢ)^{δ+1}.
+        let lead_sign = ip_lead(&chain[last]).signum();
+        let pow_sign = if (e + 1).is_multiple_of(2) {
+            1
+        } else {
+            lead_sign
+        };
+        let flip = -pow_sign < 0; // true ⇒ negate to get the positive multiple
+        // Subresultant magnitude denominator g·h^δ (exact divisor of praw).
+        let denom = g.mul(&h.pow(e as u32));
+        let mut next: alloc::vec::Vec<Int> = praw.iter().map(|c| c.div_exact(&denom)).collect();
+        if flip {
+            for c in next.iter_mut() {
+                *c = Int::neg(c);
+            }
+        }
+        // ψ update (magnitudes, Cohen 3.3.1): g ← |lc(Rᵢ)| (the divisor, which
+        // becomes the next dividend), h ← g^δ / h^{δ−1}.
+        let new_g = ip_lead(&chain[last]).abs();
+        h = if e == 0 {
+            h
+        } else {
+            new_g.pow(e as u32).div_exact(&h.pow((e - 1) as u32))
+        };
+        g = new_g;
+        chain.push(ip_trim(next));
+    }
+    chain
+}
+
+/// The subresultant GCD of two integer polynomials, returned as a primitive
+/// integer polynomial (Cohen, Algorithm 3.3.1). The result is the integer GCD up
+/// to sign; callers normalize as needed.
+#[cfg(feature = "rational")]
+fn ip_subresultant_gcd(
+    a: &[crate::int::Int],
+    b: &[crate::int::Int],
+) -> alloc::vec::Vec<crate::int::Int> {
+    use crate::int::Int;
+    let mut a = ip_primitive(a);
+    let mut b = ip_primitive(b);
+    if ip_deg(&b).is_none() {
+        return a;
+    }
+    if ip_deg(&a).is_none() {
+        return b;
+    }
+    if ip_deg(&a) < ip_deg(&b) {
+        core::mem::swap(&mut a, &mut b);
+    }
+    let mut g = Int::ONE;
+    let mut h = Int::ONE;
+    loop {
+        let e = ip_deg(&a).unwrap() - ip_deg(&b).unwrap();
+        let r = ip_prem(&a, &b);
+        match ip_deg(&r) {
+            None => break,                           // b divides a: b is the gcd
+            Some(0) => return alloc::vec![Int::ONE], // constant remainder: coprime
+            Some(_) => {}
+        }
+        let denom = g.mul(&h.pow(e as u32));
+        let next: alloc::vec::Vec<Int> = r.iter().map(|c| c.div_exact(&denom)).collect();
+        // Cohen 3.3.1: after A←B, g ← lc(A) = lc(old divisor b).
+        let new_g = ip_lead(&b).clone();
+        h = if e == 0 {
+            h
+        } else {
+            new_g.pow(e as u32).div_exact(&h.pow((e - 1) as u32))
+        };
+        g = new_g;
+        a = b;
+        b = ip_trim(next);
+    }
+    ip_primitive(&b)
+}
+
+/// Converts an integer polynomial to a `Poly<Rational>` (integer coefficients).
+#[cfg(feature = "rational")]
+fn int_poly_to_rational(p: &[crate::int::Int]) -> Poly<Rational> {
+    Poly::new(
+        p.iter()
+            .map(|c| Rational::from_integer(c.clone()))
+            .collect(),
+    )
+}
+
 #[cfg(feature = "rational")]
 impl Poly<Rational> {
+    /// Returns the monic GCD of `self` and `other` via the subresultant PRS.
+    ///
+    /// Mathematically equal to [`gcd`](Poly::gcd) (the monic greatest common
+    /// divisor over ℚ), but computed on primitive integer polynomials with
+    /// subresultant scaling, so the intermediate coefficients stay polynomially
+    /// bounded instead of suffering the Euclidean rational-coefficient blow-up.
+    pub fn subresultant_gcd(&self, other: &Poly<Rational>) -> Poly<Rational> {
+        if self.is_zero() {
+            return other.monic();
+        }
+        if other.is_zero() {
+            return self.monic();
+        }
+        let a = rational_to_primitive_int(self);
+        let b = rational_to_primitive_int(other);
+        let g = ip_subresultant_gcd(&a, &b);
+        int_poly_to_rational(&g).monic()
+    }
+
     /// Returns the squarefree part `self / gcd(self, self′)` (monic).
     pub fn squarefree_part(&self) -> Poly<Rational> {
         if self.degree().unwrap_or(0) < 1 {
             return self.monic();
         }
-        let g = self.gcd(&self.derivative());
+        let g = self.subresultant_gcd(&self.derivative());
         self.div_rem(&g).0.monic()
     }
 
-    /// Returns the Sturm chain `p₀ = self, p₁ = self′, pᵢ = −(pᵢ₋₂ mod pᵢ₋₁)`.
-    /// For a correct real-root count the polynomial should be squarefree (see
+    /// Returns a Sturm chain of `self`: `p₀ = self`, `p₁ = self′`, and each
+    /// subsequent term a positive rational multiple of `−(pᵢ₋₂ mod pᵢ₋₁)`.
+    ///
+    /// The chain is computed by the **subresultant PRS** on primitive integer
+    /// polynomials (see the module notes), so intermediate coefficients stay
+    /// polynomially bounded rather than exploding as the naive rational
+    /// remainder sequence does. Each returned polynomial is a *positive* rational
+    /// multiple of the corresponding classical Sturm polynomial, hence has the
+    /// same sign at every point: the sign-variation count — and therefore every
+    /// real-root count derived from it — is identical to the classical chain. For
+    /// a correct real-root count the polynomial should be squarefree (see
     /// [`squarefree_part`](Poly::squarefree_part)).
     pub fn sturm_chain(&self) -> alloc::vec::Vec<Poly<Rational>> {
-        let mut chain = alloc::vec![self.clone(), self.derivative()];
-        while !chain.last().unwrap().is_zero() {
-            let n = chain.len();
-            let r = chain[n - 2].rem(&chain[n - 1]);
-            if r.is_zero() {
-                break;
-            }
-            chain.push(r.neg());
+        let p0 = rational_to_primitive_int(self);
+        if ip_deg(&p0).is_none() {
+            // Zero polynomial: mirror the classical [zero, zero-derivative] shape.
+            return alloc::vec![Poly::zero()];
         }
-        chain
+        let p1 = rational_to_primitive_int(&self.derivative());
+        ip_sturm_chain(p0, p1)
+            .iter()
+            .map(|r| int_poly_to_rational(r))
+            .collect()
     }
 
     /// A Cauchy bound: every real root lies in the open interval `(-b, b)`.

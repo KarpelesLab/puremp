@@ -121,6 +121,10 @@ required-features = ["cli"]
 name = "bench"
 required-features = ["std", "float"]
 
+[[example]]
+name = "alg_bench"
+required-features = ["std", "algebraic"]
+
 [lints.rust]
 # Keep the public surface documented and the internal/external boundary honest.
 missing_docs = "warn"

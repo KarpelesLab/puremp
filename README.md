@@ -7,8 +7,9 @@
 
 Pure-Rust, MIT-licensed, arbitrary-precision arithmetic — **integers,
 rationals, MPFR-class floating point, and base-10 decimals**, plus derived
-**modular integers, complex numbers, polynomials, matrices, intervals, and exact
-real algebraic numbers** — with no foreign-code dependencies. Usable as a Rust
+**modular integers, complex numbers, polynomials, matrices, interval & ball
+arithmetic, p-adic numbers, and exact real algebraic numbers** — with no
+foreign-code dependencies. Usable as a Rust
 crate, a C library, and a command-line calculator.
 
 ## Why
@@ -96,6 +97,7 @@ int main(void) {
 | `rational` | ✔ | `Rational` and `InfRational` (implies `int`) |
 | `dyadic` | ✔ | `Dyadic` — exact `n·2⁻ᵏ` binary fractions (implies `int`) |
 | `decimal` | ✔ | `Decimal` — exact base-10 floating point (implies `int`) |
+| `padic` | ✔ | `Padic` — fixed-precision `p`-adic numbers ℤ_p/ℚ_p (implies `rational`) |
 | `complex` | ✔ | `Complex<T>` — generic complex / Gaussian integers |
 | `poly` | ✔ | `Poly<T>` — generic univariate polynomials |
 | `matrix` | ✔ | `Matrix<T>` — dense matrices with exact linear algebra |
@@ -105,6 +107,7 @@ int main(void) {
 | `algebraic` | ✔ | `Quadratic` (ℚ(√d)) and general real `Algebraic` numbers |
 | `identify` | ✔ | Inverse symbolic calculator (`identify`, `machin_like`) via PSLQ (implies `lattice` + `float`) |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
+| `dlog` | | Discrete logarithm — BSGS, Pollard rho, Pohlig–Hellman (implies `int`) |
 | `num-traits` | | Implements `num-traits` interfaces for `Int`/`Rational`/`Nat`/`Decimal`/`Complex` |
 | `ffi` | | The C ABI module (`include/puremp.h`) |
 | `cli` | ✔ | The `puremp` binary |

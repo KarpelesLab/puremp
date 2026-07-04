@@ -1124,72 +1124,198 @@ impl Nat {
         recombine_coeffs(self.limbs.len() + rhs.limbs.len(), k, &[c0, c1, c2, c3, c4])
     }
 
-    /// Quadratic schoolbook (long) multiplication.
-    ///
-    /// The main loop is an `addmul_2`: each pass adds two multiplier limbs'
-    /// worth of products (`out += (a₀ + a₁·2^64)·b`), halving the passes over
-    /// `out` and keeping two independent limb products in flight per iteration
-    /// instead of one serial multiply-accumulate chain.
+    /// Quadratic schoolbook (long) multiplication (see [`mul_into_schoolbook`]).
     fn mul_schoolbook(&self, rhs: &Nat) -> Nat {
-        use crate::limb::DLimb;
-        let a = &self.limbs;
-        let b = &rhs.limbs;
-        let rn = b.len();
-        let mut out = alloc::vec![0 as Limb; a.len() + rn];
-        let mut i = 0;
-        while i + 2 <= a.len() {
-            let (a0, a1) = (a[i], a[i + 1]);
-            // Position i+j collects lo(a0·b[j]) + hi(a0·b[j−1]) + lo(a1·b[j−1])
-            // + hi(a1·b[j−2]) + carry: five limb-sized terms, so the u128
-            // accumulator cannot overflow and the carry out is at most 4.
-            let mut ph0: Limb = 0; // hi(a0·b[j−1])
-            let mut pl1: Limb = 0; // lo(a1·b[j−1])
-            let mut ph1: Limb = 0; // hi(a1·b[j−1])
-            let mut ph1p: Limb = 0; // hi(a1·b[j−2])
-            let mut carry: Limb = 0;
-            let row = &mut out[i..i + rn + 2];
-            for (o, &bj) in row.iter_mut().zip(b) {
-                let p0 = a0 as DLimb * bj as DLimb;
-                let p1 = a1 as DLimb * bj as DLimb;
-                let acc = *o as DLimb
-                    + (p0 as Limb) as DLimb
-                    + ph0 as DLimb
-                    + pl1 as DLimb
-                    + ph1p as DLimb
-                    + carry as DLimb;
-                *o = acc as Limb;
-                carry = (acc >> LIMB_BITS) as Limb;
-                ph0 = (p0 >> LIMB_BITS) as Limb;
-                ph1p = ph1;
-                pl1 = p1 as Limb;
-                ph1 = (p1 >> LIMB_BITS) as Limb;
-            }
-            // Flush the pipeline into the two limbs above the row.
-            let acc =
-                row[rn] as DLimb + ph0 as DLimb + pl1 as DLimb + ph1p as DLimb + carry as DLimb;
-            row[rn] = acc as Limb;
-            let top = row[rn + 1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
-            row[rn + 1] = top as Limb;
-            debug_assert_eq!(top >> LIMB_BITS, 0, "schoolbook top carry escaped");
-            i += 2;
-        }
-        if i < a.len() {
-            // Odd tail: one classic addmul_1 row.
-            let ai = a[i];
-            let mut carry = 0;
-            let row = &mut out[i..i + rn];
-            for (o, &bj) in row.iter_mut().zip(b) {
-                let (lo, hi) = mac(*o, ai, bj, carry);
-                *o = lo;
-                carry = hi;
-            }
-            out[i + rn] = carry;
-        }
+        let mut out = alloc::vec![0 as Limb; self.limbs.len() + rhs.limbs.len()];
+        mul_into_schoolbook(&self.limbs, &rhs.limbs, &mut out);
         let mut n = Nat { limbs: out };
         n.normalize();
         n
     }
+}
 
+/// Quadratic schoolbook (long) multiplication of `a·b` into the zeroed buffer
+/// `out` (`out.len() == a.len() + b.len()`); accumulates on top of whatever is
+/// already there (the buffer being zeroed makes it a plain product).
+///
+/// The main loop is an `addmul_2`: each pass adds two multiplier limbs'
+/// worth of products (`out += (a₀ + a₁·2^64)·b`), halving the passes over
+/// `out` and keeping two independent limb products in flight per iteration
+/// instead of one serial multiply-accumulate chain.
+fn mul_into_schoolbook(a: &[Limb], b: &[Limb], out: &mut [Limb]) {
+    use crate::limb::DLimb;
+    debug_assert_eq!(out.len(), a.len() + b.len());
+    let rn = b.len();
+    if a.is_empty() || rn == 0 {
+        return;
+    }
+    let mut i = 0;
+    while i + 2 <= a.len() {
+        let (a0, a1) = (a[i], a[i + 1]);
+        // Position i+j collects lo(a0·b[j]) + hi(a0·b[j−1]) + lo(a1·b[j−1])
+        // + hi(a1·b[j−2]) + carry: five limb-sized terms, so the u128
+        // accumulator cannot overflow and the carry out is at most 4.
+        let mut ph0: Limb = 0; // hi(a0·b[j−1])
+        let mut pl1: Limb = 0; // lo(a1·b[j−1])
+        let mut ph1: Limb = 0; // hi(a1·b[j−1])
+        let mut ph1p: Limb = 0; // hi(a1·b[j−2])
+        let mut carry: Limb = 0;
+        let row = &mut out[i..i + rn + 2];
+        for (o, &bj) in row.iter_mut().zip(b) {
+            let p0 = a0 as DLimb * bj as DLimb;
+            let p1 = a1 as DLimb * bj as DLimb;
+            let acc = *o as DLimb
+                + (p0 as Limb) as DLimb
+                + ph0 as DLimb
+                + pl1 as DLimb
+                + ph1p as DLimb
+                + carry as DLimb;
+            *o = acc as Limb;
+            carry = (acc >> LIMB_BITS) as Limb;
+            ph0 = (p0 >> LIMB_BITS) as Limb;
+            ph1p = ph1;
+            pl1 = p1 as Limb;
+            ph1 = (p1 >> LIMB_BITS) as Limb;
+        }
+        // Flush the pipeline into the two limbs above the row.
+        let acc = row[rn] as DLimb + ph0 as DLimb + pl1 as DLimb + ph1p as DLimb + carry as DLimb;
+        row[rn] = acc as Limb;
+        let top = row[rn + 1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
+        row[rn + 1] = top as Limb;
+        debug_assert_eq!(top >> LIMB_BITS, 0, "schoolbook top carry escaped");
+        i += 2;
+    }
+    if i < a.len() {
+        // Odd tail: one classic addmul_1 row.
+        let ai = a[i];
+        let mut carry = 0;
+        let row = &mut out[i..i + rn];
+        for (o, &bj) in row.iter_mut().zip(b) {
+            let (lo, hi) = mac(*o, ai, bj, carry);
+            *o = lo;
+            carry = hi;
+        }
+        out[i + rn] = carry;
+    }
+}
+
+/// Sums `a + b` into `out`, which must be exactly `max(len) + 1` limbs; every
+/// limb of `out` is written (the top limb is the 0/1 carry).
+fn add_full(a: &[Limb], b: &[Limb], out: &mut [Limb]) {
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    debug_assert_eq!(out.len(), long.len() + 1);
+    let mut carry = 0;
+    let (head, tail) = out.split_at_mut(short.len());
+    for ((o, &x), &y) in head.iter_mut().zip(long).zip(short) {
+        let (s, c) = adc(x, y, carry);
+        *o = s;
+        carry = c;
+    }
+    let (mid, last) = tail.split_at_mut(long.len() - short.len());
+    for (o, &x) in mid.iter_mut().zip(&long[short.len()..]) {
+        let (s, c) = adc(x, 0, carry);
+        *o = s;
+        carry = c;
+    }
+    last[0] = carry;
+}
+
+/// Subtracts `src` from `dst` in place (`dst -= src`); requires `dst >= src`
+/// as numbers and `dst.len() >= src.len()`.
+fn sub_in_place(dst: &mut [Limb], src: &[Limb]) {
+    let mut borrow = 0;
+    let (head, tail) = dst.split_at_mut(src.len());
+    for (d, &s) in head.iter_mut().zip(src) {
+        let (r, b) = sbb(*d, s, borrow);
+        *d = r;
+        borrow = b;
+    }
+    let mut it = tail.iter_mut();
+    while borrow != 0 {
+        let d = it.next().expect("sub_in_place borrow escaped: dst < src");
+        let (r, b) = sbb(*d, 0, borrow);
+        *d = r;
+        borrow = b;
+    }
+}
+
+/// Karatsuba multiplication of `a·b` into the zeroed buffer `out`
+/// (`out.len() == a.len() + b.len()`), using `scratch` for every intermediate —
+/// no per-node allocation. `z0` and `z2` land directly in the disjoint halves
+/// of `out`; only the middle term needs scratch space.
+fn kara_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    debug_assert_eq!(out.len(), a.len() + b.len());
+    if a.len().min(b.len()) < KARATSUBA_THRESHOLD {
+        mul_into_schoolbook(a, b, out);
+        return;
+    }
+    let h = a.len().max(b.len()).div_ceil(2);
+    let (a0, a1) = a.split_at(a.len().min(h));
+    let (b0, b1) = b.split_at(b.len().min(h));
+    // z0 = a0·b0 at offset 0, z2 = a1·b1 at offset 2h (disjoint slices).
+    let z0_len = a0.len() + b0.len();
+    let have_z2 = !a1.is_empty() && !b1.is_empty();
+    kara_into(a0, b0, &mut out[..z0_len], scratch);
+    if have_z2 {
+        kara_into(a1, b1, &mut out[2 * h..], scratch);
+    }
+    // zm = (a0+a1)·(b0+b1) − z0 − z2, added at offset h.
+    let sa_len = a0.len().max(a1.len()) + 1;
+    let sb_len = b0.len().max(b1.len()) + 1;
+    let (sa, rest) = scratch.split_at_mut(sa_len);
+    let (sb, rest) = rest.split_at_mut(sb_len);
+    let (zm, rest) = rest.split_at_mut(sa_len + sb_len);
+    add_full(a0, a1, sa);
+    add_full(b0, b1, sb);
+    zm.fill(0);
+    kara_into(sa, sb, zm, rest);
+    sub_in_place(zm, &out[..z0_len]);
+    if have_z2 {
+        sub_in_place(zm, &out[2 * h..]);
+    }
+    // Trim zm's zero top limbs: the value always fits, the buffer may not.
+    let zm_len = zm.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
+    add_at(out, h, &zm[..zm_len]);
+}
+
+/// Karatsuba squaring of `a` into the zeroed buffer `out`
+/// (`out.len() == 2·a.len()`), sharing the same scratch discipline as
+/// [`kara_into`].
+fn kara_sqr_into(a: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    debug_assert_eq!(out.len(), 2 * a.len());
+    if a.len() < KARATSUBA_THRESHOLD {
+        sqr_into(a, out);
+        return;
+    }
+    let h = a.len().div_ceil(2);
+    let (a0, a1) = a.split_at(h);
+    kara_sqr_into(a0, &mut out[..2 * h], scratch);
+    kara_sqr_into(a1, &mut out[2 * h..], scratch);
+    let (sa, rest) = scratch.split_at_mut(h + 1);
+    let (zm, rest) = rest.split_at_mut(2 * (h + 1));
+    add_full(a0, a1, sa);
+    zm.fill(0);
+    kara_sqr_into(sa, zm, rest);
+    sub_in_place(zm, &out[..2 * h]);
+    sub_in_place(zm, &out[2 * h..]);
+    let zm_len = zm.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
+    add_at(out, h, &zm[..zm_len]);
+}
+
+/// Scratch size sufficient for [`kara_into`]/[`kara_sqr_into`] on operands of
+/// at most `n` limbs each: each level consumes `≤ 2n + 6` limbs and recurses on
+/// `≤ n/2 + 2`.
+fn kara_scratch_len(n: usize) -> usize {
+    let mut need = 0;
+    let mut m = n;
+    while m >= KARATSUBA_THRESHOLD {
+        need += 2 * m + 6;
+        m = m / 2 + 2;
+    }
+    need
+}
+
+impl Nat {
     /// Returns `self²`, using a symmetric schoolbook or Karatsuba squaring
     /// (roughly half the limb multiplications of the general `mul`).
     pub fn square(&self) -> Nat {
@@ -1212,62 +1338,32 @@ impl Nat {
         n
     }
 
-    /// Karatsuba squaring: three half-size squarings.
+    /// Karatsuba squaring: three half-size squarings, run as a slice recursion
+    /// into one output buffer with one shared scratch allocation.
     fn square_karatsuba(&self) -> Nat {
         let n = self.limbs.len();
         if n < KARATSUBA_THRESHOLD {
             return self.square_schoolbook();
         }
-        let half = n / 2;
-        let (a0, a1) = self.split_at_limb(half);
-        let z0 = a0.square();
-        let z2 = a1.square();
-        let z1 = a0
-            .add(&a1)
-            .square()
-            .checked_sub(&z0)
-            .and_then(|t| t.checked_sub(&z2))
-            .expect("karatsuba square middle term is non-negative");
-        let bits = (half * LIMB_BITS as usize) as u64;
-        z2.shl(2 * bits).add(&z1.shl(bits)).add(&z0)
+        let mut out = alloc::vec![0 as Limb; 2 * n];
+        let mut scratch = alloc::vec![0 as Limb; kara_scratch_len(n)];
+        kara_sqr_into(&self.limbs, &mut out, &mut scratch);
+        let mut r = Nat { limbs: out };
+        r.normalize();
+        r
     }
 
-    /// Returns `(low, high)` where `self == low + high·2^(64·at)`.
-    fn split_at_limb(&self, at: usize) -> (Nat, Nat) {
-        if at >= self.limbs.len() {
-            return (self.clone(), Nat::zero());
-        }
-        (
-            Nat::from_limbs(&self.limbs[..at]),
-            Nat::from_limbs(&self.limbs[at..]),
-        )
-    }
-
-    /// Karatsuba multiplication: three half-size products instead of four.
+    /// Karatsuba multiplication: three half-size products instead of four, run
+    /// as a slice recursion into one output buffer with one shared scratch
+    /// allocation (see [`kara_into`]) instead of ~9 `Vec`s per node.
     fn mul_karatsuba(&self, rhs: &Nat) -> Nat {
-        let n = self.limbs.len().max(rhs.limbs.len());
         if self.limbs.len().min(rhs.limbs.len()) < KARATSUBA_THRESHOLD {
             return self.mul_schoolbook(rhs);
         }
-        let half = n / 2;
-        let (a0, a1) = self.split_at_limb(half);
-        let (b0, b1) = rhs.split_at_limb(half);
-        let z0 = a0.mul(&b0);
-        let z2 = a1.mul(&b1);
-        // z1 = (a0+a1)(b0+b1) - z2 - z0
-        let z1 = a0
-            .add(&a1)
-            .mul(&b0.add(&b1))
-            .checked_sub(&z2)
-            .and_then(|t| t.checked_sub(&z0))
-            .expect("karatsuba middle term is non-negative");
-        // Recombine z0 + z1·B^half + z2·B^(2·half) directly into one buffer
-        // (the shifts are whole-limb), avoiding per-term shl/add allocations.
-        let total = self.limbs.len() + rhs.limbs.len();
-        let mut out = alloc::vec![0 as Limb; total + 1];
-        add_at(&mut out, 0, &z0.limbs);
-        add_at(&mut out, half, &z1.limbs);
-        add_at(&mut out, 2 * half, &z2.limbs);
+        let mut out = alloc::vec![0 as Limb; self.limbs.len() + rhs.limbs.len()];
+        let mut scratch =
+            alloc::vec![0 as Limb; kara_scratch_len(self.limbs.len().max(rhs.limbs.len()))];
+        kara_into(&self.limbs, &rhs.limbs, &mut out, &mut scratch);
         let mut n = Nat { limbs: out };
         n.normalize();
         n
@@ -2876,6 +2972,55 @@ mod tests {
         let a = common.mul(&Nat::from_u64(7).pow(30));
         let b = common.mul(&Nat::from_u64(11).pow(25));
         assert_eq!(a.gcd_lehmer(&b), common);
+    }
+
+    #[test]
+    fn karatsuba_matches_schoolbook() {
+        // The slice-recursion Karatsuba (mul and square) must agree with
+        // schoolbook across balanced, unbalanced, and threshold-edge sizes.
+        let mk = |limbs: usize, seed: u64| {
+            let mut s = seed;
+            let bytes: Vec<u8> = (0..limbs * 8)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s as u8
+                })
+                .collect();
+            Nat::from_bytes_le(&bytes)
+        };
+        let sizes: &[(usize, usize)] = &[
+            (128, 128),
+            (128, 129),
+            (129, 257),
+            (200, 400),
+            (130, 1000),
+            (333, 334),
+            (512, 512),
+            (150, 900),
+        ];
+        for &(x, y) in sizes {
+            let (a, b) = (mk(x, x as u64 + 1), mk(y, y as u64 + 7));
+            assert_eq!(
+                a.mul_karatsuba(&b),
+                a.mul_schoolbook(&b),
+                "kara mul {x}x{y}"
+            );
+            assert_eq!(
+                b.mul_karatsuba(&a),
+                b.mul_schoolbook(&a),
+                "kara mul {y}x{x}"
+            );
+        }
+        for &limbs in &[128usize, 129, 255, 256, 300, 511] {
+            let a = mk(limbs, limbs as u64 * 31 + 5);
+            assert_eq!(
+                a.square_karatsuba(),
+                a.mul_schoolbook(&a.clone()),
+                "kara square {limbs}"
+            );
+        }
     }
 
     #[test]

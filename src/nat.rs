@@ -35,8 +35,10 @@ const TOOM3_THRESHOLD: usize = 1400;
 /// Operands with at least this many limbs use Toom-4 (above Toom-3).
 const TOOM4_THRESHOLD: usize = 6000;
 
-/// GCD switches from Stein's binary algorithm to Lehmer's above this many limbs.
-const LEHMER_THRESHOLD: usize = 16;
+/// Lehmer passes use the double-word (126-bit) window above this many limbs;
+/// below it, the wider window's u128 division libcalls cost more than the
+/// full-length passes they save.
+const LEHMER_DW_LIMBS: usize = 110;
 
 /// The digit width (bytes) and transform length [`mul_ntt`] uses for a product
 /// totalling `total_bytes` of operand, or `None` if even 1-byte digits would
@@ -867,6 +869,102 @@ fn lincomb_pos(a: i128, u: &Nat, b: i128, v: &Nat) -> Nat {
     r
 }
 
+/// `⌊x / 2^shift⌋` truncated to 128 bits, read directly from the limbs — no
+/// allocation, unlike `shr`. The Lehmer callers pick `shift` so the true value
+/// fits (any higher bits are zero by construction).
+fn shifted_window(x: &Nat, shift: u64) -> u128 {
+    let ls = (shift / LIMB_BITS as u64) as usize;
+    let bs = (shift % LIMB_BITS as u64) as u32;
+    let limb = |i: usize| -> u128 { x.limbs.get(i).map_or(0, |&l| l as u128) };
+    if bs == 0 {
+        limb(ls) | (limb(ls + 1) << LIMB_BITS)
+    } else {
+        (limb(ls) >> bs) | (limb(ls + 1) << (LIMB_BITS - bs)) | (limb(ls + 2) << (128 - bs))
+    }
+}
+
+/// Single-word Lehmer pass: partial Euclid on the leading ~63 bits (`x`, `y`
+/// aligned, `x < 2^63`), accumulating the cofactor matrix `[[a,b],[c,d]]` in
+/// machine words. An i128 quotient would lower to a slow division libcall,
+/// while Lehmer's invariants keep every quantity inside a u64/i64; any sign or
+/// overflow violation simply breaks out, and `b == 0` tells the caller to fall
+/// back to one (always correct) multi-precision division.
+fn lehmer_step64(mut x: u64, mut y: u64) -> (i128, i128, i128, i128) {
+    let (mut a, mut b, mut c, mut d) = (1i64, 0i64, 0i64, 1i64);
+    loop {
+        let (yc, yd) = (y as i128 + c as i128, y as i128 + d as i128);
+        if yc <= 0 || yd <= 0 {
+            break;
+        }
+        // x < 2^63 and |a| ≤ i64::MAX, so x+a fits a u64 when ≥ 0.
+        let (xa, xb) = (x as i128 + a as i128, x as i128 + b as i128);
+        if xa < 0 || xb < 0 {
+            break;
+        }
+        let q = (xa as u64) / (yc as u64);
+        if q != (xb as u64) / (yd as u64) {
+            break; // Lehmer's exactness test failed
+        }
+        let Ok(qi) = i64::try_from(q) else { break };
+        let (Some(nc), Some(nd)) = (
+            qi.checked_mul(c).and_then(|t| a.checked_sub(t)),
+            qi.checked_mul(d).and_then(|t| b.checked_sub(t)),
+        ) else {
+            break;
+        };
+        (a, b) = (c, d);
+        (c, d) = (nc, nd);
+        // ny = x − q·y, non-negative by construction (q equals the true
+        // quotient of x/y because the two bracketing tests agreed).
+        let ny = (x as u128).wrapping_sub(q as u128 * y as u128) as u64;
+        x = y;
+        y = ny;
+    }
+    (a as i128, b as i128, c as i128, d as i128)
+}
+
+/// Double-word Lehmer pass: like [`lehmer_step64`] but on the leading
+/// ~126 bits, stripping about twice as many bits per full-length matrix
+/// application. The cofactors are explicitly capped below 2^63 to honour
+/// [`lincomb_pos`]'s bound (the exactness test fails around there anyway).
+fn lehmer_step128(mut x: u128, mut y: u128) -> (i128, i128, i128, i128) {
+    debug_assert!(x >> 126 == 0, "window must leave i128 headroom");
+    let (mut a, mut b, mut c, mut d) = (1i128, 0i128, 0i128, 1i128);
+    loop {
+        // x < 2^126 and |c|, |d| < 2^63, so these sums cannot overflow i128.
+        let (yc, yd) = (y as i128 + c, y as i128 + d);
+        if yc <= 0 || yd <= 0 {
+            break;
+        }
+        let (xa, xb) = (x as i128 + a, x as i128 + b);
+        if xa < 0 || xb < 0 {
+            break;
+        }
+        let q = (xa as u128) / (yc as u128);
+        if q != (xb as u128) / (yd as u128) {
+            break; // Lehmer's exactness test failed
+        }
+        let Ok(qi) = i128::try_from(q) else { break };
+        let (Some(nc), Some(nd)) = (
+            qi.checked_mul(c).and_then(|t| a.checked_sub(t)),
+            qi.checked_mul(d).and_then(|t| b.checked_sub(t)),
+        ) else {
+            break;
+        };
+        if nc.unsigned_abs() >> 62 != 0 || nd.unsigned_abs() >> 62 != 0 {
+            break; // keep the matrix inside lincomb_pos's |coefficient| < 2^63
+        }
+        (a, b) = (c, d);
+        (c, d) = (nc, nd);
+        // Exact for the same bracketing reason as the single-word pass, and
+        // q·y ≤ x < 2^126 keeps the product inside u128.
+        let ny = x.wrapping_sub(q.wrapping_mul(y));
+        x = y;
+        y = ny;
+    }
+    (a, b, c, d)
+}
+
 /// An arbitrary-precision natural number (a non-negative integer).
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct Nat {
@@ -1529,14 +1627,14 @@ impl Nat {
                 rhs.to_u128().expect("<= 2 limbs"),
             ));
         }
-        if self.limbs.len().max(rhs.limbs.len()) < LEHMER_THRESHOLD {
-            self.gcd_binary(rhs)
-        } else {
-            self.gcd_lehmer(rhs)
-        }
+        self.gcd_lehmer(rhs)
     }
 
     /// Stein's binary GCD (no division). Precondition: both operands non-zero.
+    /// No longer on the dispatch path (Lehmer wins from 3 limbs up, and the
+    /// u128 fast path covers everything below), but kept as the independent
+    /// reference oracle for the gcd tests.
+    #[cfg(test)]
     fn gcd_binary(&self, rhs: &Nat) -> Nat {
         let mut u = self.clone();
         let mut v = rhs.clone();
@@ -1559,9 +1657,11 @@ impl Nat {
     }
 
     /// Lehmer's GCD (Knuth TAOCP §4.5.2, Algorithm L): use the leading words to
-    /// derive a 2×2 cofactor matrix in single precision, then apply it to the
+    /// derive a 2×2 cofactor matrix in machine precision, then apply it to the
     /// full operands, doing far fewer multi-precision divisions than plain
-    /// Euclid. Precondition: both operands non-zero.
+    /// Euclid. Large operands run the partial Euclid on a double-word window
+    /// (~63 bits stripped per pass instead of ~31, halving the full-length
+    /// matrix applications). Precondition: both operands non-zero.
     fn gcd_lehmer(&self, rhs: &Nat) -> Nat {
         let mut u = self.clone();
         let mut v = rhs.clone();
@@ -1569,56 +1669,27 @@ impl Nat {
             core::mem::swap(&mut u, &mut v);
         }
         while v.limbs.len() > 1 {
-            // Leading ~63 bits of u, and of v at the same alignment.
-            let shift = u.bit_len().saturating_sub(63);
-            let mut x = u.shr(shift).to_u64().unwrap_or(0);
-            let mut y = v.shr(shift).to_u64().unwrap_or(0);
-
-            // Single-precision partial Euclid, accumulating [[a,b],[c,d]] in
-            // machine words: an i128 quotient lowers to a slow division
-            // libcall, while Lehmer's invariants keep every quantity inside a
-            // u64/i64. Any sign or overflow violation simply breaks to the
-            // (always correct) multi-precision fallback below.
-            let (mut a, mut b, mut c, mut d) = (1i64, 0i64, 0i64, 1i64);
-            loop {
-                let (yc, yd) = (y as i128 + c as i128, y as i128 + d as i128);
-                if yc <= 0 || yd <= 0 {
-                    break;
-                }
-                // x < 2^63 and |a| ≤ i64::MAX, so x+a fits a u64 when ≥ 0.
-                let (xa, xb) = (x as i128 + a as i128, x as i128 + b as i128);
-                if xa < 0 || xb < 0 {
-                    break;
-                }
-                let q = (xa as u64) / (yc as u64);
-                if q != (xb as u64) / (yd as u64) {
-                    break; // Lehmer's exactness test failed
-                }
-                let Ok(qi) = i64::try_from(q) else { break };
-                let (Some(nc), Some(nd)) = (
-                    qi.checked_mul(c).and_then(|t| a.checked_sub(t)),
-                    qi.checked_mul(d).and_then(|t| b.checked_sub(t)),
-                ) else {
-                    break;
-                };
-                (a, b) = (c, d);
-                (c, d) = (nc, nd);
-                // ny = x − q·y, non-negative by construction (same bits as the
-                // former i128 computation).
-                let ny = (x as u128).wrapping_sub(q as u128 * y as u128) as u64;
-                x = y;
-                y = ny;
-            }
+            // Leading bits of u, and of v at the same alignment.
+            let (a, b, c, d) = if v.limbs.len() >= LEHMER_DW_LIMBS {
+                let shift = u.bit_len() - 126; // v ≥ 3 limbs, so u.bit_len() > 128
+                lehmer_step128(shifted_window(&u, shift), shifted_window(&v, shift))
+            } else {
+                let shift = u.bit_len().saturating_sub(63);
+                lehmer_step64(
+                    shifted_window(&u, shift) as u64,
+                    shifted_window(&v, shift) as u64,
+                )
+            };
 
             if b == 0 {
-                // No single-precision progress: one full division step.
+                // No machine-precision progress: one full division step.
                 let (_, r) = u.div_rem(&v).expect("v is non-zero");
                 u = core::mem::replace(&mut v, r);
             } else {
                 // Apply the matrix to the full operands (result stays positive),
                 // borrowing `u`/`v` rather than cloning them into `Int`.
-                let nu = lincomb_pos(a as i128, &u, b as i128, &v);
-                let nv = lincomb_pos(c as i128, &u, d as i128, &v);
+                let nu = lincomb_pos(a, &u, b, &v);
+                let nv = lincomb_pos(c, &u, d, &v);
                 u = nu;
                 v = nv;
                 if u.cmp_ref(&v) == Ordering::Less {

@@ -15,6 +15,10 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::ops::{Add, Div, Mul, Neg, Sub};
 
+/// Degree (in the smaller operand's coefficient count) at or above which
+/// `Poly::mul` switches from schoolbook to Karatsuba.
+const POLY_KARATSUBA_THRESHOLD: usize = 24;
+
 /// A dense univariate polynomial with coefficients of type `T`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Poly<T> {
@@ -112,6 +116,28 @@ where
         if self.is_zero() || rhs.is_zero() {
             return Poly::zero();
         }
+        // Karatsuba above a threshold; schoolbook below. Karatsuba trades one
+        // coefficient multiplication per split for a few additions, which is a
+        // win whenever a coefficient product costs more than an add (e.g. exact
+        // `Rational`/`Int` coefficients).
+        if self.coeffs.len().min(rhs.coeffs.len()) < POLY_KARATSUBA_THRESHOLD {
+            return self.mul_schoolbook(rhs);
+        }
+        let m = self.coeffs.len().max(rhs.coeffs.len()) / 2;
+        let (a0, a1) = self.split_at(m);
+        let (b0, b1) = rhs.split_at(m);
+        let z0 = Poly::mul(&a0, &b0);
+        let z2 = Poly::mul(&a1, &b1);
+        // z1 = (a0 + a1)(b0 + b1) − z0 − z2
+        let mid = Poly::mul(&Poly::add(&a0, &a1), &Poly::add(&b0, &b1));
+        let z1 = Poly::sub(&Poly::sub(&mid, &z0), &z2);
+        // z0 + z1·x^m + z2·x^(2m)
+        let r = Poly::add(&z0, &z1.shift_up(m));
+        Poly::add(&r, &z2.shift_up(2 * m))
+    }
+
+    /// Quadratic schoolbook multiplication.
+    fn mul_schoolbook(&self, rhs: &Poly<T>) -> Poly<T> {
         let mut out = alloc::vec![T::default(); self.coeffs.len() + rhs.coeffs.len() - 1];
         for (i, a) in self.coeffs.iter().enumerate() {
             for (j, b) in rhs.coeffs.iter().enumerate() {
@@ -120,6 +146,29 @@ where
             }
         }
         Poly::new(out)
+    }
+
+    /// Splits into `(low, high)` where `self = low + high·x^k` (low has the
+    /// coefficients of degree `< k`).
+    fn split_at(&self, k: usize) -> (Poly<T>, Poly<T>) {
+        if k >= self.coeffs.len() {
+            return (self.clone(), Poly::zero());
+        }
+        (
+            Poly::new(self.coeffs[..k].to_vec()),
+            Poly::new(self.coeffs[k..].to_vec()),
+        )
+    }
+
+    /// Returns `self · x^k` (prepends `k` zero coefficients).
+    fn shift_up(&self, k: usize) -> Poly<T> {
+        if self.is_zero() || k == 0 {
+            return self.clone();
+        }
+        let mut v = Vec::with_capacity(self.coeffs.len() + k);
+        v.resize(k, T::default());
+        v.extend_from_slice(&self.coeffs);
+        Poly::new(v)
     }
 
     /// Returns `self · scalar`.

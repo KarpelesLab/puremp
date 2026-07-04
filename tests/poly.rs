@@ -87,3 +87,40 @@ fn real_root_isolation_and_approximation() {
     // repeated root: (x-1)^2 has one distinct real root
     assert_eq!(prat(&[1, -2, 1]).real_root_count(), 1);
 }
+
+#[test]
+fn karatsuba_matches_schoolbook_large() {
+    // Above the Karatsuba threshold, verify against an independent naive product
+    // and the eval homomorphism.
+    fn naive(a: &Poly<Rational>, b: &Poly<Rational>) -> Poly<Rational> {
+        if a.is_zero() || b.is_zero() {
+            return Poly::zero();
+        }
+        let (ac, bc) = (a.coeffs(), b.coeffs());
+        let mut out = vec![Rational::ZERO; ac.len() + bc.len() - 1];
+        for (i, x) in ac.iter().enumerate() {
+            for (j, y) in bc.iter().enumerate() {
+                out[i + j] = out[i + j].add(&x.mul(y));
+            }
+        }
+        Poly::new(out)
+    }
+    let mut s: u64 = 0x51D_CADE;
+    let next = |s: &mut u64| {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (*s >> 33) as i64 % 21 - 10
+    };
+    for &(da, db) in &[
+        (30usize, 30usize),
+        (64, 40),
+        (100, 100),
+        (25, 25),
+        (23, 200),
+    ] {
+        let a: Poly<Rational> = Poly::new((0..=da).map(|_| Rational::from(next(&mut s))).collect());
+        let b: Poly<Rational> = Poly::new((0..=db).map(|_| Rational::from(next(&mut s))).collect());
+        assert_eq!(a.mul(&b), naive(&a, &b), "deg {da}×{db}");
+        let x = Rational::new(2.into(), 3.into());
+        assert_eq!(a.mul(&b).eval(&x), a.eval(&x).mul(&b.eval(&x)));
+    }
+}

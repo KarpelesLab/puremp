@@ -197,7 +197,7 @@ fn dot_rr(a: &[Rational], b: &[Rational]) -> Rational {
 }
 
 #[cfg(feature = "float")]
-pub use relations::{find_integer_relation, minimal_polynomial};
+pub use relations::{find_integer_relation, minimal_polynomial, pslq, pslq_with};
 
 /// Integer-relation detection and minimal-polynomial recovery, built on LLL.
 #[cfg(feature = "float")]
@@ -281,6 +281,268 @@ mod relations {
             powers.push(powers.last().unwrap().mul(alpha, prec, m));
         }
         (1..=max_degree).find_map(|d| find_integer_relation(&powers[..=d], scale_bits))
+    }
+
+    /// Searches for a small nonzero **integer relation** among the real numbers
+    /// `xs` using the **PSLQ** algorithm: an integer vector `a`, not all zero,
+    /// with `Σ aᵢ·xᵢ ≈ 0`. Returns `None` if no relation is found within the
+    /// precision/iteration budget (e.g. the values are rationally independent,
+    /// like `[1, √2, π]`).
+    ///
+    /// This is the one-level PSLQ of Ferguson, Bailey & Arno (*Analysis of the
+    /// PSLQ Integer Relation Algorithm*, Math. Comp. 68 (1999)), using the
+    /// standard reduction parameter `γ = 2/√3`. The internal linear algebra runs
+    /// in [`Float`] at a working precision above the input's noise floor, while
+    /// the change-of-basis matrices — and hence the returned relation — are kept
+    /// as exact [`Int`]s.
+    ///
+    /// The `xs` must all be finite and computed to `precision` bits. A relation
+    /// is accepted once the smallest transformed coordinate falls below
+    /// `2^-(precision − precision/4)`; see [`pslq_with`] for full control over the
+    /// iteration cap and detection threshold. The returned relation is
+    /// sign-normalized (first nonzero entry positive).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use puremp::{Float, Int, RoundingMode};
+    /// use puremp::lattice::pslq;
+    ///
+    /// let p = 256;
+    /// let m = RoundingMode::Nearest;
+    /// // φ = (1+√5)/2 satisfies φ² − φ − 1 = 0, so {1, φ, φ²} has relation (−1,−1,1).
+    /// let phi = Float::from_int(&Int::from(5), p, m)
+    ///     .sqrt(p, m)
+    ///     .add(&Float::from_int(&Int::ONE, p, m), p, m)
+    ///     .div(&Float::from_int(&Int::from(2), p, m), p, m);
+    /// let xs = [
+    ///     Float::from_int(&Int::ONE, p, m),
+    ///     phi.clone(),
+    ///     phi.mul(&phi, p, m),
+    /// ];
+    /// // Sign-normalized (first nonzero entry positive): −φ²+φ+1 = 0.
+    /// let rel = pslq(&xs, p).unwrap();
+    /// assert_eq!(rel, [Int::from(1), Int::from(1), Int::from(-1)]);
+    /// ```
+    pub fn pslq(xs: &[Float], precision: u64) -> Option<Vec<Int>> {
+        let n = xs.len();
+        let detect_bits = precision - precision / 4;
+        // O(n²·precision) iterations comfortably bounds the tiny relations this
+        // targets while keeping the "no relation" case terminating quickly.
+        let max_iters = (precision as usize + 20) * n.max(1) * n.max(1);
+        pslq_with(xs, precision, max_iters, detect_bits)
+    }
+
+    /// [`pslq`] with explicit control over the search budget.
+    ///
+    /// `max_iters` caps the number of PSLQ iterations (returning `None` on
+    /// exhaustion), and `detect_bits` sets the detection threshold: a relation is
+    /// reported once the smallest transformed coordinate drops below
+    /// `2^-detect_bits`. `detect_bits` should sit comfortably below `precision`
+    /// (the input's accuracy) yet well above the size of any spurious short
+    /// combination — `precision − precision/4` is the default and works for
+    /// small-coefficient relations.
+    pub fn pslq_with(
+        xs: &[Float],
+        precision: u64,
+        max_iters: usize,
+        detect_bits: u64,
+    ) -> Option<Vec<Int>> {
+        let n = xs.len();
+        if n == 0 {
+            return None;
+        }
+        if xs.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        if n == 1 {
+            return xs[0].is_zero().then(|| alloc::vec![Int::ONE]);
+        }
+
+        let m = RoundingMode::Nearest;
+        // Work above the input's noise floor so the linear-algebra rounding does
+        // not dominate the ~2^-precision residual of a genuine relation.
+        let wp = precision + 64;
+        let x: Vec<Float> = xs.iter().map(|v| v.round(wp, m)).collect();
+
+        // Partial norms s_k = ‖(x_k, …, x_{n-1})‖.
+        let mut s = alloc::vec![Float::zero(wp); n];
+        let mut acc = Float::zero(wp);
+        for k in (0..n).rev() {
+            acc = acc.add(&x[k].mul(&x[k], wp, m), wp, m);
+            s[k] = acc.sqrt(wp, m);
+        }
+        if s[0].is_zero() {
+            // All inputs are zero: e₀ is a relation.
+            let mut a = alloc::vec![Int::ZERO; n];
+            a[0] = Int::ONE;
+            return Some(a);
+        }
+
+        // Normalize so ‖y‖ = 1 (t = 1/s₀); y stays proportional to x·B throughout.
+        let one = Float::from_int(&Int::ONE, wp, m);
+        let t0 = one.div(&s[0], wp, m);
+        let mut y: Vec<Float> = x.iter().map(|xi| t0.mul(xi, wp, m)).collect();
+        for sk in &mut s {
+            *sk = t0.mul(sk, wp, m);
+        }
+
+        // Initial lower-trapezoidal H (n×(n−1)).
+        let mut h = alloc::vec![alloc::vec![Float::zero(wp); n - 1]; n];
+        for j in 0..n - 1 {
+            h[j][j] = s[j + 1].div(&s[j], wp, m);
+            let sj = s[j].mul(&s[j + 1], wp, m);
+            for i in j + 1..n {
+                h[i][j] = y[i].mul(&y[j], wp, m).div(&sj, wp, m).neg();
+            }
+        }
+
+        // Exact change-of-basis matrices (A = B⁻¹), both starting as identity.
+        let mut a_mat = alloc::vec![alloc::vec![Int::ZERO; n]; n];
+        let mut b_mat = alloc::vec![alloc::vec![Int::ZERO; n]; n];
+        for i in 0..n {
+            a_mat[i][i] = Int::ONE;
+            b_mat[i][i] = Int::ONE;
+        }
+
+        // γ = 2/√3 and its powers γ^(k+1) used in the row-selection weight.
+        let gamma = Float::from_int(&Int::from_i64(2), wp, m).div(
+            &Float::from_int(&Int::from_i64(3), wp, m).sqrt(wp, m),
+            wp,
+            m,
+        );
+        let mut gpow = Vec::with_capacity(n - 1);
+        let mut g = gamma.clone();
+        for _ in 0..n - 1 {
+            gpow.push(g.clone());
+            g = g.mul(&gamma, wp, m);
+        }
+
+        // Any spurious near-zero combination reaching ε has coefficients larger
+        // than ~2^(detect_bits/(n−1)); a genuine small relation stays far below
+        // this, so reject candidates whose entries exceed half that exponent.
+        let coeff_bits = detect_bits / (2 * (n as u64 - 1));
+
+        // Detection threshold ε = 2^-detect_bits.
+        let eps = Float::from_rational(
+            &Rational::new(
+                Int::ONE,
+                Int::ONE.mul_2k(detect_bits.min(u32::MAX as u64) as u32),
+            ),
+            wp,
+            m,
+        );
+
+        hermite_reduce(n, wp, m, &mut y, &mut h, &mut a_mat, &mut b_mat);
+
+        for _ in 0..max_iters {
+            // Select the row maximizing γ^(k+1)·|H_kk|.
+            let mut sel = 0;
+            let mut best = gpow[0].mul(&h[0][0].abs(), wp, m);
+            for k in 1..n - 1 {
+                let v = gpow[k].mul(&h[k][k].abs(), wp, m);
+                if v > best {
+                    best = v;
+                    sel = k;
+                }
+            }
+
+            // Swap rows sel, sel+1 of y/H/A and the matching columns of B.
+            y.swap(sel, sel + 1);
+            h.swap(sel, sel + 1);
+            a_mat.swap(sel, sel + 1);
+            for row in &mut b_mat {
+                row.swap(sel, sel + 1);
+            }
+
+            // Corner (Givens) update to restore the trapezoidal shape of H.
+            if sel < n - 2 {
+                let hmm = h[sel][sel].clone();
+                let hmm1 = h[sel][sel + 1].clone();
+                let t = hmm
+                    .mul(&hmm, wp, m)
+                    .add(&hmm1.mul(&hmm1, wp, m), wp, m)
+                    .sqrt(wp, m);
+                let t1 = hmm.div(&t, wp, m);
+                let t2 = hmm1.div(&t, wp, m);
+                for row in h.iter_mut().take(n).skip(sel) {
+                    let t3 = row[sel].clone();
+                    let t4 = row[sel + 1].clone();
+                    row[sel] = t1.mul(&t3, wp, m).add(&t2.mul(&t4, wp, m), wp, m);
+                    row[sel + 1] = t1.mul(&t4, wp, m).sub(&t2.mul(&t3, wp, m), wp, m);
+                }
+            }
+
+            hermite_reduce(n, wp, m, &mut y, &mut h, &mut a_mat, &mut b_mat);
+
+            // A near-zero coordinate y_k means column k of B is the relation.
+            let mut kmin = 0;
+            let mut ymin = y[0].abs();
+            for (k, yk) in y.iter().enumerate().skip(1) {
+                let ak = yk.abs();
+                if ak < ymin {
+                    ymin = ak;
+                    kmin = k;
+                }
+            }
+            if ymin < eps {
+                let rel: Vec<Int> = (0..n).map(|j| b_mat[j][kmin].clone()).collect();
+                // A genuine relation drives the residual to the input's noise
+                // floor with *small* coefficients. Any near-zero combination of
+                // rationally independent reals instead needs huge coefficients
+                // (|a·x| ≳ ‖a‖^-(n-1) by Dirichlet), so an oversized candidate
+                // means no small relation is certifiable at this precision.
+                if rel.iter().any(|c| u64::from(c.bit_len()) > coeff_bits) {
+                    return None;
+                }
+                if rel.iter().any(|c| !c.is_zero()) {
+                    return Some(normalize_sign(rel));
+                }
+            }
+        }
+        None
+    }
+
+    /// One Hermite (size-) reduction sweep of PSLQ: makes `|H_ij| ≤ ½|H_jj|` for
+    /// `j < i`, applying the matching integer updates to `y`, `A` and `B`.
+    #[allow(clippy::too_many_arguments)]
+    fn hermite_reduce(
+        n: usize,
+        wp: u64,
+        m: RoundingMode,
+        y: &mut [Float],
+        h: &mut [Vec<Float>],
+        a: &mut [Vec<Int>],
+        b: &mut [Vec<Int>],
+    ) {
+        for i in 1..n {
+            for j in (0..i).rev() {
+                let q = match h[i][j].div(&h[j][j], wp, m).round_to_int() {
+                    Some(q) if !q.is_zero() => q,
+                    _ => continue,
+                };
+                let qf = Float::from_int(&q, wp, m);
+                // y_j += q·y_i.
+                let dy = qf.mul(&y[i], wp, m);
+                y[j] = y[j].add(&dy, wp, m);
+                // H_ik -= q·H_jk for k ≤ j.
+                let hj = h[j].clone();
+                for k in 0..=j {
+                    let d = qf.mul(&hj[k], wp, m);
+                    h[i][k] = h[i][k].sub(&d, wp, m);
+                }
+                // A_ik -= q·A_jk.
+                let aj = a[j].clone();
+                for k in 0..n {
+                    a[i][k] = a[i][k].sub(&q.mul(&aj[k]));
+                }
+                // B_kj += q·B_ki.
+                for row in b.iter_mut() {
+                    let bki = row[i].clone();
+                    row[j] = row[j].add(&q.mul(&bki));
+                }
+            }
+        }
     }
 
     /// Canonicalizes a relation so its first nonzero entry is positive.

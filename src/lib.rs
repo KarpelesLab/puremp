@@ -21,6 +21,8 @@
 //!
 //! - [`ModInt`] — modular integers `ℤ/mℤ` with automatic reduction (`int`).
 //! - [`Complex`] — generic complex numbers / Gaussian integers (`complex`).
+//! - [`GaloisField`] / [`GfElement`] — finite field extensions `GF(pᵏ)`
+//!   (`galois`).
 //! - [`Poly`] — generic univariate polynomials (`poly`).
 //! - [`Matrix`] — dense matrices with exact determinant/inverse/solve
 //!   (`matrix`).
@@ -122,6 +124,9 @@ pub mod decimal;
 #[cfg(feature = "complex")]
 pub mod complex;
 
+#[cfg(feature = "galois")]
+pub mod galois;
+
 #[cfg(feature = "poly")]
 pub mod poly;
 
@@ -204,6 +209,9 @@ pub use decimal::{Decimal, Rounding};
 
 #[cfg(feature = "complex")]
 pub use complex::Complex;
+
+#[cfg(feature = "galois")]
+pub use galois::{GaloisField, GfElement};
 
 #[cfg(feature = "poly")]
 pub use poly::Poly;

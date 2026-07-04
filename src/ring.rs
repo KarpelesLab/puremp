@@ -227,3 +227,80 @@ impl Field for crate::galois::GfElement {
 
 #[cfg(feature = "complex")]
 impl<F: Field> Field for crate::complex::Complex<F> {}
+
+/// A **finite** field `GF(q)`: a [`Field`] that additionally exposes its size
+/// `q` (the number of elements) and characteristic `p`.
+///
+/// This is the marker the generic Cantor–Zassenhaus factorizer
+/// (`FactorOverField`, with the `poly` feature) keys on: the algorithm
+/// needs the field order `q`, which only *finite* fields have. The infinite
+/// fields (`Rational`, `Float`) deliberately do **not** implement it, so the
+/// factorizer cannot be misapplied to them.
+///
+/// Caveat (as with [`Field`]): a [`ModInt`] is a genuine field only when its
+/// modulus is prime — it is the caller's responsibility that the ring really is
+/// a field.
+///
+/// [`ModInt`]: crate::mod_int::ModInt
+#[cfg(feature = "int")]
+pub trait FiniteField: Field {
+    /// The field order `q`: the number of elements (`p` for the prime field
+    /// `ℤ/pℤ`, `pᵏ` for `GF(pᵏ)`).
+    fn order(&self) -> crate::int::Int;
+
+    /// The characteristic `p` (a prime): the additive order of `1`.
+    fn characteristic(&self) -> crate::int::Int;
+
+    /// Maps an integer to a field element — a bijection of `[0, q)` onto the
+    /// field (the index is first reduced modulo `q`). Lets generic code
+    /// enumerate or randomly sample field elements without knowing the concrete
+    /// representation. Takes `&self` for the field context (modulus/field data),
+    /// not as a value to convert.
+    #[allow(clippy::wrong_self_convention)]
+    fn from_index(&self, index: &crate::int::Int) -> Self;
+}
+
+#[cfg(feature = "int")]
+impl FiniteField for crate::mod_int::ModInt {
+    /// The order equals the modulus `p` (a genuine field only when it is prime).
+    #[inline]
+    fn order(&self) -> crate::int::Int {
+        self.modulus()
+    }
+    /// The characteristic equals the modulus `p`.
+    #[inline]
+    fn characteristic(&self) -> crate::int::Int {
+        self.modulus()
+    }
+    #[inline]
+    fn from_index(&self, index: &crate::int::Int) -> Self {
+        self.of(index.clone())
+    }
+}
+
+#[cfg(feature = "galois")]
+impl FiniteField for crate::galois::GfElement {
+    /// The order `pᵏ`.
+    #[inline]
+    fn order(&self) -> crate::int::Int {
+        self.field().order()
+    }
+    /// The characteristic `p`.
+    #[inline]
+    fn characteristic(&self) -> crate::int::Int {
+        self.field().characteristic()
+    }
+    /// Writes `index mod pᵏ` in base `p` (`k` little-endian digits) and reads the
+    /// digits back as the coefficient vector of an element of `GF(pᵏ)`.
+    fn from_index(&self, index: &crate::int::Int) -> Self {
+        let field = self.field();
+        let p = field.characteristic();
+        let mut n = index.rem_euclid(&field.order());
+        let mut digits = alloc::vec::Vec::with_capacity(field.degree());
+        for _ in 0..field.degree() {
+            digits.push(n.rem_euclid(&p));
+            n = n.div_floor(&p);
+        }
+        field.element(&digits)
+    }
+}

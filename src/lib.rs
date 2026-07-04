@@ -143,6 +143,9 @@ pub mod matrix;
 #[cfg(all(feature = "poly", feature = "rational"))]
 mod poly_factor;
 
+#[cfg(all(feature = "poly", feature = "int"))]
+mod poly_finite_field;
+
 #[cfg(feature = "lattice")]
 pub mod lattice;
 
@@ -191,6 +194,12 @@ mod serde_impls;
 pub use error::{Error, Result};
 
 pub use ring::{Field, Ring};
+
+#[cfg(feature = "int")]
+pub use ring::FiniteField;
+
+#[cfg(all(feature = "poly", feature = "int"))]
+pub use poly_finite_field::FactorOverField;
 
 #[cfg(feature = "int")]
 pub use int::{Int, Sign};

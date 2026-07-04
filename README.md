@@ -7,9 +7,9 @@
 
 Pure-Rust, MIT-licensed, arbitrary-precision arithmetic — **integers,
 rationals, MPFR-class floating point, and base-10 decimals**, plus derived
-**modular integers, complex numbers, polynomials, matrices, and intervals** —
-with no foreign-code dependencies. Usable as a Rust crate, a C library, and a
-command-line calculator.
+**modular integers, complex numbers, polynomials, matrices, intervals, and exact
+real algebraic numbers** — with no foreign-code dependencies. Usable as a Rust
+crate, a C library, and a command-line calculator.
 
 ## Why
 
@@ -112,6 +112,17 @@ Beyond the base types, `Int`/`Rational` provide a number-theory toolkit —
 `random_prime`, `factorial`/`binomial`/`fibonacci`, and continued-fraction
 `approximate` — plus `ModInt` for modular arithmetic.
 
+The exact-algebra layers stack on top of these:
+
+- `Poly::factor` factors a rational polynomial into irreducible factors over ℚ
+  (Berlekamp–Zassenhaus with **van Hoeij** LLL recombination).
+- `Algebraic` is a real root of a rational polynomial, with exact `+ − × ÷`,
+  comparison, and `sqrt` — and `Algebraic::from_float` recovers one *exactly* from
+  a floating-point approximation.
+- `lattice::lll_reduce` is an exact LLL lattice reduction; on top of it,
+  `find_integer_relation` recognizes constants (e.g. is a number `a·√2 + b`?) and
+  `minimal_polynomial` recovers a real algebraic number's defining polynomial.
+
 For a bare `no_std` build: `--no-default-features` (add `--features int` for the
 integer types).
 
@@ -131,7 +142,9 @@ never consulted. Algorithms come from the open literature —
   divide, GCD, base conversion);
 - Menezes, van Oorschot & Vanstone, *Handbook of Applied Cryptography*;
 - primary papers: Karatsuba; Toom–Cook; Burnikel–Ziegler; Möller–Granlund;
-  Faddeev–LeVerrier (algebraic numbers); Sturm sequences (real-root isolation).
+  Faddeev–LeVerrier (algebraic numbers); Sturm sequences (real-root isolation);
+  Lenstra–Lenstra–Lovász (LLL); Cantor–Zassenhaus and van Hoeij (polynomial
+  factorization).
 
 Correctness is checked against published values and, in the dev-only test
 harness, a trusted reference — never a runtime dependency.

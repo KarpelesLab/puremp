@@ -52,6 +52,12 @@ impl Rational {
         if num.is_zero() {
             return Rational::ZERO;
         }
+        // A unit denominator is already canonical: skip the gcd entirely (the
+        // common case for integer-valued rationals, e.g. integer polynomials
+        // and matrices).
+        if den.is_one() {
+            return Rational { num, den };
+        }
         let g = Int::from(num.magnitude().gcd(&den.magnitude()));
         if !g.is_one() {
             num = num.div_exact(&g);

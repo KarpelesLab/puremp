@@ -966,6 +966,12 @@ impl Nat {
         if self.is_zero() || rhs.is_zero() {
             return Nat::zero();
         }
+        if self.is_one() {
+            return rhs.clone();
+        }
+        if rhs.is_one() {
+            return self.clone();
+        }
         if self.limbs == rhs.limbs {
             return self.square();
         }
@@ -1434,6 +1440,11 @@ impl Nat {
         }
         if rhs.is_zero() {
             return self.clone();
+        }
+        // gcd(1, n) == 1 without touching the operands (dividing by a unit is
+        // the common case when normalizing integer-valued rationals).
+        if self.is_one() || rhs.is_one() {
+            return Nat::one();
         }
         // Machine-word operands: allocation-free binary GCD (this is the hot
         // path of every small-`Rational` reduction).

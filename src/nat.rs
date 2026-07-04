@@ -451,6 +451,23 @@ impl Nat {
     }
 }
 
+/// Recombines Toom coefficients `Σ cᵢ·2^(64·k·i)` into a single [`Nat`], writing
+/// each (non-negative) coefficient at whole-limb offset `k·i` with carry
+/// propagation. Cheaper than a chain of `mul_2k`/`add`.
+fn recombine_coeffs(product_limbs: usize, k: usize, coeffs: &[crate::int::Int]) -> Nat {
+    let mut out = alloc::vec![0 as Limb; product_limbs + 2];
+    for (i, c) in coeffs.iter().enumerate() {
+        debug_assert!(!c.is_negative(), "toom coefficient is negative");
+        let mag = c.magnitude();
+        if !mag.is_zero() {
+            add_at(&mut out, i * k, mag.as_limbs());
+        }
+    }
+    let mut n = Nat { limbs: out };
+    n.normalize();
+    n
+}
+
 /// Adds the limbs of `val` into `out` starting at limb `offset`, propagating the
 /// carry. `out` must be large enough to hold the result (including any carry).
 #[inline]
@@ -670,7 +687,6 @@ impl Nat {
 
         let n = self.limbs.len().max(rhs.limbs.len());
         let k = n.div_ceil(4);
-        let bshift = k as u64 * LIMB_BITS as u64;
         let part = |x: &Nat, i: usize| -> Int {
             let l = x.limbs.len();
             let lo = i * k;
@@ -735,13 +751,11 @@ impl Nat {
         let c3 = f.sub(&c5.mul(&Int::from_i64(5)));
         let c1 = o1.sub(&c3).sub(&c5);
 
-        let coeffs = [c0, c1, c2, c3, c4, c5, c6];
-        let mut acc = Int::ZERO;
-        for (i, c) in coeffs.iter().enumerate() {
-            acc = acc.add(&c.mul_2k((i as u64 * bshift) as u32));
-        }
-        debug_assert!(!acc.is_negative(), "toom4 produced a negative result");
-        acc.magnitude()
+        recombine_coeffs(
+            self.limbs.len() + rhs.limbs.len(),
+            k,
+            &[c0, c1, c2, c3, c4, c5, c6],
+        )
     }
 
     /// Toom-3 multiplication: five half-third-size products, evaluated at the
@@ -752,7 +766,6 @@ impl Nat {
 
         let n = self.limbs.len().max(rhs.limbs.len());
         let k = n.div_ceil(3);
-        let bshift = k as u64 * LIMB_BITS as u64;
 
         // Split a value into its base-2^(64k) digits a0 + a1·B + a2·B², as Int.
         let part = |x: &Nat, lo: usize, hi: usize| -> Int {
@@ -803,13 +816,9 @@ impl Nat {
         let c3 = t.div_exact(&Int::from_i64(6));
         let c1 = s.sub(&c3);
 
-        let result = c0
-            .add(&c1.mul_2k(bshift as u32))
-            .add(&c2.mul_2k((2 * bshift) as u32))
-            .add(&c3.mul_2k((3 * bshift) as u32))
-            .add(&c4.mul_2k((4 * bshift) as u32));
-        debug_assert!(!result.is_negative(), "toom3 produced a negative result");
-        result.magnitude()
+        // The final coefficients are the (non-negative) product-polynomial
+        // coefficients; recombine them at whole-limb offsets `i·k` directly.
+        recombine_coeffs(self.limbs.len() + rhs.limbs.len(), k, &[c0, c1, c2, c3, c4])
     }
 
     /// Quadratic schoolbook (long) multiplication.

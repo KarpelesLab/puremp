@@ -146,36 +146,57 @@ core operations and the derived types.
 
 Candidate directions, all specifiable from open literature (so they preserve the
 clean-room provenance). Nothing here is implemented yet; ordering is rough
-interest, not commitment.
+interest, not commitment. Brent & Zimmermann's *Modern Computer Arithmetic* (MCA;
+freely available drafts) is the umbrella reference for most of this list.
 
 **Faster algorithms** (existing operations, correct today, just not maximally fast):
 
-- **Half-GCD** for subquadratic `Rational` reduction — a recursive 2×2 cofactor
-  matrix HGCD, `O(M(n)·log n)` vs. the current `~O(n²)` Lehmer. Only wins at very
-  large operand sizes and needs Möller's conservative-cut correction to be both
-  correct and fast. Stehlé–Zimmermann; *Modern Computer Arithmetic* §1.6.
+- **Multi-prime argument reduction** for elementary functions (`exp`/`log`/`sin`/
+  `cos`) — reduces the argument using Diophantine combinations of logarithms of
+  many primes, solved with a fast integer-relation search. Reported ~2× speedup
+  from a few thousand bits to millions; applies directly to the series we already
+  ship. Johansson, *Arbitrary-precision computation of the gamma function* /
+  "faster elementary functions" (arXiv:2207.02501, 2022). **Most actionable.**
+- **Sharper Newton building blocks** — power-series square root in `(4/3)·M(n)`
+  (from ~1.83) and reciprocal in `(13/9)·M(n)` (from 1.5) via a third-order
+  iteration whose extra term is nearly free; feeds `Float::sqrt`, reciprocal, and
+  Newton nth-root. Harvey, *Faster algorithms for the square root and reciprocal
+  of power series* (arXiv:0910.1926).
 - **AGM-based transcendentals** — π and `log`/`exp` via the arithmetic–geometric
-  mean (Brent–Salamin), `O(M(n)·log n)`, overtaking binary-splitting series at
-  very high precision. Brent, *Multiple-precision zero-finding methods and the
-  complexity of elementary function evaluation* (1976).
+  mean (Brent–Salamin / Gauss–Legendre), `O(M(n)·log n)` in ~2·lg n quadratically
+  converging steps; a large implicit constant means it *complements* binary
+  splitting, winning only at very high precision. Brent (1976); Borwein & Borwein,
+  *Pi and the AGM*; MCA §4.8.
+- **Half-GCD** for subquadratic `Rational` reduction — a recursive 2×2 cofactor
+  matrix HGCD, `O(M(n)·log n)` vs. the current `~O(n²)` Lehmer. The canonical
+  clean-room reference is Möller's left-to-right variant (its stop condition
+  removes the back-up steps, "much simpler to implement"); only wins at very large
+  operand sizes. Möller, *Math. Comp.* 77 (2008); MCA §1.6.
 - **Subresultant PRS** to tame Sturm-sequence coefficient growth for high-degree
-  `Algebraic` operations (Collins–Brown; *MCA* §2.4).
+  `Algebraic` operations (Collins–Brown; MCA §2.4).
 
 **Candidate new capabilities** (new operations / types):
 
 - **Integer factorization beyond trial division + Pollard rho** — Lenstra's
-  **ECM** (elliptic-curve method) and the **quadratic sieve**, extending
-  `factorize` into the 40–100-digit range. Crandall & Pomerance, *Prime Numbers:
-  A Computational Perspective*; the HAC.
-- **Primality *proving*** — **APR-CL** or **ECPP** to upgrade the probabilistic
-  Miller–Rabin test into a certificate. Atkin–Morain (ECPP).
-- **Lattice reduction (LLL)** — Lenstra–Lenstra–Lovász, unlocking integer-relation
-  detection (**PSLQ**), minimal-polynomial recovery for `Algebraic`, and
-  Diophantine approximation. *MCA* / the original 1982 paper.
-- **Special functions** for `Float` — Γ / `lgamma` (Spouge or binary-splitting),
-  the Riemann ζ, `erf`/`erfc`, and Bessel functions, with correct rounding.
-- **Polynomial factorization** over 𝔽ₚ and ℚ — Cantor–Zassenhaus and
-  Zassenhaus/van Hoeij, strengthening the `Poly`/`Algebraic` layer.
+  **ECM** (elliptic-curve method, the best method whose cost scales with the
+  *factor* size, using Montgomery-curve arithmetic), then the **quadratic sieve**
+  for the 40–100-digit range. Zimmermann's ECM survey; Crandall & Pomerance,
+  *Prime Numbers: A Computational Perspective*; the HAC.
+- **Primality *proving*** — upgrade probabilistic Miller–Rabin to a certificate
+  via **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁵)`, fast
+  variant `Õ((log N)⁴)`) or the deterministic **APR-CL**.
+- **Lattice reduction (LLL)** — Lenstra–Lenstra–Lovász (*Factoring Polynomials
+  with Rational Coefficients*, Math. Ann. 1982), unlocking integer-relation
+  detection (**PSLQ**), `Algebraic` minimal-polynomial recovery, and Diophantine
+  approximation.
+- **Polynomial factorization** over 𝔽ₚ and ℚ — Cantor–Zassenhaus (mod p) lifted
+  by **Berlekamp–Zassenhaus** (over ℤ, hence ℚ by Gauss's lemma), with **van
+  Hoeij**'s LLL-knapsack recombination replacing the exponential `2ⁿ` step for
+  polynomial-time factoring. Strengthens the `Poly`/`Algebraic` layer.
+- **Special functions** for `Float` — Γ / `lgamma` (Stirling series with argument
+  reduction, MCA §4.5), the Riemann ζ (Euler–Maclaurin / Borwein), `erf`/`erfc`
+  (incomplete-Γ series), Bessel functions (MCA §4.7.1), and Euler's constant γ
+  (Brent–McMillan, binary-split), all correctly rounded.
 - **Discrete logarithm** (baby-step/giant-step, Pollard rho for DLP) and
   **`p`-adic numbers** (ℤ_p/ℚ_p) as new exact-arithmetic types.
 

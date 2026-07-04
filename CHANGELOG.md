@@ -7,6 +7,20 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/puremp/compare/v0.1.9...v0.2.0) - 2026-07-04
+
+### Added
+
+- *(float)* Euler–Mascheroni γ and Catalan's constant
+- *(float,rational,algebraic)* rounding conveniences + exact-rational detection
+- *(int,random)* number-theory helpers, RNG-free prime successors, SeedRng
+- *(complex,float)* Complex<Float> support — operators + transcendentals
+- multi-prime argument reduction for exp (+ restore const ln2/pi wiring)
+
+### Other
+
+- embed ln2/pi as precomputed constants; remove FloatContext
+
 ## [0.1.9](https://github.com/KarpelesLab/puremp/compare/v0.1.8...v0.1.9) - 2026-07-04
 
 ### Added

@@ -7,6 +7,23 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+### Other
+
+- unit fast paths in Nat::mul, gcd and Rational::normalize — integer-valued rationals ~4x faster
+- slice-recursion Karatsuba into shared out/scratch buffers (2 allocations per multiply)
+- retune Burnikel–Ziegler base case for the addmul_2 basecase
+- skip the discarded top-of-ladder squarings in radix I/O (~16% faster)
+- fused single-pass Lehmer cofactor application — gcd ~3x faster
+- second range-reduction stage in exp — ~40% faster
+- Zimmermann square root with remainder — isqrt ~2.9x faster
+- machine-word fast path for small gcd — small Rational ops ~4x faster
+- evaluate pi and ln2 by scaled integer series — pi ~4.7x, exp ~2x faster
+- fold significand trailing zeros into the exponent in Float mul/div (pi ~39%, exp ~35% faster)
+- dedicated Montgomery squaring + bounds-check-free CIOS — modpow ~18% faster
+- retune multiplication crossovers for the addmul_2 basecase
+- addmul_2 inner loops for schoolbook multiplication and squaring (~2.5x faster basecase)
+- emit 19 digits per division in the radix base case — to_string ~10% faster
+
 ## [0.1.6](https://github.com/KarpelesLab/puremp/compare/v0.1.5...v0.1.6) - 2026-07-04
 
 ### Other

@@ -1666,7 +1666,7 @@ fn to_radix_recursive(v: &Nat, powers: &[Nat], radix: u32) -> String {
 
 /// Number of limbs at or below which radix conversion uses the simple
 /// single-limb-division loop rather than recursing.
-const RADIX_RECURSION_LIMBS: usize = 3;
+const RADIX_RECURSION_LIMBS: usize = 10;
 
 /// Minimal base-`radix` digit string via repeated single-limb division (for
 /// small values / the recursion base case). Each multi-limb division peels a

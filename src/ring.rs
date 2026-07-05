@@ -55,6 +55,37 @@ pub trait Ring:
     /// their results are unaffected.
     const REASSOCIATIVE: bool = false;
 
+    /// Whether this ring's arithmetic is **exact** (no rounding), so that an
+    /// algebraic algorithm whose mathematical result is *unique* — fast
+    /// polynomial division (Newton) and the Half-GCD — is **bit-identical** to
+    /// the schoolbook/Euclid reference it replaces.
+    ///
+    /// The default is `false`. The exact rings opt in: the arbitrary-precision
+    /// integers/rationals ([`Int`](crate::int::Int),
+    /// [`Rational`](crate::rational::Rational)) and the finite fields
+    /// ([`ModInt`](crate::mod_int::ModInt), [`GfElement`](crate::galois::GfElement)).
+    /// Rounding types such as [`Float`](crate::float::Float) leave it `false`, so
+    /// their [`Poly`](crate::poly::Poly) division/GCD always take the schoolbook
+    /// path and their (rounding-order-sensitive) results are unchanged.
+    const EXACT: bool = false;
+
+    /// Optional fast dense-polynomial multiply hook, keyed on the coefficient
+    /// type, letting [`Poly::mul`](crate::poly::Poly::mul) route to a specialized
+    /// algorithm that Rust's coherence rules forbid expressing as a `Poly<T>`
+    /// override. The inputs are the two operands' coefficient slices (low-to-high,
+    /// each trimmed with a nonzero leading term); the return value is the product
+    /// coefficient vector (low-to-high). Returning `None` — the default — falls
+    /// back to the generic Karatsuba/schoolbook path.
+    ///
+    /// [`Int`](crate::int::Int) and [`Rational`](crate::rational::Rational)
+    /// override it with Kronecker-substitution multiplication (pack into a big
+    /// integer, one fast integer multiply, unpack) above a degree threshold; the
+    /// result is exactly the schoolbook product.
+    #[cfg(feature = "alloc")]
+    fn poly_mul(_a: &[Self], _b: &[Self]) -> Option<alloc::vec::Vec<Self>> {
+        None
+    }
+
     /// A cheap proxy for the *cost of multiplying two ring elements of roughly
     /// `self`'s magnitude* — for the arbitrary-precision integers/rationals, the
     /// operand's bit length.
@@ -75,9 +106,14 @@ pub trait Ring:
 impl Ring for crate::int::Int {
     // Arbitrary-precision integer arithmetic is exact and associative.
     const REASSOCIATIVE: bool = true;
+    const EXACT: bool = true;
     #[inline]
     fn multiply_cost_hint(&self) -> u64 {
         u64::from(self.bit_len())
+    }
+    #[cfg(feature = "poly")]
+    fn poly_mul(a: &[Self], b: &[Self]) -> Option<alloc::vec::Vec<Self>> {
+        crate::poly::kronecker_mul_int(a, b)
     }
     #[inline]
     fn zero(&self) -> Self {
@@ -97,11 +133,16 @@ impl Ring for crate::int::Int {
 impl Ring for crate::rational::Rational {
     // Exact reduced fractions: addition and multiplication are exact/associative.
     const REASSOCIATIVE: bool = true;
+    const EXACT: bool = true;
     #[inline]
     fn multiply_cost_hint(&self) -> u64 {
         // A rational multiply costs roughly both numerator and denominator
         // products (plus a gcd); size it by their combined bit length.
         u64::from(self.numerator().bit_len()) + u64::from(self.denominator().bit_len())
+    }
+    #[cfg(feature = "poly")]
+    fn poly_mul(a: &[Self], b: &[Self]) -> Option<alloc::vec::Vec<Self>> {
+        crate::poly::kronecker_mul_rational(a, b)
     }
     #[inline]
     fn zero(&self) -> Self {
@@ -173,6 +214,8 @@ impl Ring for crate::decimal::Decimal {
 
 #[cfg(feature = "int")]
 impl Ring for crate::mod_int::ModInt {
+    // Modular integer arithmetic is exact.
+    const EXACT: bool = true;
     /// Zero in the same ring `ℤ/nℤ` as `self` (shares the modulus).
     #[inline]
     fn zero(&self) -> Self {
@@ -191,6 +234,8 @@ impl Ring for crate::mod_int::ModInt {
 
 #[cfg(feature = "galois")]
 impl Ring for crate::galois::GfElement {
+    // Finite-field arithmetic is exact.
+    const EXACT: bool = true;
     /// Zero in the same field `GF(pᵏ)` as `self`.
     #[inline]
     fn zero(&self) -> Self {
@@ -209,6 +254,8 @@ impl Ring for crate::galois::GfElement {
 
 #[cfg(feature = "complex")]
 impl<T: Ring> Ring for crate::complex::Complex<T> {
+    // Exact exactly when the component ring is exact.
+    const EXACT: bool = T::EXACT;
     /// Componentwise zero (`0 + 0·i`), each component in the same ring as
     /// `self`'s.
     #[inline]
@@ -228,6 +275,8 @@ impl<T: Ring> Ring for crate::complex::Complex<T> {
 
 #[cfg(feature = "poly")]
 impl<T: Ring> Ring for crate::poly::Poly<T> {
+    // A polynomial ring is exact exactly when its coefficient ring is.
+    const EXACT: bool = T::EXACT;
     /// The zero polynomial.
     #[inline]
     fn zero(&self) -> Self {

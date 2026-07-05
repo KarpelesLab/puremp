@@ -7,6 +7,37 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/KarpelesLab/puremp/compare/v0.2.1...v0.2.2) - 2026-07-04
+
+### Added
+
+- *(poly)* Cantor–Zassenhaus factorization over finite fields GF(q)
+- *(matrix)* generic linear algebra over any Field via FieldMatrix trait
+- *(ring)* add Field trait (Ring + Div, with inv)
+- *(ring)* generic Ring layer — Poly/Matrix over ModInt, GF(pᵏ), any ring
+- add GF(pᵏ) finite field extensions (galois feature)
+- *(float)* add gamma, ln_gamma and first-kind Bessel Jₙ/Iₙ
+- *(factor)* self-initializing MPQS (SIQS) for balanced semiprimes
+- *(primality)* certificate-based primality proving (Pocklington + BLS n^{1/3})
+- *(identify)* inverse symbolic calculator + Machin-formula discovery
+- *(ball)* rigorous root solving + monotone exp/ln on Ball
+- *(dlog)* add Pohlig–Hellman discrete log; dispatch composite orders to it
+- *(ball)* add Ball — midpoint–radius rigorous arithmetic (Arb-style)
+
+### Other
+
+- note FieldMatrix and FactorOverField in the generic-ring bullet
+- add finite fields (GaloisField) to the intro blurb and feature table
+- drop Half-GCD from roadmap (shipped, guarded)
+- harden Half-GCD: always-on gcd-preservation guard + exhaustive determinism
+- subquadratic Half-GCD for Nat::gcd (O(M(n)·log n))
+- drop Subresultant PRS (shipped) and Sharper Newton building blocks from roadmap
+- *(algebraic)* subresultant PRS for Sturm chains and polynomial GCD
+- prune SIQS/gamma-Bessel/primality from the roadmap; add primality feature
+- prune shipped items from the roadmap
+- add Ball/p-adic to the intro blurb and dlog/padic to the feature table
+- note identify/machin, Pohlig–Hellman, and Ball root-finding as shipped
+
 ## [0.2.1](https://github.com/KarpelesLab/puremp/compare/v0.2.0...v0.2.1) - 2026-07-04
 
 ### Added

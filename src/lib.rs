@@ -235,7 +235,7 @@ pub use galois::{GaloisField, GfElement};
 pub use poly::Poly;
 
 #[cfg(feature = "matrix")]
-pub use matrix::{FieldMatrix, Matrix};
+pub use matrix::{FieldMatrix, Matrix, RingMatrix};
 
 #[cfg(feature = "lattice")]
 pub use lattice::{lll_reduce, lll_reduce_delta};

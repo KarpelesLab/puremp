@@ -359,6 +359,21 @@ poly_binop!(Add, add, AddAssign, add_assign);
 poly_binop!(Sub, sub, SubAssign, sub_assign);
 poly_binop!(Mul, mul, MulAssign, mul_assign);
 
+impl<T: Ring> core::ops::Neg for Poly<T> {
+    type Output = Poly<T>;
+    #[inline]
+    fn neg(self) -> Poly<T> {
+        Poly::neg(&self)
+    }
+}
+impl<T: Ring> core::ops::Neg for &Poly<T> {
+    type Output = Poly<T>;
+    #[inline]
+    fn neg(self) -> Poly<T> {
+        Poly::neg(self)
+    }
+}
+
 // ===========================================================================
 // Real-root isolation over ℚ (Sturm sequences).
 //

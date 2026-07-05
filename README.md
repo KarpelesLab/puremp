@@ -133,8 +133,10 @@ The exact-algebra layers stack on top of these:
   context-carrying `ModInt` (ℤ/nℤ) and `GfElement` (GF(pᵏ)), so polynomials and
   matrices over finite fields and modular integers work, not just over `Int`/`Rational`.
   Over a `Field`, `FieldMatrix` gives `determinant`/`inverse`/`solve`/`rank` by
-  Gaussian elimination, and `FactorOverField` factors polynomials over a finite
-  field (Cantor–Zassenhaus).
+  Gaussian elimination, `FactorOverField` factors polynomials over a finite
+  field (Cantor–Zassenhaus), and `RingMatrix` gives a division-free determinant
+  and characteristic polynomial (Samuelson–Berkowitz) over *any* commutative ring
+  — including non-fields like ℤ/nℤ (composite `n`) or `Matrix<Poly<Int>>`.
 
 For a bare `no_std` build: `--no-default-features` (add `--features int` for the
 integer types).

@@ -856,3 +856,105 @@ macro_rules! matrix_binop {
 matrix_binop!(Add, add, AddAssign, add_assign);
 matrix_binop!(Sub, sub, SubAssign, sub_assign);
 matrix_binop!(Mul, mul, MulAssign, mul_assign);
+
+/// Division-free linear algebra over any commutative [`Ring`] — the
+/// characteristic polynomial and determinant by the **Samuelson–Berkowitz**
+/// algorithm, which uses only ring `+`/`−`/`×` (no division at all). This works
+/// over rings that are not fields or integral domains — `ModInt` with a composite
+/// modulus, `Matrix<Poly<Int>>`, and the like — where Gaussian elimination and
+/// fraction-free Bareiss cannot be applied.
+///
+/// For `Int`/`Rational` the inherent [`Matrix::determinant`] (Bareiss) is faster,
+/// and for a genuine field [`FieldMatrix::determinant`] (Gaussian) is faster;
+/// these are the universal fallback. Cost is `O(n⁴)` ring multiplications.
+pub trait RingMatrix<T: Ring> {
+    /// The characteristic polynomial `det(x·I − self)` as coefficients from the
+    /// constant term up: `charpoly()[i]` is the coefficient of `xⁱ`, so
+    /// `charpoly()[0]` is `(−1)ⁿ·det` and the leading coefficient is one.
+    ///
+    /// # Panics
+    /// If the matrix is not square, or is `0×0` (no element to source the ring).
+    fn charpoly(&self) -> alloc::vec::Vec<T>;
+
+    /// The determinant of `self`, computed division-free.
+    ///
+    /// # Panics
+    /// If the matrix is not square, or is `0×0`.
+    fn det(&self) -> T;
+}
+
+impl<T: Ring> RingMatrix<T> for Matrix<T> {
+    #[allow(clippy::needless_range_loop)] // `j` is the power in S·Mʲ⁻²·R, not just an index
+    fn charpoly(&self) -> alloc::vec::Vec<T> {
+        assert!(
+            self.is_square(),
+            "RingMatrix::charpoly: matrix must be square"
+        );
+        let n = self.rows();
+        assert!(
+            n > 0,
+            "RingMatrix::charpoly: 0×0 matrix has no ring context"
+        );
+        let one = self.get(0, 0).one();
+        let zero = self.get(0, 0).zero();
+        // `v` = characteristic polynomial of the leading r×r block, high-degree
+        // first (`v[0]` is the coefficient of xʳ = one), grown by a Toeplitz
+        // matrix–vector product each step (Samuelson–Berkowitz).
+        let mut v = alloc::vec![one.clone()];
+        for r in 1..=n {
+            let a = self.get(r - 1, r - 1).clone();
+            // Toeplitz first column `t` (length r+1): t0 = 1, t1 = −a,
+            // t_j = −(S·Mʲ⁻²·R) for j = 2..=r, where M is the leading (r−1)² block,
+            // R = column r−1 (rows 0..r−1), S = row r−1 (cols 0..r−1).
+            let mut t = alloc::vec![zero.clone(); r + 1];
+            t[0] = one.clone();
+            t[1] = -a.clone();
+            if r >= 2 {
+                let mut w: alloc::vec::Vec<T> =
+                    (0..r - 1).map(|i| self.get(i, r - 1).clone()).collect();
+                for j in 2..=r {
+                    let mut s = zero.clone();
+                    for (c, wc) in w.iter().enumerate() {
+                        s = s + self.get(r - 1, c).clone() * wc.clone();
+                    }
+                    t[j] = -s;
+                    if j < r {
+                        let mut wn = alloc::vec![zero.clone(); r - 1];
+                        for (i, wni) in wn.iter_mut().enumerate() {
+                            let mut acc = zero.clone();
+                            for (k, wk) in w.iter().enumerate() {
+                                acc = acc + self.get(i, k).clone() * wk.clone();
+                            }
+                            *wni = acc;
+                        }
+                        w = wn;
+                    }
+                }
+            }
+            // v_new = T · v, with T[(i,k)] = t[i−k] (lower-triangular Toeplitz).
+            let mut vn = alloc::vec![zero.clone(); r + 1];
+            for (i, vni) in vn.iter_mut().enumerate() {
+                let mut acc = zero.clone();
+                for (k, vk) in v.iter().enumerate() {
+                    if i >= k {
+                        acc = acc + t[i - k].clone() * vk.clone();
+                    }
+                }
+                *vni = acc;
+            }
+            v = vn;
+        }
+        v.reverse(); // high-to-low → low-to-high (index = power of x)
+        v
+    }
+
+    fn det(&self) -> T {
+        let c = self.charpoly();
+        // det = (−1)ⁿ · constant term.
+        if self.rows().is_multiple_of(2) {
+            c[0].clone()
+        } else {
+            -c[0].clone()
+        }
+    }
+}

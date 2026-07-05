@@ -184,6 +184,30 @@ impl<T: Ring> Ring for crate::complex::Complex<T> {
     }
 }
 
+#[cfg(feature = "poly")]
+impl<T: Ring> Ring for crate::poly::Poly<T> {
+    /// The zero polynomial.
+    #[inline]
+    fn zero(&self) -> Self {
+        crate::poly::Poly::zero()
+    }
+    /// The constant polynomial `1` (its `1` drawn from a coefficient's ring).
+    ///
+    /// # Panics
+    /// On the zero polynomial, which has no coefficient to source the ring from.
+    fn one(&self) -> Self {
+        crate::poly::Poly::constant(
+            self.leading()
+                .expect("Poly::one: the zero polynomial has no ring context")
+                .one(),
+        )
+    }
+    #[inline]
+    fn is_zero(&self) -> bool {
+        crate::poly::Poly::is_zero(self)
+    }
+}
+
 /// An element of a (commutative) field: a [`Ring`] whose nonzero elements are
 /// invertible (it also has division).
 ///

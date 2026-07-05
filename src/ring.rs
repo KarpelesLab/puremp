@@ -41,10 +41,44 @@ pub trait Ring:
     fn one(&self) -> Self;
     /// Whether `self` is the additive identity.
     fn is_zero(&self) -> bool;
+
+    /// Whether this ring's `+`/`−`/`×` are *exact and associative*, so that a
+    /// re-associating fast matrix multiply (Strassen–Winograd, which forms
+    /// products of sums of blocks and recombines them in a different order) is
+    /// **bit-identical** to the naive triple loop.
+    ///
+    /// The default is `false`: a ring opts in only when it is genuinely exact.
+    /// The exact arbitrary-precision rings ([`Int`](crate::int::Int),
+    /// [`Rational`](crate::rational::Rational)) set it to `true`; rounding types
+    /// such as [`Float`](crate::float::Float) leave it `false`, so their
+    /// [`Matrix::mul`](crate::matrix::Matrix::mul) always uses the naive path and
+    /// their results are unaffected.
+    const REASSOCIATIVE: bool = false;
+
+    /// A cheap proxy for the *cost of multiplying two ring elements of roughly
+    /// `self`'s magnitude* — for the arbitrary-precision integers/rationals, the
+    /// operand's bit length.
+    ///
+    /// Strassen–Winograd trades one element multiply (per 8) for a handful of
+    /// extra element additions and block allocations; that is a win only when a
+    /// multiply is far dearer than an add, i.e. when the operands are large.
+    /// [`Matrix::mul`](crate::matrix::Matrix::mul) samples this on one entry to
+    /// decide whether to take the Strassen path. It never affects the *result*,
+    /// only the path taken; the default `0` (a free multiply) keeps a ring on the
+    /// naive path.
+    fn multiply_cost_hint(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(feature = "int")]
 impl Ring for crate::int::Int {
+    // Arbitrary-precision integer arithmetic is exact and associative.
+    const REASSOCIATIVE: bool = true;
+    #[inline]
+    fn multiply_cost_hint(&self) -> u64 {
+        u64::from(self.bit_len())
+    }
     #[inline]
     fn zero(&self) -> Self {
         crate::int::Int::ZERO
@@ -61,6 +95,14 @@ impl Ring for crate::int::Int {
 
 #[cfg(feature = "rational")]
 impl Ring for crate::rational::Rational {
+    // Exact reduced fractions: addition and multiplication are exact/associative.
+    const REASSOCIATIVE: bool = true;
+    #[inline]
+    fn multiply_cost_hint(&self) -> u64 {
+        // A rational multiply costs roughly both numerator and denominator
+        // products (plus a gcd); size it by their combined bit length.
+        u64::from(self.numerator().bit_len()) + u64::from(self.denominator().bit_len())
+    }
     #[inline]
     fn zero(&self) -> Self {
         crate::rational::Rational::ZERO

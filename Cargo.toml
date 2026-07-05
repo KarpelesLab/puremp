@@ -124,6 +124,10 @@ required-features = ["cli"]
 # Ad-hoc throughput harness (`cargo run --release --example bench`). Gated so
 # `--no-default-features` (bare no_std) builds don't try to compile it.
 [[example]]
+name = "strassen_bench"
+required-features=["std","matrix","rational"]
+
+[[example]]
 name = "bench"
 required-features = ["std", "float"]
 

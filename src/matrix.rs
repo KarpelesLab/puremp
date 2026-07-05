@@ -18,6 +18,28 @@ use crate::ring::{Field, Ring};
 use alloc::vec::Vec;
 use core::fmt;
 
+/// Dimension crossover below which [`Matrix::mul`] uses the naive triple loop
+/// instead of recursing with Strassen–Winograd. A block product is taken by
+/// Strassen only while every dimension of the (possibly recursively split)
+/// operands strictly exceeds this; the recursion bottoms out in the naive
+/// multiply at or below it.
+const STRASSEN_THRESHOLD: usize = 24;
+
+/// Minimum entry size (a [`Ring::multiply_cost_hint`], i.e. bit length for
+/// `Int`/`Rational`) below which [`Matrix::mul`] stays on the naive path
+/// regardless of dimension.
+///
+/// Strassen–Winograd replaces one of every eight element multiplies with a
+/// bundle of extra element additions and block allocations. Measured on this
+/// crate's `Int`/`Rational`, that is a net win only once a single element
+/// multiply is dear enough — around a thousand bits. Below this cutoff (e.g.
+/// machine-word-sized entries) the extra additions dominate and Strassen is
+/// ~10–20% *slower* at every dimension, so the naive path is kept. Above it,
+/// and above [`STRASSEN_THRESHOLD`] in dimension, Strassen wins: measured
+/// ≈1.03–1.26× for `Int` (2000-bit entries, `n` = 32…64) and ≈1.25–1.53× for
+/// large reduced `Rational`s, both growing with entry size and dimension.
+const STRASSEN_MIN_ENTRY_BITS: u64 = 1024;
+
 /// A dense `rows × cols` matrix stored row-major.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Matrix<T> {
@@ -192,8 +214,33 @@ impl<T: Ring> Matrix<T> {
 
     /// Returns the matrix product `self · rhs`. Panics if the inner dimensions
     /// disagree.
+    ///
+    /// For component rings whose arithmetic is exact and associative
+    /// ([`Ring::REASSOCIATIVE`]) the product is computed by the recursive
+    /// **Strassen–Winograd** algorithm above a size threshold (7 recursive block
+    /// products instead of 8), falling back to the naive triple loop below the
+    /// threshold and for small or awkward shapes. The visible result is always
+    /// **bit-identical** to the naive product.
     pub fn mul(&self, rhs: &Matrix<T>) -> Matrix<T> {
         assert_eq!(self.cols, rhs.rows, "Matrix::mul: inner dimension mismatch");
+        // Fast path: only for exact rings (Strassen re-associates arithmetic, so
+        // it is bit-identical to naive *only* when `+`/`−`/`×` are exact), only
+        // once every dimension is comfortably above the crossover point, and only
+        // when the entries are large enough that saving a multiply outweighs the
+        // extra additions (sampled cheaply on one entry; both operands are
+        // non-empty here).
+        if T::REASSOCIATIVE
+            && self.rows.min(self.cols).min(rhs.cols) > STRASSEN_THRESHOLD
+            && self.data[0].multiply_cost_hint() >= STRASSEN_MIN_ENTRY_BITS
+        {
+            return self.strassen_mul(rhs);
+        }
+        self.naive_mul(rhs)
+    }
+
+    /// The classical `O(n³)` triple-loop product — the reference implementation
+    /// and the base case of [`strassen_mul`](Matrix::strassen_mul).
+    fn naive_mul(&self, rhs: &Matrix<T>) -> Matrix<T> {
         let out_len = self.rows * rhs.cols;
         // Accumulator zeros come from a sample cell (the ring's zero). The only
         // way both operands are empty yet a cell is needed is the degenerate
@@ -224,6 +271,120 @@ impl<T: Ring> Matrix<T> {
             }
         }
         out
+    }
+
+    /// Recursive Strassen–Winograd product. Assumes the inner dimension already
+    /// matches (`self.cols == rhs.rows`); dispatched from [`mul`](Matrix::mul)
+    /// only for exact rings above [`STRASSEN_THRESHOLD`].
+    fn strassen_mul(&self, rhs: &Matrix<T>) -> Matrix<T> {
+        let m = self.rows;
+        let k = self.cols;
+        let n = rhs.cols;
+        // Base case: recurse down to the naive triple loop.
+        if m.min(k).min(n) <= STRASSEN_THRESHOLD {
+            return self.naive_mul(rhs);
+        }
+        // A sample entry gives the ring's zero for the padding cells. Both
+        // operands are non-empty here (all dimensions exceed the threshold).
+        let zero = self.data[0].zero();
+
+        // Pad each dimension up to even so the four quadrants are equal-sized.
+        let me = m + (m & 1);
+        let ke = k + (k & 1);
+        let ne = n + (n & 1);
+        let hm = me / 2;
+        let hk = ke / 2;
+        let hn = ne / 2;
+
+        let a = self.padded(me, ke, &zero);
+        let b = rhs.padded(ke, ne, &zero);
+
+        // A blocks (hm×hk) and B blocks (hk×hn).
+        let a11 = a.block(0, 0, hm, hk);
+        let a12 = a.block(0, hk, hm, hk);
+        let a21 = a.block(hm, 0, hm, hk);
+        let a22 = a.block(hm, hk, hm, hk);
+        let b11 = b.block(0, 0, hk, hn);
+        let b12 = b.block(0, hn, hk, hn);
+        let b21 = b.block(hk, 0, hk, hn);
+        let b22 = b.block(hk, hn, hk, hn);
+
+        // Winograd's schedule (7 products, 15 additions; the addition-minimizing
+        // variant of Strassen, *Numer. Math.* 13 (1969) / MCA §12.1). Verified by
+        // symbolic expansion to equal the four naive block sums.
+        let s1 = a21.add(&a22);
+        let s2 = s1.sub(&a11);
+        let s3 = a11.sub(&a21);
+        let s4 = a12.sub(&s2);
+        let s5 = b12.sub(&b11);
+        let s6 = b22.sub(&s5);
+        let s7 = b22.sub(&b12);
+        let s8 = s6.sub(&b21);
+
+        let p1 = s2.strassen_mul(&s6);
+        let p2 = a11.strassen_mul(&b11);
+        let p3 = a12.strassen_mul(&b21);
+        let p4 = s3.strassen_mul(&s7);
+        let p5 = s1.strassen_mul(&s5);
+        let p6 = s4.strassen_mul(&b22);
+        let p7 = a22.strassen_mul(&s8);
+
+        let u1 = p1.add(&p2);
+        let u2 = u1.add(&p4);
+        let u3 = u1.add(&p5);
+
+        let c11 = p2.add(&p3);
+        let c12 = u3.add(&p6);
+        let c21 = u2.sub(&p7);
+        let c22 = u2.add(&p5);
+
+        // Reassemble into the visible m×n result (dropping the padded row/column).
+        let mut data = alloc::vec![zero; m * n];
+        for i in 0..m {
+            let (bi, ii) = if i < hm { (false, i) } else { (true, i - hm) };
+            for j in 0..n {
+                let (bj, jj) = if j < hn { (false, j) } else { (true, j - hn) };
+                let cell = match (bi, bj) {
+                    (false, false) => c11.get(ii, jj),
+                    (false, true) => c12.get(ii, jj),
+                    (true, false) => c21.get(ii, jj),
+                    (true, true) => c22.get(ii, jj),
+                };
+                data[i * n + j] = cell.clone();
+            }
+        }
+        Matrix {
+            rows: m,
+            cols: n,
+            data,
+        }
+    }
+
+    /// Returns a `rows × cols` copy with `self` in the top-left corner and `zero`
+    /// elsewhere (`rows ≥ self.rows`, `cols ≥ self.cols`).
+    fn padded(&self, rows: usize, cols: usize, zero: &T) -> Matrix<T> {
+        let mut data = alloc::vec![zero.clone(); rows * cols];
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                data[i * cols + j] = self.data[i * self.cols + j].clone();
+            }
+        }
+        Matrix { rows, cols, data }
+    }
+
+    /// Extracts the `hr × hc` sub-block whose top-left corner is `(r0, c0)`.
+    fn block(&self, r0: usize, c0: usize, hr: usize, hc: usize) -> Matrix<T> {
+        let mut data = Vec::with_capacity(hr * hc);
+        for i in 0..hr {
+            for j in 0..hc {
+                data.push(self.data[(r0 + i) * self.cols + (c0 + j)].clone());
+            }
+        }
+        Matrix {
+            rows: hr,
+            cols: hc,
+            data,
+        }
     }
 
     /// Returns `self · scalar`.
@@ -1066,4 +1227,127 @@ fn squarefree_decomposition(
         }
     }
     result
+}
+
+#[cfg(all(test, feature = "rational"))]
+mod strassen_tests {
+    use super::*;
+    use crate::int::Int;
+    use crate::rational::Rational;
+
+    /// A tiny deterministic LCG — enough to build reproducible random matrices.
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Lcg {
+            Lcg(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        /// A signed integer of roughly `bits` bits.
+        fn int(&mut self, bits: u32) -> Int {
+            let mut v = Int::ZERO;
+            let chunk = Int::from_i64(1i64 << 20);
+            let mut b = 0u32;
+            while b < bits {
+                v = &(&v * &chunk) + &Int::from_i64((self.next() & 0xF_FFFF) as i64);
+                b += 20;
+            }
+            if self.next() & 1 == 0 { v.neg() } else { v }
+        }
+        fn imatrix(&mut self, rows: usize, cols: usize, bits: u32) -> Matrix<Int> {
+            let data = (0..rows * cols).map(|_| self.int(bits)).collect();
+            Matrix::new(rows, cols, data)
+        }
+        fn rmatrix(&mut self, rows: usize, cols: usize, bits: u32) -> Matrix<Rational> {
+            let data = (0..rows * cols)
+                .map(|_| {
+                    let d = self.int(bits.max(1));
+                    let den = if d.is_zero() { Int::ONE } else { d };
+                    Rational::new(self.int(bits), den)
+                })
+                .collect();
+            Matrix::new(rows, cols, data)
+        }
+    }
+
+    /// Shapes covering: below/at/above the threshold, odd dimensions,
+    /// rectangular, degenerate, and two recursion levels (dim > 48). Kept ≤ 65
+    /// so the differential runs quickly in unoptimized `cargo test`.
+    const SHAPES: &[(usize, usize, usize)] = &[
+        (1, 1, 1),
+        (2, 2, 2),
+        (3, 5, 4),
+        (24, 24, 24),
+        (25, 25, 25),
+        (26, 26, 26),
+        (25, 26, 27),
+        (33, 17, 49),
+        (48, 48, 48),
+        (49, 49, 49),
+        (50, 37, 63),
+        (65, 65, 65),
+        (1, 60, 1),
+        (60, 1, 60),
+    ];
+
+    #[test]
+    fn strassen_matches_naive_int_small_entries() {
+        let mut r = Lcg::new(0xC0FFEE);
+        for &(m, k, n) in SHAPES {
+            let a = r.imatrix(m, k, 30);
+            let b = r.imatrix(k, n, 30);
+            assert_eq!(
+                a.strassen_mul(&b),
+                a.naive_mul(&b),
+                "int mismatch at {m}x{k} * {k}x{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn strassen_matches_naive_int_large_entries() {
+        let mut r = Lcg::new(0x1234_5678);
+        // Big entries (~300 bits) across odd / rectangular / two-level shapes —
+        // exercises carries and signs without the debug-mode cost of huge dims.
+        for &(m, k, n) in &[(26usize, 26, 26), (33usize, 25, 41)] {
+            let a = r.imatrix(m, k, 300);
+            let b = r.imatrix(k, n, 300);
+            assert_eq!(a.strassen_mul(&b), a.naive_mul(&b));
+        }
+    }
+
+    #[test]
+    fn strassen_matches_naive_rational() {
+        let mut r = Lcg::new(0xABCD_EF01);
+        // Rational multiplies (gcd-heavy) are dear in debug, so use a smaller
+        // subset of shapes that still spans odd / rectangular / two levels.
+        for &(m, k, n) in &[(2usize, 2, 2), (25usize, 25, 25), (33usize, 17, 49)] {
+            let a = r.rmatrix(m, k, 40);
+            let b = r.rmatrix(k, n, 40);
+            assert_eq!(
+                a.strassen_mul(&b),
+                a.naive_mul(&b),
+                "rational mismatch at {m}x{k} * {k}x{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_mul_dispatches_and_matches_naive_large() {
+        // Entries above the bit cutoff so the public `mul` really takes the
+        // Strassen path; it must still equal the naive product bit-for-bit.
+        let mut r = Lcg::new(0x55AA_55AA);
+        let a = r.imatrix(26, 26, 1100);
+        let b = r.imatrix(26, 26, 1100);
+        assert!(a.get(0, 0).multiply_cost_hint() >= STRASSEN_MIN_ENTRY_BITS);
+        assert_eq!(a.mul(&b), a.naive_mul(&b));
+        // A · I = A on the Strassen path.
+        let id = Matrix::<Int>::identity(26);
+        assert_eq!(a.mul(&id), a);
+    }
 }

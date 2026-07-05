@@ -32,6 +32,7 @@
 //! pushing the practical range into the ~50-digit region. Both are
 //! dependency-free and `unsafe`-free like the rest of the crate.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::Int;
@@ -764,8 +765,41 @@ fn init_a(fb: &[FbPrime], m: u64, a: Nat, a_idx: Vec<usize>) -> ACoeff {
     }
 }
 
+/// Accumulated large-prime state across a whole `siqs_factor` run: the map from
+/// each seen large prime to a representative partial relation (its base value
+/// and factor-base exponents), plus yield counters for reporting.
+struct LpStore {
+    /// large prime → (base, factor-base exponents) of its representative partial.
+    reps: BTreeMap<u64, (Nat, Vec<(usize, u32)>)>,
+    /// Relations found directly smooth (classic full relations). Read only by
+    /// the yield benchmark; incremented always so the count is exact.
+    #[cfg_attr(not(test), allow(dead_code))]
+    direct: usize,
+    /// Full relations synthesised by combining two matched partials.
+    #[cfg_attr(not(test), allow(dead_code))]
+    combined: usize,
+    /// Total partial relations seen (matched or not).
+    #[cfg_attr(not(test), allow(dead_code))]
+    partials_seen: usize,
+}
+
+impl LpStore {
+    fn new() -> Self {
+        LpStore {
+            reps: BTreeMap::new(),
+            direct: 0,
+            combined: 0,
+            partials_seen: 0,
+        }
+    }
+}
+
 /// Sieves the current polynomial `Q(x) = (a·x + b)² − n` over `[−M, M]`,
-/// collects the smooth relations, and appends them to `relations`.
+/// collects the smooth relations, and appends them to `relations`. Partial
+/// relations (a single leftover large prime `≤ lp_bound`) are routed through
+/// `lp`: the first with a given large prime is stored, and each later one
+/// sharing it is combined with the stored representative into a full relation,
+/// itself appended to `relations`.
 #[allow(clippy::too_many_arguments)]
 fn sieve_poly(
     n: &Nat,
@@ -775,8 +809,10 @@ fn sieve_poly(
     m: u64,
     target: u32,
     fudge: u32,
+    lp_bound: u64,
     logs: &mut [u8],
     relations: &mut Vec<Relation>,
+    lp: &mut LpStore,
     want: usize,
 ) {
     let width = (2 * m + 1) as usize;
@@ -814,13 +850,64 @@ fn sieve_poly(
         if base.is_zero() {
             continue;
         }
-        if let Some(rel) = siqs_relation(n, ac, base, fb, i) {
-            relations.push(rel);
-            if relations.len() >= want {
-                return;
+        match siqs_relation(n, ac, base, fb, i, lp_bound) {
+            Cand::Full(rel) => {
+                lp.direct += 1;
+                relations.push(rel);
             }
+            Cand::Partial {
+                lp: prime,
+                base,
+                exps,
+            } => {
+                lp.partials_seen += 1;
+                match lp.reps.get(&prime) {
+                    Some((b0, e0)) => {
+                        if let Some(rel) =
+                            combine_partials(n, prime, b0, e0, &base, &exps, fb.len())
+                        {
+                            lp.combined += 1;
+                            relations.push(rel);
+                        }
+                    }
+                    None => {
+                        lp.reps.insert(prime, (base, exps));
+                    }
+                }
+            }
+            Cand::None => {}
+        }
+        if relations.len() >= want {
+            return;
         }
     }
+}
+
+/// The outcome of trial-dividing one SIQS sieve candidate over the factor base.
+enum Cand {
+    /// `Q(x)` factored completely over the base — a directly-smooth full relation.
+    Full(Relation),
+    /// `Q(x)` reduced to a single leftover prime `lp` in `(bound, LP]` — a
+    /// *partial* relation, carrying its base value and factor-base exponents.
+    /// Two partials sharing the same `lp` combine into a full relation.
+    Partial {
+        lp: u64,
+        base: Nat,
+        exps: Vec<(usize, u32)>,
+    },
+    /// Not usable: `Q(x)` retained a composite cofactor (or a prime above `LP`).
+    None,
+}
+
+/// Packs a sparse exponent list into `GF(2)` parity words over `cols` columns.
+fn parity_of(exps: &[(usize, u32)], cols: usize) -> Vec<u64> {
+    let mut parity = alloc::vec![0u64; cols.div_ceil(64)];
+    for &(idx, e) in exps {
+        if e & 1 == 1 {
+            parity[idx / 64] ^= 1u64 << (idx % 64);
+        }
+    }
+    parity
 }
 
 /// Confirms and factors a SIQS candidate at array index `i`. Unlike the
@@ -830,7 +917,16 @@ fn sieve_poly(
 /// actually hit `i` — plus the primes dividing `a`, which divide every `Q` —
 /// are divided out. This turns thousands of big-integer divisions per candidate
 /// into a handful.
-fn siqs_relation(n: &Nat, ac: &ACoeff, base: Nat, fb: &[FbPrime], i: usize) -> Option<Relation> {
+///
+/// Because every factor-base prime dividing `Q(x)` is divided out, the residue
+/// `mag` left over is coprime to the whole base. If it is `1` the candidate is
+/// a directly-smooth full relation; if it is a single prime `≤ lp_bound` the
+/// candidate is kept as a *partial* relation tagged by that large prime (the
+/// single-large-prime variation), from which two partials sharing the prime
+/// later combine into a full. `lp_bound = 0` disables partials (the classic
+/// full-only behaviour). Anything else — a composite cofactor, or a prime above
+/// the bound — is discarded.
+fn siqs_relation(n: &Nat, ac: &ACoeff, base: Nat, fb: &[FbPrime], i: usize, lp_bound: u64) -> Cand {
     let sq = base.square();
     let (mut mag, neg) = if sq >= *n {
         (sq.checked_sub(n).unwrap(), false)
@@ -838,7 +934,7 @@ fn siqs_relation(n: &Nat, ac: &ACoeff, base: Nat, fb: &[FbPrime], i: usize) -> O
         (n.checked_sub(&sq).unwrap(), true)
     };
     if mag.is_zero() {
-        return None;
+        return Cand::None;
     }
     let mut exps: Vec<(usize, u32)> = Vec::new();
     if neg {
@@ -873,39 +969,152 @@ fn siqs_relation(n: &Nat, ac: &ACoeff, base: Nat, fb: &[FbPrime], i: usize) -> O
             break;
         }
     }
-    if !mag.is_one() {
-        return None; // leftover cofactor: not smooth over the base
+    if mag.is_one() {
+        let parity = parity_of(&exps, fb.len());
+        return Cand::Full(Relation { base, exps, parity });
     }
-    let words = fb.len().div_ceil(64);
-    let mut parity = alloc::vec![0u64; words];
-    for &(idx, e) in &exps {
-        if e & 1 == 1 {
-            parity[idx / 64] ^= 1u64 << (idx % 64);
+    // A leftover cofactor, coprime to the whole factor base. Keep it iff it is a
+    // single prime within the large-prime bound: a partial relation.
+    if lp_bound > 0
+        && mag.bit_len() <= 64
+        && let Some(lp) = mag.to_u64()
+        && lp <= lp_bound
+        && mag.is_prime_bpsw()
+    {
+        return Cand::Partial { lp, base, exps };
+    }
+    Cand::None // composite (or too-large) leftover: not usable
+}
+
+/// Merges two ascending sparse exponent lists, summing shared indices.
+fn merge_exps(a: &[(usize, u32)], b: &[(usize, u32)]) -> Vec<(usize, u32)> {
+    let mut out: Vec<(usize, u32)> = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        match (a.get(i), b.get(j)) {
+            (Some(&(ia, ea)), Some(&(ib, eb))) => {
+                if ia < ib {
+                    out.push((ia, ea));
+                    i += 1;
+                } else if ib < ia {
+                    out.push((ib, eb));
+                    j += 1;
+                } else {
+                    out.push((ia, ea + eb));
+                    i += 1;
+                    j += 1;
+                }
+            }
+            (Some(&e), None) => {
+                out.push(e);
+                i += 1;
+            }
+            (None, Some(&e)) => {
+                out.push(e);
+                j += 1;
+            }
+            (None, None) => break,
         }
     }
+    out
+}
+
+/// Combines two partial relations sharing the large prime `lp` into a full one.
+///
+/// With `bᵢ² ≡ Qᵢ = lp·∏ p^{eᵢ} (mod n)`, set `base = b₁·b₂·lp⁻¹ (mod n)`; then
+/// `base² ≡ Q₁·Q₂·lp⁻² = ∏ p^{e₁+e₂} (mod n)` is smooth over the factor base —
+/// the large prime, squared, has dropped out. The result is an ordinary full
+/// relation feeding the existing dependency search unchanged. Returns `None`
+/// only in the degenerate cases (`lp` not invertible mod `n`, i.e. a factor of
+/// `n`, or a zero base), which the caller simply skips.
+fn combine_partials(
+    n: &Nat,
+    lp: u64,
+    b1: &Nat,
+    e1: &[(usize, u32)],
+    b2: &Nat,
+    e2: &[(usize, u32)],
+    cols: usize,
+) -> Option<Relation> {
+    let inv = Int::from_u64(lp).modinv(&Int::from(n.clone()))?.magnitude();
+    let base = b1
+        .mul(b2)
+        .div_rem(n)
+        .unwrap()
+        .1
+        .mul(&inv)
+        .div_rem(n)
+        .unwrap()
+        .1;
+    if base.is_zero() {
+        return None;
+    }
+    let exps = merge_exps(e1, e2);
+    let parity = parity_of(&exps, cols);
     Some(Relation { base, exps, parity })
 }
 
-/// Attempts to split the odd composite `n` with the self-initializing MPQS.
+/// Attempts to split the odd composite `n` with the self-initializing MPQS,
+/// using the single-large-prime variation (see [`siqs_run`]).
 /// Returns a non-trivial factor, or `None` if it could not build a usable
 /// `a`-coefficient, gather enough relations within the polynomial budget, or
 /// turn any dependency into a proper factor (the caller then falls back).
 /// `n` must not be a perfect square (the caller handles perfect powers).
 pub(crate) fn siqs_factor(n: &Nat) -> Option<Nat> {
+    siqs_run(n, LargePrime::Single).0
+}
+
+/// The large-prime variation to apply while collecting SIQS relations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LargePrime {
+    /// Full relations only (the classic sieve) — used as the benchmark baseline.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Off,
+    /// Keep a single leftover prime in `(bound, bound·2⁷]` as a partial relation
+    /// and combine matched partials into fulls.
+    Single,
+}
+
+/// Runs SIQS with the chosen large-prime policy, returning the factor (if any)
+/// together with the relation-yield statistics ([`LpStore`]) for reporting and
+/// benchmarking. Factored out of [`siqs_factor`] so the with/without-partials
+/// comparison exercises the identical sieve.
+///
+/// The large-prime bound is `LP = bound·2⁷`. It sits comfortably inside the
+/// existing log-threshold slack (`fudge ≈ log₂ bound + 11`), so a candidate
+/// whose only missing factor is a prime `≤ LP` already clears the threshold and
+/// reaches trial division — the variation merely *keeps* such a candidate (as a
+/// partial) instead of discarding it, adding relations without widening the
+/// sieve or admitting extra non-smooth candidates.
+fn siqs_run(n: &Nat, policy: LargePrime) -> (Option<Nat>, LpStore) {
     let digits = (n.bit_len() * 30103 / 100000 + 1) as usize;
     let params = siqs_params_for(digits);
+    let mut lp = LpStore::new();
     let fb = build_factor_base(n, params.bound);
     if fb.len() < 10 {
-        return None;
+        return (None, lp);
     }
     let root = n.isqrt();
     if root.square() == *n {
-        return Some(root); // perfect square
+        return (Some(root), lp); // perfect square
     }
 
     let target = (n.bit_len() as u32).div_ceil(2) + (64 - params.m.leading_zeros());
     let fudge = (64 - params.bound.leading_zeros()) + 10;
-    let want = fb.len() + 16 + fb.len() / 20;
+    let lp_bound = match policy {
+        LargePrime::Off => 0,
+        LargePrime::Single => params.bound.saturating_mul(128),
+    };
+    // Combined-partial relations are individually valid but more linearly
+    // correlated than directly-smooth ones (many share a representative partial),
+    // so more of the resulting dependencies can be trivial. Carry a larger
+    // surplus under the large-prime policy to keep the factor-yield at least as
+    // reliable as the full-only sieve while still finishing in fewer polynomials.
+    let margin = match policy {
+        LargePrime::Off => 16 + fb.len() / 20,
+        LargePrime::Single => 48 + fb.len() / 8,
+    };
+    let want = fb.len() + margin;
 
     let mut rng = Lcg(n.as_limbs().first().copied().unwrap_or(1) | 1);
     let mut relations: Vec<Relation> = Vec::new();
@@ -916,7 +1125,9 @@ pub(crate) fn siqs_factor(n: &Nat) -> Option<Nat> {
     let max_polys: u64 = 400_000;
     let mut polys = 0u64;
     'outer: while relations.len() < want && polys < max_polys {
-        let (a, a_idx) = choose_a(n, &fb, &params, &mut rng)?;
+        let Some((a, a_idx)) = choose_a(n, &fb, &params, &mut rng) else {
+            return (None, lp);
+        };
         let s = a_idx.len();
         let mut ac = init_a(&fb, params.m, a, a_idx);
 
@@ -964,8 +1175,10 @@ pub(crate) fn siqs_factor(n: &Nat) -> Option<Nat> {
                 params.m,
                 target,
                 fudge,
+                lp_bound,
                 &mut logs,
                 &mut relations,
+                &mut lp,
                 want,
             );
             polys += 1;
@@ -976,10 +1189,10 @@ pub(crate) fn siqs_factor(n: &Nat) -> Option<Nat> {
     }
 
     if relations.len() <= fb.len() {
-        return None;
+        return (None, lp);
     }
     let deps = find_dependencies(&relations, fb.len());
-    factor_from_dependencies(n, &fb, &relations, &deps)
+    (factor_from_dependencies(n, &fb, &relations, &deps), lp)
 }
 
 #[cfg(test)]
@@ -1065,5 +1278,217 @@ mod tests {
         let p = big_prime_at_least(&Nat::from_u128(40_000_000_000_000_000_019u128));
         let n = p.square();
         assert_eq!(siqs_factor(&n), Some(p));
+    }
+
+    /// Checks the relation invariant `base² ≡ (−1)^{e₀}·∏ p^{e} (mod n)` — i.e.
+    /// that the stored exponent factorization really is `Q = base² − n` up to
+    /// multiples of `n`. Holds for directly-smooth *and* combined-partial fulls.
+    fn check_relation(n: &Nat, fb: &[FbPrime], rel: &Relation) -> bool {
+        let lhs = rel.base.square().div_rem(n).unwrap().1;
+        let mut neg = false;
+        let mut rhs = Nat::one();
+        for &(idx, e) in &rel.exps {
+            if idx == 0 {
+                neg = e & 1 == 1;
+                continue;
+            }
+            let pe = Nat::from_u64(fb[idx].p).modpow(&Nat::from_u64(e as u64), n);
+            rhs = rhs.mul(&pe).div_rem(n).unwrap().1;
+        }
+        let rhs = if neg {
+            n.checked_sub(&rhs).unwrap()
+        } else {
+            rhs
+        };
+        lhs == rhs
+    }
+
+    /// Combined-partial relations are algebraically valid: gather real relations
+    /// (including many synthesised from matched partials) and confirm every one
+    /// satisfies the square-congruence invariant. Heavy — run in release.
+    #[test]
+    #[ignore = "heavy: release-only relation-invariant check"]
+    fn combined_partial_relations_are_valid() {
+        let (n, _p, _q) = balanced_semiprime(38, 3);
+        let params = siqs_params_for((n.bit_len() * 30103 / 100000 + 1) as usize);
+        let fb = build_factor_base(&n, params.bound);
+        let target = (n.bit_len() as u32).div_ceil(2) + (64 - params.m.leading_zeros());
+        let fudge = (64 - params.bound.leading_zeros()) + 10;
+        let lp_bound = params.bound.saturating_mul(128);
+        let m = params.m;
+        let mut logs = alloc::vec![0u8; (2 * m + 1) as usize];
+        let mut rng = Lcg(n.as_limbs().first().copied().unwrap_or(1) | 1);
+        let mut relations: Vec<Relation> = Vec::new();
+        let mut lp = LpStore::new();
+
+        // Sieve the full Gray-code family of a few `a`-coefficients so combined
+        // relations actually arise.
+        for _ in 0..8 {
+            let Some((a, a_idx)) = choose_a(&n, &fb, &params, &mut rng) else {
+                break;
+            };
+            let s = a_idx.len();
+            let mut ac = init_a(&fb, m, a, a_idx);
+            let mut signs = alloc::vec![1i64; s];
+            let mut b = {
+                let mut acc = Int::ZERO;
+                for t in &ac.b_terms {
+                    acc = acc.add(&Int::from(t.clone()));
+                }
+                acc
+            };
+            for iter in 0..(1u64 << (s - 1)) {
+                if iter > 0 {
+                    let j = iter.trailing_zeros() as usize;
+                    let ds = signs[j];
+                    signs[j] = -ds;
+                    let two_bj = Int::from(ac.b_terms[j].clone()).mul(&Int::from_u64(2));
+                    b = if ds > 0 {
+                        b.sub(&two_bj)
+                    } else {
+                        b.add(&two_bj)
+                    };
+                    for (idx, fp) in fb.iter().enumerate().skip(1) {
+                        if !ac.active[idx] {
+                            continue;
+                        }
+                        let p = fp.p as i128;
+                        let inc = ds as i128 * ac.bainv2[idx * s + j] as i128;
+                        ac.soln1[idx] = ((ac.soln1[idx] as i128 + inc).rem_euclid(p)) as u64;
+                        ac.soln2[idx] = ((ac.soln2[idx] as i128 + inc).rem_euclid(p)) as u64;
+                    }
+                }
+                sieve_poly(
+                    &n,
+                    &ac,
+                    &b,
+                    &fb,
+                    m,
+                    target,
+                    fudge,
+                    lp_bound,
+                    &mut logs,
+                    &mut relations,
+                    &mut lp,
+                    usize::MAX,
+                );
+            }
+        }
+
+        assert!(lp.combined > 0, "expected some combined-partial relations");
+        for rel in &relations {
+            assert!(
+                check_relation(&n, &fb, rel),
+                "invalid relation base={:?}",
+                rel.base
+            );
+        }
+    }
+
+    /// Decimal 10^k, for building semiprimes larger than `u128`.
+    fn ten_pow(k: u32) -> Nat {
+        let ten = Nat::from_u64(10);
+        let mut r = Nat::one();
+        for _ in 0..k {
+            r = r.mul(&ten);
+        }
+        r
+    }
+
+    /// A balanced `d`-digit semiprime: two distinct primes of about `d/2` digits.
+    fn balanced_semiprime(d: u32, seed: u64) -> (Nat, Nat, Nat) {
+        let base = ten_pow(d / 2);
+        let p = big_prime_at_least(&base.add(&Nat::from_u64(seed.wrapping_mul(2) + 1)));
+        let q = big_prime_at_least(&base.add(&Nat::from_u64(seed.wrapping_mul(1000) + 12345)));
+        let n = p.mul(&q);
+        (n, p, q)
+    }
+
+    /// Correctness across the SIQS range with the large-prime variation on:
+    /// every factor SIQS returns is an exact prime divisor, and the vast
+    /// majority of cases are solved. (SIQS may decline on a few inputs — it is
+    /// documented to return `None`, whereupon the production caller falls back —
+    /// so this tolerates a small miss rate but demands every *returned* factor
+    /// be correct.) Heavy — run in release:
+    /// `cargo test --release siqs_lp_correctness -- --ignored`.
+    #[test]
+    #[ignore = "heavy: release-only SIQS batch"]
+    fn siqs_lp_correctness_batch() {
+        let (mut solved, mut total) = (0u32, 0u32);
+        for &d in &[30u32, 34, 38, 42, 46] {
+            for seed in 0..4u64 {
+                let (n, p, q) = balanced_semiprime(d, seed);
+                if p == q {
+                    continue;
+                }
+                total += 1;
+                let Some(f) = siqs_factor(&n) else { continue };
+                solved += 1;
+                assert!(f == p || f == q, "d={d} seed={seed}: bad factor {f:?}");
+                let (cof, r) = n.div_rem(&f).unwrap();
+                assert!(r.is_zero(), "d={d} seed={seed}: not a divisor");
+                assert!(f.is_prime_bpsw() && cof.is_prime_bpsw());
+                assert_eq!(f.mul(&cof), n, "d={d} seed={seed}: product mismatch");
+            }
+        }
+        // Every returned factor was verified above; require a high solve rate so
+        // the batch is a meaningful exercise of the large-prime path.
+        assert!(
+            solved * 10 >= total * 9,
+            "solved {solved}/{total}: SIQS+LP solve rate too low"
+        );
+    }
+
+    /// Relation-yield / timing benchmark: SIQS with vs without the single
+    /// large-prime variation over representative balanced semiprimes. Prints the
+    /// speedup and the share of relations that came from combined partials.
+    /// Run: `cargo test --release siqs_lp_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark: release-only, prints timings"]
+    fn siqs_lp_benchmark() {
+        use std::time::Instant;
+        std::println!(
+            "\n{:>4} {:>10} {:>10} {:>8} {:>9} {:>9} {:>7}",
+            "dig",
+            "off (ms)",
+            "lp (ms)",
+            "speedup",
+            "combined",
+            "partials",
+            "share",
+        );
+        // Fastest of several runs per policy — min is more stable than mean
+        // against scheduler noise (same convention as `examples/bench.rs`).
+        let best = |n: &Nat, pol: LargePrime| -> (f64, LpStore) {
+            let mut ms = f64::MAX;
+            let mut store = LpStore::new();
+            for _ in 0..3 {
+                let t = Instant::now();
+                let (f, s) = siqs_run(n, pol);
+                ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
+                assert!(f.is_some());
+                store = s;
+            }
+            (ms, store)
+        };
+        for &d in &[38u32, 42, 44, 46, 48] {
+            let (n, _p, _q) = balanced_semiprime(d, 1);
+            let (off_ms, _soff) = best(&n, LargePrime::Off);
+            let (lp_ms, slp) = best(&n, LargePrime::Single);
+
+            let total = slp.direct + slp.combined;
+            let share = if total > 0 {
+                100.0 * slp.combined as f64 / total as f64
+            } else {
+                0.0
+            };
+            std::println!(
+                "{d:>4} {off_ms:>10.1} {lp_ms:>10.1} {:>7.2}x {:>9} {:>9} {:>6.1}%",
+                off_ms / lp_ms,
+                slp.combined,
+                slp.partials_seen,
+                share,
+            );
+        }
     }
 }

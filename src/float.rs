@@ -1054,6 +1054,22 @@ impl fmt::Debug for Float {
 
 const NEAR: RoundingMode = RoundingMode::Nearest;
 
+/// Working precision (bits) at or above which `Float::ln` switches from
+/// argument reduction plus the term-by-term `atanh` series (which costs
+/// `O(n²)`) to the AGM formula `ln(s) = π/(2·M(1, 4/s))` (`O(M(n)·log n)`).
+///
+/// The crossover was measured (see the `agm_crossover` ignored bench): AGM is
+/// already ~4× faster at 4096 bits and the lead widens with precision (≈25× at
+/// 16 kbit, ≈73× at 128 kbit), so the threshold sits just below the smallest
+/// measured win. Inputs within `2^-32` of 1 stay on the series regardless (see
+/// [`ln_near_one`]).
+///
+/// (A Brent–Salamin AGM π was also implemented and benchmarked, but the
+/// existing Machin binary-split series is already `O(M(n)·log n)` and matched or
+/// beat the AGM at every precision — slightly *faster* above ~256 kbit — so no
+/// AGM π path is wired in.)
+const LN_AGM_THRESHOLD: u64 = 1 << 12;
+
 /// A finite integer Float at working precision `w`.
 fn iflt(k: i64, w: u64) -> Float {
     Float::from_int(&Int::from_i64(k), w, NEAR)
@@ -2062,6 +2078,83 @@ fn pi_at(w: u64) -> Float {
     Float::round_raw(false, pi_scaled, -(n as i64), w, NEAR).0
 }
 
+/// `⌊log₂|x|⌋` for a finite non-zero [`Float`]; `i64::MIN` for zero/NaN/∞.
+fn floor_log2(x: &Float) -> i64 {
+    match &x.repr {
+        Repr::Normal { sig, exp, .. } => exp + sig.bit_len() as i64 - 1,
+        _ => i64::MIN,
+    }
+}
+
+/// `⌊log₂ w⌋` for `w ≥ 1` (guard-bit budget grows with the iteration count).
+fn ilog2(w: u64) -> u64 {
+    63 - w.max(1).leading_zeros() as u64
+}
+
+/// Arithmetic–geometric mean `M(a, b)` at working precision `w`, for `a, b > 0`.
+///
+/// Iterates `(a, b) ← ((a+b)/2, √(ab))`; the two sequences converge
+/// quadratically to a common limit, so `~log₂ w` steps (one multiply + one
+/// square root each) suffice. Stops once the pair agrees to `w` bits.
+fn agm(a: &Float, b: &Float, w: u64) -> Float {
+    let mut a = a.round(w, NEAR);
+    let mut b = b.round(w, NEAR);
+    // The two sequences converge quadratically; the initial slow phase (when b
+    // starts tiny, as in `ln_agm_at`) adds a further ~log₂ w linear steps, so
+    // this cap is never binding in practice. It only guards against a 1-ulp
+    // rounding limit cycle near the fixed point, where the values agree to
+    // working precision but never become bit-identical.
+    let max_iters = 2 * ilog2(w) + 16;
+    for _ in 0..max_iters {
+        let a1 = a.add(&b, w, NEAR).scale_pow2(-1);
+        let b1 = a.mul(&b, w, NEAR).sqrt(w, NEAR);
+        let d = a1.sub(&b1, w, NEAR);
+        a = a1;
+        b = b1;
+        // Once |a1 − b1| ≤ 2^(⌊log₂ a1⌋ − w) the two agree to w bits.
+        if d.is_zero() || floor_log2(&d) <= floor_log2(&a) - w as i64 {
+            return a;
+        }
+    }
+    a.add(&b, w, NEAR).scale_pow2(-1)
+}
+
+/// `true` when `x` is within `2^-32` of 1, where `ln(x)` is so small that the
+/// AGM formula's fixed *absolute* accuracy cannot deliver `w`-bit *relative*
+/// precision (the `ln(s) − m·ln2` subtraction cancels). The `atanh` series is
+/// both correct and fast there (its argument is tiny, so it needs few terms),
+/// so `ln_at` routes those inputs to the series regardless of precision.
+fn ln_near_one(x: &Float) -> bool {
+    let d = x.sub(&iflt(1, 64), 64, NEAR);
+    d.is_zero() || floor_log2(&d) < -32
+}
+
+/// `ln(x)` for finite `x > 0` (and not within `2^-32` of 1) at precision `w`,
+/// via the AGM.
+///
+/// With `s = x·2^m` scaled so `s > 2^{n/2}` (`n` the guarded working precision),
+/// Brent's formula gives `ln(s) = π / (2·M(1, 4/s))` to `n` bits, so
+/// `ln(x) = ln(s) − m·ln2`. Costs one AGM (`O(M(n)·log n)`) plus a π and a ln2.
+///
+/// The subtraction cancels `~log₂ n` leading bits (both terms are `~n/2` in
+/// magnitude); the wide guard `n − w` absorbs that plus the per-iteration
+/// rounding, and `ln_near_one` fences off the inputs where the result itself is
+/// too small for any fixed guard.
+fn ln_agm_at(x: &Float, w: u64) -> Float {
+    let n = w + 64 + 4 * ilog2(w);
+    // Scale x up so s ≈ 2^{n/2 + margin}: 4/s is then below 2^{-n/2}, which
+    // bounds the formula's O((4/s)²·ln s) error well under 2^{-n}.
+    let e = floor_log2(x);
+    let target = n as i64 / 2 + 16 + ilog2(n) as i64;
+    let m = target - e;
+    let s = x.scale_pow2(m); // exact
+    let four_over_s = iflt(4, n).div(&s, n, NEAR);
+    let agm = agm(&iflt(1, n), &four_over_s, n);
+    let ln_s = pi_at(n).div(&agm.scale_pow2(1), n, NEAR); // π/(2·M)
+    let m_ln2 = iflt(m, n).mul(&ln2_at(n), n, NEAR);
+    ln_s.sub(&m_ln2, n, NEAR).round(w, NEAR)
+}
+
 /// Binary-splitting node for `Σ_{k=a}^{b-1} σ^k / ((2k+1)·m^k)` (`σ = −1` when
 /// `alternating`, else `+1`): returns `(N, O, P)` with the partial sum equal to
 /// `N / (m^(b−1)·O)`, where `O = Π (2k+1)` over the range and `P = m^(b−a)`.
@@ -2201,6 +2294,15 @@ fn ln_at(x: &Float, w: u64) -> Float {
     if x.is_zero() {
         return Float::neg_infinity(w);
     }
+    if w >= LN_AGM_THRESHOLD && !ln_near_one(x) {
+        return ln_agm_at(x, w);
+    }
+    ln_series_at(x, w)
+}
+
+/// `ln(x)` for finite non-zero `x > 0` at precision `w`, via argument reduction
+/// to `m ∈ [1, 2)` and the `atanh` series `ln(m) = 2·atanh((m−1)/(m+1))`.
+fn ln_series_at(x: &Float, w: u64) -> Float {
     let bits = x.significand().map(|s| s.bit_len() as i64).unwrap_or(0);
     let e = x.exponent().unwrap_or(0) + bits - 1; // floor(log2 x)
     let m = x.scale_pow2(-e); // m ∈ [1, 2)
@@ -3077,4 +3179,254 @@ fn bessel_k_at(n: u64, x: &Float, w: u64) -> Float {
         .add(&piece2, ns, NEAR)
         .add(&piece3, ns, NEAR)
         .round(w, NEAR)
+}
+
+#[cfg(test)]
+mod agm_tests {
+    extern crate std;
+    use std::println;
+
+    use super::*;
+    use crate::RoundingMode::{AwayFromZero, Nearest, TowardNegative, TowardPositive, TowardZero};
+
+    const MODES: [RoundingMode; 5] = [
+        Nearest,
+        TowardZero,
+        TowardPositive,
+        TowardNegative,
+        AwayFromZero,
+    ];
+
+    // π via the Machin binary-split series (the production `pi_at` body without
+    // the embedded-constant shortcut) — kept here only to benchmark against and
+    // differentially validate the AGM π below, which is *not* wired into
+    // production because the series matches or beats it at every precision.
+    fn pi_series_at(w: u64) -> Float {
+        let n = w + 32;
+        let a1 = super::atan_recip_scaled(5, n);
+        let a2 = super::atan_recip_scaled(239, n);
+        let pi_scaled = a1.shl(4).checked_sub(&a2.shl(2)).unwrap();
+        Float::round_raw(false, pi_scaled, -(n as i64), w, NEAR).0
+    }
+
+    // π via the Gauss–Legendre / Brent–Salamin AGM iteration (test-only; see
+    // above). a₀=1, b₀=1/√2, t₀=1/4, p₀=1; step: a←(a+b)/2, b←√(ab),
+    // t←t−p(a−a')², p←2p; π≈(a+b)²/(4t).
+    fn pi_agm_at(w: u64) -> Float {
+        let n = w + 32 + 2 * ilog2(w);
+        let mut a = iflt(1, n);
+        let mut b = rflt(1, 2, n).sqrt(n, NEAR);
+        let mut t = rflt(1, 4, n);
+        for p_exp in 0..(2 * ilog2(w) as i64 + 16) {
+            let a1 = a.add(&b, n, NEAR).scale_pow2(-1);
+            let b1 = a.mul(&b, n, NEAR).sqrt(n, NEAR);
+            let diff = a.sub(&a1, n, NEAR);
+            let d2 = diff.mul(&diff, n, NEAR).scale_pow2(p_exp);
+            t = t.sub(&d2, n, NEAR);
+            let conv = a1.sub(&b1, n, NEAR);
+            a = a1;
+            b = b1;
+            if conv.is_zero() || floor_log2(&conv) <= -(w as i64) {
+                break;
+            }
+        }
+        let s = a.add(&b, n, NEAR);
+        s.mul(&s, n, NEAR)
+            .div(&t.scale_pow2(2), n, NEAR)
+            .round(w, NEAR)
+    }
+
+    // Correctly-rounded π/ln through Ziv, but forcing a specific inner method,
+    // so the differential tests can compare the two implementations end-to-end.
+    fn pi_series(prec: u64, mode: RoundingMode) -> Float {
+        Float::ziv(prec, mode, pi_series_at)
+    }
+    fn pi_agm(prec: u64, mode: RoundingMode) -> Float {
+        Float::ziv(prec, mode, pi_agm_at)
+    }
+    fn ln_series(x: &Float, prec: u64, mode: RoundingMode) -> Float {
+        let x = x.clone();
+        Float::ziv(prec, mode, move |w| ln_series_at(&x.round(w, NEAR), w))
+    }
+    fn ln_agm(x: &Float, prec: u64, mode: RoundingMode) -> Float {
+        let x = x.clone();
+        Float::ziv(prec, mode, move |w| ln_agm_at(&x.round(w, NEAR), w))
+    }
+
+    fn same(a: &Float, b: &Float) -> bool {
+        a.to_exact_string() == b.to_exact_string()
+    }
+
+    #[test]
+    fn agm_quick_sanity() {
+        // Fast low-precision checks that the AGM math is correct at all (these
+        // call the `_at` functions directly regardless of the wiring
+        // thresholds). ln is exercised only for x bounded away from 1, where
+        // the AGM formula is accurate.
+        for &prec in &[53u64, 200, 2000] {
+            for &mode in &MODES {
+                assert!(
+                    same(&pi_agm(prec, mode), &pi_series(prec, mode)),
+                    "quick pi_agm != series at {prec} bits, {mode:?}"
+                );
+            }
+            for k in [2i64, 3, 7, 100, 1000] {
+                let x = iflt(k, prec + 64);
+                assert!(
+                    same(&ln_agm(&x, prec, Nearest), &ln_series(&x, prec, Nearest)),
+                    "quick ln_agm != series at {prec} bits, x={k}"
+                );
+            }
+            let half = rflt(1, 2, prec + 64); // 0.5, far enough from 1
+            assert!(same(
+                &ln_agm(&half, prec, Nearest),
+                &ln_series(&half, prec, Nearest)
+            ));
+        }
+        // Known values.
+        assert!(same(
+            &ln_agm(&iflt(2, 2064), 2000, Nearest),
+            &Float::ln2(2000, Nearest)
+        ));
+        assert!(same(&pi_agm(2000, Nearest), &Float::pi(2000, Nearest)));
+    }
+
+    #[test]
+    fn ln_near_one_falls_back_to_series() {
+        // Where the AGM formula loses relative accuracy (x ≈ 1, tiny result),
+        // the wired `Float::ln` must fall back to the series and stay
+        // bit-identical to it — above the AGM threshold and in every mode.
+        let prec = LN_AGM_THRESHOLD + 500; // exercises the wired dispatch
+        let ref_prec = prec;
+        // x = 1 exactly (ln = 0), and x = 1 ± 2^-k for k straddling the fence.
+        let mut xs = alloc::vec::Vec::new();
+        xs.push(iflt(1, prec + 64));
+        for k in [10i64, 33, 60, 200] {
+            let d = iflt(1, prec + 64).scale_pow2(-k);
+            xs.push(iflt(1, prec + 64).add(&d, prec + 64, NEAR));
+            xs.push(iflt(1, prec + 64).sub(&d, prec + 64, NEAR));
+        }
+        for x in &xs {
+            for &mode in &MODES {
+                assert!(
+                    same(&x.ln(prec, mode), &ln_series(x, ref_prec, mode)),
+                    "wired ln != series near 1 at {prec} bits, {mode:?}, x={}",
+                    x.to_exact_string()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ln_agm_matches_series_all_modes() {
+        // A spread of x > 0 (including < 1) and precisions crossing the AGM
+        // threshold. LCG for reproducibility.
+        let mut state: u64 = 0x1234_5678_9abc_def1;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
+        for &prec in &[64u64, 777, 9000] {
+            let cases = if prec >= 40000 { 3 } else { 8 };
+            for _ in 0..cases {
+                // x = mantissa · 2^scale, scale in [-40, 40].
+                let mant = Int::from_u64(next() | 1);
+                let scale = (next() % 81) as i64 - 40;
+                let x = Float::from_int(&mant, prec + 64, NEAR).scale_pow2(scale);
+                for &mode in &MODES {
+                    let s = ln_series(&x, prec, mode);
+                    let a = ln_agm(&x, prec, mode);
+                    assert!(
+                        same(&s, &a),
+                        "ln_agm != series at {prec} bits, {mode:?}, x={}",
+                        x.to_exact_string()
+                    );
+                    assert!(
+                        same(&x.ln(prec, mode), &s),
+                        "Float::ln != series at {prec} bits, {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ln_agm_known_values() {
+        // ln(2) equals the embedded constant; ln(e) = 1; ln(1) = 0.
+        for &prec in &[500u64, 3000] {
+            let two = iflt(2, prec + 64);
+            assert!(
+                same(&ln_agm(&two, prec, Nearest), &Float::ln2(prec, Nearest)),
+                "ln_agm(2) != ln2 at {prec}"
+            );
+            let e = Float::e(prec + 64, Nearest);
+            let one = iflt(1, prec);
+            assert!(
+                same(&ln_agm(&e, prec, Nearest), &one),
+                "ln_agm(e) != 1 at {prec}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "high-precision differential (slow); run with --ignored"]
+    fn ln_agm_high_precision_matches_series() {
+        // Above the wired threshold, so Float::ln itself takes the AGM path.
+        for &prec in &[40000u64, 70000] {
+            let x = iflt(3, prec + 64).scale_pow2(-1); // 1.5
+            for &mode in &MODES {
+                assert!(same(&ln_agm(&x, prec, mode), &ln_series(&x, prec, mode)));
+                assert!(same(&x.ln(prec, mode), &ln_series(&x, prec, mode)));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run with --ignored --nocapture"]
+    fn agm_crossover() {
+        use std::time::Instant;
+        fn t<F: Fn() -> Float>(f: F) -> f64 {
+            let start = Instant::now();
+            let _ = f();
+            start.elapsed().as_secs_f64() * 1e3
+        }
+        println!("\n== π: Machin series vs Brent–Salamin AGM (ms) ==");
+        println!(
+            "{:>10}  {:>12}  {:>12}  {:>8}",
+            "bits", "series", "agm", "speedup"
+        );
+        for &w in &[
+            1u64 << 12,
+            1 << 14,
+            1 << 15,
+            1 << 16,
+            1 << 17,
+            1 << 18,
+            1 << 19,
+        ] {
+            let ts = t(|| pi_series_at(w));
+            let ta = t(|| pi_agm_at(w));
+            println!("{w:>10}  {ts:>12.2}  {ta:>12.2}  {:>7.2}x", ts / ta);
+        }
+        println!("\n== ln: atanh series vs AGM (ms) ==");
+        println!(
+            "{:>10}  {:>12}  {:>12}  {:>8}",
+            "bits", "series", "agm", "speedup"
+        );
+        let x = iflt(3, 1 << 20).scale_pow2(-1); // 1.5
+        for &w in &[
+            1u64 << 12,
+            1 << 13,
+            1 << 14,
+            1 << 15,
+            1 << 16,
+            1 << 17,
+            1 << 18,
+        ] {
+            let xw = x.round(w, NEAR);
+            let ts = t(|| ln_series_at(&xw, w));
+            let ta = t(|| ln_agm_at(&xw, w));
+            println!("{w:>10}  {ts:>12.2}  {ta:>12.2}  {:>7.2}x", ts / ta);
+        }
+    }
 }

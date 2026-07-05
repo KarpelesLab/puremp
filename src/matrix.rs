@@ -958,3 +958,112 @@ impl<T: Ring> RingMatrix<T> for Matrix<T> {
         }
     }
 }
+
+// ---- exact eigenvalues of a rational matrix ----
+
+/// Exact eigenvalues of a rational matrix, as real algebraic numbers.
+///
+/// These methods compose the two exact building blocks the crate already
+/// provides: the division-free [`RingMatrix::charpoly`] (Samuelson–Berkowitz)
+/// gives the monic characteristic polynomial `det(x·I − A)` over ℚ, and
+/// [`Algebraic::real_roots_of`](crate::algebraic::Algebraic::real_roots_of)
+/// isolates its real roots exactly (Sturm sequences + bisection). Every returned
+/// eigenvalue is therefore an exact [`Algebraic`](crate::algebraic::Algebraic) —
+/// compared and combined by its true real value, never a float approximation.
+///
+/// # Real eigenvalues only
+///
+/// [`Algebraic`](crate::algebraic::Algebraic) models *real* algebraic numbers, so
+/// only the **real** eigenvalues are returned; non-real (complex-conjugate)
+/// eigenvalues are silently omitted. A matrix whose spectrum is entirely complex
+/// (e.g. the rotation `[[0,−1],[1,0]]`, eigenvalues `±i`) yields an empty list
+/// without error.
+///
+/// # Cost
+///
+/// The characteristic polynomial costs `O(n⁴)` rational multiplications
+/// (Samuelson–Berkowitz), and real-root isolation runs Sturm sequences and
+/// polynomial GCDs by the subresultant PRS on the degree-`n` char poly. Both are
+/// exact but grow quickly with `n`; this is intended for modest matrix sizes.
+#[cfg(feature = "algebraic")]
+impl Matrix<crate::rational::Rational> {
+    /// Returns the characteristic polynomial `det(x·I − A)` over ℚ, monic and in
+    /// low-to-high coefficient order (`coeffs()[i]` is the coefficient of `xⁱ`).
+    ///
+    /// Computed division-free via [`RingMatrix::charpoly`]. Panics if the matrix
+    /// is not square (or is `0×0`, which has no ring context).
+    pub fn characteristic_polynomial(&self) -> crate::poly::Poly<crate::rational::Rational> {
+        crate::poly::Poly::new(RingMatrix::charpoly(self))
+    }
+
+    /// Returns the **distinct real eigenvalues** as exact algebraic numbers, in
+    /// increasing order.
+    ///
+    /// Non-real (complex) eigenvalues are not returned — see the
+    /// [type-level note](Matrix#real-eigenvalues-only). A repeated eigenvalue
+    /// appears once; use
+    /// [`real_eigenvalues_with_multiplicity`](Self::real_eigenvalues_with_multiplicity)
+    /// for algebraic multiplicities.
+    ///
+    /// Panics if the matrix is not square (or is `0×0`).
+    pub fn real_eigenvalues(&self) -> Vec<crate::algebraic::Algebraic> {
+        crate::algebraic::Algebraic::real_roots_of(&self.characteristic_polynomial())
+    }
+
+    /// Returns the distinct real eigenvalues paired with their **algebraic
+    /// multiplicity** (their multiplicity as roots of the characteristic
+    /// polynomial), in increasing order of eigenvalue.
+    ///
+    /// The multiplicities come from a squarefree decomposition of the char poly
+    /// (Yun's algorithm — repeated GCDs with the derivative): the roots of the
+    /// multiplicity-`k` squarefree factor are exactly the eigenvalues of algebraic
+    /// multiplicity `k`. Non-real eigenvalues are omitted, so the returned
+    /// multiplicities need not sum to `n`.
+    ///
+    /// Panics if the matrix is not square (or is `0×0`).
+    pub fn real_eigenvalues_with_multiplicity(&self) -> Vec<(crate::algebraic::Algebraic, usize)> {
+        use crate::algebraic::Algebraic;
+        let cp = self.characteristic_polynomial();
+        let mut out = Vec::new();
+        for (i, factor) in squarefree_decomposition(&cp).into_iter().enumerate() {
+            let mult = i + 1; // factor i (0-based) holds the roots of multiplicity i+1
+            for root in Algebraic::real_roots_of(&factor) {
+                out.push((root, mult));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
+
+/// Squarefree decomposition of a rational polynomial by **Yun's algorithm**.
+///
+/// Returns `[g₁, g₂, …]` where `gₖ` (monic) is the product of the distinct
+/// irreducible factors of `p` that occur with multiplicity exactly `k`; entry
+/// `k−1` may be a constant (`1`) when no factor has that multiplicity. Uses only
+/// derivative, subresultant GCD, and exact division — no full factorization.
+#[cfg(feature = "algebraic")]
+fn squarefree_decomposition(
+    p: &crate::poly::Poly<crate::rational::Rational>,
+) -> Vec<crate::poly::Poly<crate::rational::Rational>> {
+    let p = p.monic();
+    if p.degree().unwrap_or(0) < 1 {
+        return Vec::new();
+    }
+    let d = p.derivative();
+    let a0 = p.subresultant_gcd(&d);
+    let mut b = p.div_rem(&a0).0; // b₁ = p / gcd(p, p′)
+    let mut c = d.div_rem(&a0).0; // c₁ = p′ / gcd(p, p′)
+    let mut result = Vec::new();
+    loop {
+        let dd = c.sub(&b.derivative()); // dₖ = cₖ − bₖ′
+        let g = b.subresultant_gcd(&dd); // gₖ = gcd(bₖ, dₖ): the multiplicity-k factor
+        result.push(g.monic());
+        b = b.div_rem(&g).0; // bₖ₊₁ = bₖ / gₖ
+        c = dd.div_rem(&g).0; // cₖ₊₁ = dₖ / gₖ
+        if b.degree().unwrap_or(0) < 1 {
+            break;
+        }
+    }
+    result
+}

@@ -7,6 +7,21 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/KarpelesLab/puremp/compare/v0.2.2...v0.2.3) - 2026-07-05
+
+### Added
+
+- *(float)* digamma/polygamma, beta, and second-kind Bessel Yₙ/Kₙ
+- elliptic curves y² = x³ + a·x + b over GF(p) and ℚ
+- *(complex)* add remaining elementary transcendentals to Complex<Float>
+- *(matrix)* exact eigenvalues of a rational matrix (algebraic feature)
+- *(matrix)* division-free determinant & charpoly over any ring (Berkowitz)
+
+### Other
+
+- *(float)* AGM (Brent–Salamin) ln above a 4096-bit threshold
+- roadmap/feature-table updates for the new capabilities; minor cleanups
+
 ## [0.2.2](https://github.com/KarpelesLab/puremp/compare/v0.2.1...v0.2.2) - 2026-07-04
 
 ### Added

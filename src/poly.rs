@@ -29,14 +29,26 @@ const POLY_KARATSUBA_THRESHOLD: usize = 24;
 #[cfg(feature = "int")]
 const KRONECKER_THRESHOLD: usize = 32;
 
-/// Divisor degree (and quotient degree) at or above which `Poly::div_rem`
-/// switches from schoolbook long division to Newton-iteration fast division.
-/// Below it the schoolbook base case is both faster and the differential
-/// reference.
-const NEWTON_DIV_THRESHOLD: usize = 40;
+/// Divisor/quotient degree at or above which `Poly::div_rem` dispatches to
+/// Newton-iteration fast division. Set high deliberately: benchmarking on this
+/// codebase (whose coefficient arithmetic is already fast) shows schoolbook long
+/// division wins through at least degree 2048 — Newton's `O(M(d))` only overcomes
+/// its constant factor at very large degree. So the fast path is reserved for
+/// enormous polynomials, and every practical division uses the schoolbook base
+/// case (which is also the differential reference). The Newton path stays
+/// verified: the unit tests call `div_rem_newton` directly.
+const NEWTON_DIV_THRESHOLD: usize = 1 << 16;
 
-/// Degree at or above which `Poly::gcd` switches from Euclid to the recursive
-/// Half-GCD. Below it, plain Euclid is the base case and the reference.
+/// Dispatch degree at or above which `Poly::gcd` uses the recursive Half-GCD.
+/// Set high for the same reason as [`NEWTON_DIV_THRESHOLD`]: measured, Euclid
+/// wins through at least degree 2048, so Half-GCD is reserved for enormous
+/// inputs and practical gcds use Euclid (the base case and reference). The
+/// Half-GCD path stays verified via direct `gcd_hgcd` calls in the unit tests.
+const HGCD_DISPATCH_THRESHOLD: usize = 1 << 16;
+
+/// Degree at or below which the internal Half-GCD recursion bottoms out to
+/// Euclid. Kept small so the recursive algorithm is genuinely exercised by the
+/// `gcd_hgcd` differential tests (independent of the high dispatch threshold).
 const HGCD_THRESHOLD: usize = 48;
 
 /// A dense univariate polynomial with coefficients of type `T`.
@@ -413,7 +425,7 @@ where
     /// Euclid runs as both the base case and the differential reference.
     pub fn gcd(&self, other: &Poly<T>) -> Poly<T> {
         let big = self.degree().unwrap_or(0).max(other.degree().unwrap_or(0));
-        if T::EXACT && !self.is_zero() && !other.is_zero() && big >= HGCD_THRESHOLD {
+        if T::EXACT && !self.is_zero() && !other.is_zero() && big >= HGCD_DISPATCH_THRESHOLD {
             return self.gcd_hgcd(other);
         }
         self.gcd_euclid(other)

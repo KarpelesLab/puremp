@@ -2985,11 +2985,13 @@ fn split_composite(n: &Nat) -> Nat {
     }
     // For a balanced semiprime the quadratic sieve is faster and more reliable
     // than ECM, whose cost would depend on the (large) factor rather than on
-    // `n`. Below ~40 digits the single-polynomial sieve is simplest; from there
-    // up to ~52 digits the self-initializing MPQS (SIQS) lifts the interval and
-    // memory limit and is the method of choice. Each falls through to the next
-    // strategy if it fails to split `n`.
-    if n.bit_len() >= 130
+    // `n`. The self-initializing MPQS (SIQS) is the method of choice from ~30
+    // digits (~100 bits) up to ~52 digits — measured ~3× faster than the
+    // single-polynomial sieve at 33 digits and ~14× at 38 digits, where the
+    // single-poly interval/memory limit bites. Below that, and if SIQS declines
+    // to run, the single-polynomial sieve handles it. Each falls through to the
+    // next strategy if it fails to split `n`.
+    if n.bit_len() >= 100
         && n.bit_len() <= 175
         && let Some(f) = crate::qsieve::siqs_factor(n)
     {

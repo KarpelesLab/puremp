@@ -557,6 +557,7 @@ fn factor_monic_squarefree(f: &[Int]) -> Vec<Vec<Int>> {
     // and, when van Hoeij is available, also large enough that its trace lattice
     // separates the true factors (m ≳ (2n·Rᵐᵗ·2^{r+mt})² with mt = r traces).
     let norm1 = f.iter().fold(Int::ZERO, |a, c| a.add(&c.abs()));
+    #[cfg_attr(not(feature = "lattice"), allow(unused_mut))]
     let mut bound = Int::ONE.mul_2k(n as u32 + 1).mul(&norm1);
     #[cfg(feature = "lattice")]
     {

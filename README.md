@@ -8,7 +8,7 @@
 Pure-Rust, MIT-licensed, arbitrary-precision arithmetic — **integers, rationals,
 MPFR-class floating point, and base-10 decimals**, plus derived **modular
 integers, complex numbers, polynomials, matrices, interval & ball arithmetic,
-p-adic numbers, finite fields, and exact real algebraic numbers** — with no foreign-code
+p-adic numbers, finite fields, elliptic curves, and exact real algebraic numbers** — with no foreign-code
 dependencies. Usable as a Rust crate, a C library, and a command-line calculator.
 
 ## Why
@@ -105,6 +105,7 @@ int main(void) {
 | `ball` | ✔ | `Ball` — midpoint–radius (mid-rad) rigorous arithmetic, Arb-style (implies `interval`) |
 | `algebraic` | ✔ | `Quadratic` (ℚ(√d)) and general real `Algebraic` numbers |
 | `galois` | ✔ | `GaloisField` / `GfElement` — finite field extensions `GF(pᵏ)` (implies `int`) |
+| `elliptic` | ✔ | `EllipticCurve` / `Point` — elliptic curves over GF(p) and ℚ (implies `rational`) |
 | `identify` | ✔ | Inverse symbolic calculator (`identify`, `machin_like`) via PSLQ (implies `lattice` + `float`) |
 | `primality` | ✔ | Primality proving with auditable certificates — Pocklington + BLS `n∓1` (implies `int`) |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
@@ -197,8 +198,6 @@ available drafts) is the umbrella reference for much of this list.
   factorable `n∓1`; the general case (a large prime whose `n∓1` is hard) needs
   **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁴⁻⁵)`) or the
   deterministic **APR-CL**.
-- **Second-kind Bessel functions** — `Yₙ` and `Kₙ` (the subtractive-cancellation
-  cases; first-kind `Jₙ` and modified `Iₙ` are done). DLMF §10; MCA §4.7.1.
 - **Factorization past ~50 digits** — SIQS handles balanced semiprimes into the
   ~50-digit range; a large-prime variation, a sparse GF(2) solver (block
   Lanczos / Wiedemann in place of dense Gaussian elimination), and ultimately the

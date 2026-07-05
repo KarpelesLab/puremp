@@ -3,9 +3,10 @@
 //! [`Complex`] is parameterized over the component type, so it composes with any
 //! of the crate's numeric types that expose the relevant operators:
 //! `Complex<Int>` (Gaussian integers), `Complex<Rational>`, `Complex<Dyadic>`,
-//! `Complex<Decimal>`, and `Complex<FixedFloat>`. (The precision-carrying
-//! [`Float`](crate::float::Float) has no plain operators, so use `FixedFloat`
-//! for complex floats.)
+//! `Complex<Decimal>`, and `Complex<Float>` / `Complex<FixedFloat>` for inexact
+//! complex. `Complex<Float>` additionally carries a full analytic suite —
+//! `abs`/`arg`, `exp`, `ln`, `sqrt`, `pow`, the trigonometric and hyperbolic
+//! functions and their inverses.
 //!
 //! Addition, subtraction, multiplication, negation, and conjugation need only
 //! `+ - *` on the component type; complex division additionally needs `/`, so it

@@ -511,9 +511,32 @@ impl Int {
 
     /// Returns the modular inverse of `self` mod `modulus` (in `[0, |modulus|)`),
     /// or `None` if `self` is not invertible (`gcd(self, modulus) != 1`).
+    ///
+    /// Large operands use the subquadratic Half-GCD cofactor driver
+    /// (`O(M(n)·log n)` vs. plain extended Euclid's `O(n²)`); small ones use
+    /// Euclid, which wins there. The result is **identical on either path**:
+    /// only `x mod modulus` is observed, and that inverse is unique regardless
+    /// of which Bézout pair the reduction happens to yield.
     pub fn modinv(&self, modulus: &Int) -> Option<Int> {
         if modulus.is_zero() {
             return None;
+        }
+        let m = modulus.magnitude();
+        // Reduce to a non-negative representative in [0, m); the inverse depends
+        // only on `self mod m`. `a` and `m` are both non-negative, so the
+        // Half-GCD cofactor is a Bézout coefficient of `a·x + m·y = gcd(a, m)`.
+        let a = self.rem_euclid(modulus).magnitude();
+        if a.limb_count().min(m.limb_count()) >= crate::nat::HGCD_MODINV_THRESHOLD {
+            // `x` is *some* Bézout coefficient with `a·x ≡ gcd (mod m)`; when the
+            // gcd is 1 it is the (unique mod m) inverse, so `x mod modulus`
+            // matches Euclid's exactly. `None` means the reduction guard tripped
+            // — fall through to the trusted Euclidean path.
+            if let Some((g, x, _)) = a.extgcd_hgcd(&m) {
+                if !g.is_one() {
+                    return None;
+                }
+                return Some(x.rem_euclid(modulus));
+            }
         }
         let (g, x, _) = self.extended_gcd(modulus);
         if !g.is_one() {
@@ -686,6 +709,13 @@ impl Int {
     }
 
     /// Extended GCD: returns `(g, x, y)` with `g == self·x + b·y` and `g ≥ 0`.
+    ///
+    /// This is the plain extended Euclidean algorithm. Its Bézout pair `(x, y)`
+    /// is the canonical minimal one the algorithm produces and is part of the
+    /// public contract, so — unlike [`Int::modinv`], where only `x mod m`
+    /// matters and which uses the subquadratic Half-GCD driver above a size
+    /// threshold — this stays Euclidean. It also serves as the reference the
+    /// Half-GCD path is differentially tested against.
     pub fn extended_gcd(&self, b: &Int) -> (Int, Int, Int) {
         let (mut old_r, mut r) = (self.clone(), b.clone());
         let (mut old_s, mut s) = (Int::ONE, Int::ZERO);

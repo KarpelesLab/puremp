@@ -1614,6 +1614,193 @@ impl Float {
         if flip { res.neg() } else { res }
     }
 
+    /// Returns the digamma function `ψ(x) = Γ'(x)/Γ(x)` for a real argument,
+    /// correctly rounded.
+    ///
+    /// # Algorithm
+    /// The asymptotic series (DLMF 5.11.2)
+    ///
+    /// ```text
+    /// ψ(z) ≈ ln z − 1/(2z) − Σ_{k≥1} B₂ₖ / (2k · z^{2k})
+    /// ```
+    ///
+    /// with the Bernoulli numbers `B₂ₖ` as exact rationals. The argument is first
+    /// shifted upward with the recurrence `ψ(x) = ψ(x+m) − Σ_{j=0}^{m−1} 1/(x+j)`
+    /// so that `z = x+m ≳ precision/4` makes the asymptotic tail fall below the
+    /// target. For `x < ½` the reflection `ψ(1−x) − ψ(x) = π·cot(πx)` (DLMF 5.5.4)
+    /// maps the argument into the convergent region.
+    ///
+    /// # Domain
+    /// Defined for all real `x` except the poles `x = 0, −1, −2, …`, which return
+    /// NaN. `ψ(+∞) = +∞`; `ψ(−∞)` and NaN return NaN.
+    pub fn digamma(&self, precision: u64, mode: RoundingMode) -> Float {
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(false) => Float::infinity(precision),
+            Repr::Inf(true) => Float::nan(precision),
+            Repr::Zero(_) => Float::nan(precision),
+            Repr::Normal { .. } => {
+                if is_nonpos_int(self) {
+                    return Float::nan(precision);
+                }
+                let x = self.clone();
+                Float::ziv(precision, mode, move |w| digamma_at(&x.round(w, NEAR), w))
+            }
+        }
+    }
+
+    /// Returns the polygamma function `ψ⁽ⁿ⁾(x)`, the `n`-th derivative of the
+    /// digamma function, for a real argument, correctly rounded. `n = 0` is the
+    /// digamma function itself.
+    ///
+    /// # Algorithm
+    /// For `n ≥ 1` the asymptotic series (DLMF 5.15.8)
+    ///
+    /// ```text
+    /// ψ⁽ⁿ⁾(z) ≈ (−1)^{n−1} [ (n−1)!/zⁿ + n!/(2 z^{n+1})
+    ///                       + Σ_{k≥1} B₂ₖ (2k+n−1)!/(2k)! / z^{2k+n} ]
+    /// ```
+    ///
+    /// with an upward argument shift `ψ⁽ⁿ⁾(x) = ψ⁽ⁿ⁾(x+m) − (−1)ⁿ n! Σ_{j<m}
+    /// 1/(x+j)^{n+1}` (DLMF 5.15.5) pushing `z = x+m` large. Both pieces carry the
+    /// sign `(−1)^{n−1}`, so no cancellation occurs.
+    ///
+    /// # Domain
+    /// Defined for all real `x` except the poles `x = 0, −1, −2, …`, which return
+    /// NaN. For `n ≥ 1`, `ψ⁽ⁿ⁾(+∞) = 0`; `ψ⁽ⁿ⁾(−∞)` and NaN return NaN.
+    pub fn polygamma(&self, n: u64, precision: u64, mode: RoundingMode) -> Float {
+        if n == 0 {
+            return self.digamma(precision, mode);
+        }
+        match &self.repr {
+            Repr::NaN => Float::nan(precision),
+            Repr::Inf(false) => Float::zero(precision),
+            Repr::Inf(true) => Float::nan(precision),
+            Repr::Zero(_) => Float::nan(precision),
+            Repr::Normal { .. } => {
+                if is_nonpos_int(self) {
+                    return Float::nan(precision);
+                }
+                let x = self.clone();
+                Float::ziv(precision, mode, move |w| {
+                    polygamma_at(n, &x.round(w, NEAR), w)
+                })
+            }
+        }
+    }
+
+    /// Returns the beta function `B(a, b) = Γ(a)Γ(b)/Γ(a+b)`, correctly rounded.
+    ///
+    /// # Algorithm
+    /// Computed as `sign · exp(ln|Γ(a)| + ln|Γ(b)| − ln|Γ(a+b)|)` so intermediate
+    /// gamma values never overflow, with the sign recovered from the three signs
+    /// of `Γ` (via reflection for negative arguments; DLMF 5.5.3).
+    ///
+    /// # Domain
+    /// Defined for all real `a`, `b` where neither `a` nor `b` is a non-positive
+    /// integer (a pole of `Γ` in the numerator), which return NaN; if only `a+b`
+    /// is a non-positive integer the result is `0` (the denominator pole). NaN or
+    /// infinite arguments return NaN.
+    pub fn beta(a: &Float, b: &Float, precision: u64, mode: RoundingMode) -> Float {
+        if !a.is_finite() || !b.is_finite() {
+            return Float::nan(precision);
+        }
+        if is_nonpos_int(a) || is_nonpos_int(b) {
+            return Float::nan(precision);
+        }
+        // Denominator pole `Γ(a+b)` with a finite numerator ⇒ `B = 0` exactly.
+        if let (Some(ra), Some(rb)) = (a.to_rational(), b.to_rational()) {
+            let sum = ra.add(&rb);
+            if sum.denominator() == &Int::ONE && !sum.numerator().is_positive() {
+                return Float::zero(precision);
+            }
+        }
+        let a = a.clone();
+        let b = b.clone();
+        Float::ziv(precision, mode, move |w| {
+            beta_at(&a.round(w, NEAR), &b.round(w, NEAR), w)
+        })
+    }
+
+    /// Returns the Bessel function of the second kind `Yₙ(self)` for integer order
+    /// `n` and real argument `x > 0`, correctly rounded.
+    ///
+    /// # Algorithm
+    /// The ascending series (DLMF 10.8.1)
+    ///
+    /// ```text
+    /// Yₙ(x) = (2/π) ln(x/2) Jₙ(x)
+    ///         − (1/π) Σ_{k=0}^{n−1} (n−k−1)!/k! (x/2)^{2k−n}
+    ///         − (1/π) Σ_{k≥0} (−1)ᵏ (ψ(k+1)+ψ(n+k+1)) / (k!(n+k)!) (x/2)^{2k+n}
+    /// ```
+    ///
+    /// with `ψ(k+1) = −γ + Hₖ` (Euler–Mascheroni constant, harmonic numbers). The
+    /// second series is alternating and its partial sums reach `≈ e^{|x|}`, so
+    /// about `1.443·|x|` guard bits are added for the cancellation. `Y₋ₙ =
+    /// (−1)ⁿ Yₙ`.
+    ///
+    /// # Domain
+    /// Any integer `n` and real `x > 0`. Correctly rounded for moderate `x` (the
+    /// guard budget grows linearly with `x`, so very large `x` is progressively
+    /// more expensive — in practice good to `x` of a few hundred at reasonable
+    /// precision). `Yₙ(0) = −∞`; `x < 0` and non-finite `x` return NaN.
+    pub fn bessel_y(&self, n: i64, precision: u64, mode: RoundingMode) -> Float {
+        if !self.is_finite() {
+            return Float::nan(precision);
+        }
+        if self.is_zero() {
+            return Float::neg_infinity(precision);
+        }
+        if self.is_sign_negative() {
+            return Float::nan(precision);
+        }
+        let order = n.unsigned_abs();
+        let flip = n < 0 && order % 2 == 1;
+        let x = self.clone();
+        let res = Float::ziv(precision, mode, move |w| {
+            bessel_y_at(order, &x.round(w, NEAR), w)
+        });
+        if flip { res.neg() } else { res }
+    }
+
+    /// Returns the modified Bessel function of the second kind `Kₙ(self)` for
+    /// integer order `n` and real argument `x > 0`, correctly rounded.
+    ///
+    /// # Algorithm
+    /// The ascending series (DLMF 10.31.1)
+    ///
+    /// ```text
+    /// Kₙ(x) = ½ (x/2)^{−n} Σ_{k=0}^{n−1} (n−k−1)!/k! (−x²/4)ᵏ
+    ///         + (−1)^{n+1} ln(x/2) Iₙ(x)
+    ///         + (−1)ⁿ ½ (x/2)ⁿ Σ_{k≥0} (ψ(k+1)+ψ(n+k+1)) / (k!(n+k)!) (x²/4)ᵏ
+    /// ```
+    ///
+    /// with `ψ(k+1) = −γ + Hₖ`. The `ln(x/2) Iₙ(x)` term grows like `e^{x}` while
+    /// `Kₙ(x) ~ e^{−x}`, so the pieces cancel to `≈ 2.885·x` bits; that many guard
+    /// bits are added. `K₋ₙ = Kₙ`.
+    ///
+    /// # Domain
+    /// Any integer `n` and real `x > 0`. Correctly rounded for moderate `x` (the
+    /// guard budget grows linearly with `x` — in practice good to `x` of about a
+    /// hundred at reasonable precision, less for very large `x`). `Kₙ(0) = +∞`;
+    /// `x < 0` and non-finite `x` return NaN.
+    pub fn bessel_k(&self, n: i64, precision: u64, mode: RoundingMode) -> Float {
+        if !self.is_finite() {
+            return Float::nan(precision);
+        }
+        if self.is_zero() {
+            return Float::infinity(precision);
+        }
+        if self.is_sign_negative() {
+            return Float::nan(precision);
+        }
+        let order = n.unsigned_abs();
+        let x = self.clone();
+        Float::ziv(precision, mode, move |w| {
+            bessel_k_at(order, &x.round(w, NEAR), w)
+        })
+    }
+
     /// Sign as `i64` (`-1`/`0`/`1`), for internal use.
     fn signum_i(&self) -> i64 {
         match self.sign() {
@@ -2535,4 +2722,359 @@ fn factorial_float(n: u64, w: u64) -> Float {
         k += 1;
     }
     Float::from_int(&f, w, NEAR)
+}
+
+/// `n!` as an exact [`Int`].
+fn factorial_int(n: u64) -> Int {
+    let mut f = Int::ONE;
+    let mut k = 2u64;
+    while k <= n {
+        f = f.mul(&Int::from_u64(k));
+        k += 1;
+    }
+    f
+}
+
+/// The `n`-th harmonic number `Hₙ = Σ_{j=1}^{n} 1/j` as a [`Float`] at precision
+/// `w` (`H₀ = 0`).
+fn harmonic_float(n: u64, w: u64) -> Float {
+    let mut s = Float::zero(w);
+    for j in 1..=n {
+        s = s.add(&iflt(1, w).div(&iflt(j as i64, w), w, NEAR), w, NEAR);
+    }
+    s
+}
+
+/// True if `x` is a non-positive integer (`0, −1, −2, …`), i.e. a pole of `Γ`.
+fn is_nonpos_int(x: &Float) -> bool {
+    match x.to_rational() {
+        Some(r) => r.denominator() == &Int::ONE && !r.numerator().is_positive(),
+        None => false,
+    }
+}
+
+/// Digamma asymptotic tail `Σ_{k≥1} B₂ₖ / (2k·z^{2k})` at precision `w`, for a
+/// large positive `z`; mirrors [`stirling_tail`] (asymptotic, with the same
+/// safety net if a term stops shrinking).
+fn digamma_tail(z: &Float, w: u64) -> Float {
+    let z2 = z.mul(z, w, NEAR);
+    let mut zpow = z2.clone(); // z^{2k}, starts at z² (k = 1)
+    let mut sum = Float::zero(w);
+    let mut table = BernoulliTable::new();
+    let mut prev_msb = i64::MAX;
+    let mut k = 1u64;
+    loop {
+        // coeff = B₂ₖ / (2k).
+        let coeff = table
+            .even(k)
+            .div(&Rational::from_integer(Int::from_u64(2 * k)));
+        let term = Float::from_rational(&coeff, w, NEAR).div(&zpow, w, NEAR);
+        let msb = float_msb(&term);
+        if msb < -(w as i64) {
+            break;
+        }
+        if msb >= prev_msb {
+            break;
+        }
+        prev_msb = msb;
+        sum = sum.add(&term, w, NEAR);
+        zpow = zpow.mul(&z2, w, NEAR); // z^{2k+2}
+        k += 1;
+    }
+    sum
+}
+
+/// `ψ(x)` for finite `x` at precision `w`, via the upward recurrence
+/// `ψ(x) = ψ(z) − Σ_{j<m} 1/(x+j)` with `z = x+m ≳ w/4`.
+fn digamma_pos_at(x: &Float, w: u64) -> Float {
+    let bw = 64 - w.leading_zeros() as u64;
+    let n = w + 2 * bw + 48;
+    let z_thresh = (n / 4 + 8) as i64;
+    let fx = x.floor().and_then(|i| i.to_i64()).unwrap_or(z_thresh);
+    let m = if fx >= z_thresh { 0 } else { z_thresh - fx };
+    let z = x.add(&iflt(m, n), n, NEAR);
+    // Σ_{j=0}^{m−1} 1/(x+j).
+    let mut s = Float::zero(n);
+    for j in 0..m {
+        let d = x.add(&iflt(j, n), n, NEAR);
+        s = s.add(&iflt(1, n).div(&d, n, NEAR), n, NEAR);
+    }
+    // ψ(z) = ln z − 1/(2z) − tail.
+    let ln_z = z.ln(n, NEAR);
+    let half_over_z = iflt(1, n).div(&z, n, NEAR).scale_pow2(-1);
+    let psi_z = ln_z
+        .sub(&half_over_z, n, NEAR)
+        .sub(&digamma_tail(&z, n), n, NEAR);
+    psi_z.sub(&s, n, NEAR).round(w, NEAR)
+}
+
+/// `ψ(x)` for finite `x` (not a non-positive integer) at precision `w`.
+fn digamma_at(x: &Float, w: u64) -> Float {
+    let half = rflt(1, 2, w + 8);
+    if x.partial_cmp(&half) == Some(Ordering::Less) {
+        // Reflection: ψ(x) = ψ(1−x) − π·cot(πx), with 1−x > ½.
+        let n = w + 48 + float_msb(x).max(0) as u64;
+        let one = iflt(1, n);
+        let one_minus_x = one.sub(x, n, NEAR);
+        let psi1 = digamma_pos_at(&one_minus_x, n);
+        let pix = pi_at(n).mul(x, n, NEAR);
+        let cot = pix.cos(n, NEAR).div(&pix.sin(n, NEAR), n, NEAR);
+        let pcot = pi_at(n).mul(&cot, n, NEAR);
+        return psi1.sub(&pcot, n, NEAR).round(w, NEAR);
+    }
+    digamma_pos_at(x, w)
+}
+
+/// `ψ⁽ⁿ⁾(z)` for order `n ≥ 1` and large positive `z`, via the asymptotic series
+/// (DLMF 5.15.8).
+fn polygamma_asymp(order: u64, z: &Float, w: u64) -> Float {
+    let n = order;
+    let zn = float_powi(z, n, w); // zⁿ
+    let znp1 = zn.mul(z, w, NEAR); // z^{n+1}
+    // (n−1)!/zⁿ + n!/(2 z^{n+1}).
+    let mut acc = Float::from_int(&factorial_int(n - 1), w, NEAR).div(&zn, w, NEAR);
+    acc = acc.add(
+        &Float::from_int(&factorial_int(n), w, NEAR)
+            .div(&znp1, w, NEAR)
+            .scale_pow2(-1),
+        w,
+        NEAR,
+    );
+    // Tail Σ_{k≥1} B₂ₖ (2k+n−1)!/(2k)! / z^{2k+n}.
+    let z2 = z.mul(z, w, NEAR);
+    let mut zpow = znp1.mul(z, w, NEAR); // z^{n+2} (k = 1)
+    let mut table = BernoulliTable::new();
+    let mut prev_msb = i64::MAX;
+    let mut k = 1u64;
+    loop {
+        // ratio = (2k+n−1)!/(2k)! = ∏_{i=1}^{n−1} (2k+i).
+        let mut ratio = Int::ONE;
+        for i in 1..n {
+            ratio = ratio.mul(&Int::from_u64(2 * k + i));
+        }
+        let coeff = table.even(k).mul(&Rational::from_integer(ratio));
+        let term = Float::from_rational(&coeff, w, NEAR).div(&zpow, w, NEAR);
+        let msb = float_msb(&term);
+        if msb < -(w as i64) {
+            break;
+        }
+        if msb >= prev_msb {
+            break;
+        }
+        prev_msb = msb;
+        acc = acc.add(&term, w, NEAR);
+        zpow = zpow.mul(&z2, w, NEAR);
+        k += 1;
+    }
+    // Overall sign (−1)^{n−1}.
+    if n % 2 == 1 { acc } else { acc.neg() }
+}
+
+/// `ψ⁽ⁿ⁾(x)` for order `n ≥ 1` and finite `x` (not a non-positive integer) at
+/// precision `w`, via the upward recurrence
+/// `ψ⁽ⁿ⁾(x) = ψ⁽ⁿ⁾(z) − (−1)ⁿ n! Σ_{j<m} 1/(x+j)^{n+1}`, `z = x+m` large.
+fn polygamma_at(order: u64, x: &Float, w: u64) -> Float {
+    let bw = 64 - w.leading_zeros() as u64;
+    let n = w + 2 * bw + 48;
+    let z_thresh = ((n / 4 + 8) as i64).max(2 * order as i64 + 8);
+    let fx = x.floor().and_then(|i| i.to_i64()).unwrap_or(z_thresh);
+    let m = if fx >= z_thresh { 0 } else { z_thresh - fx };
+    let z = x.add(&iflt(m, n), n, NEAR);
+    let psi_z = polygamma_asymp(order, &z, n);
+    // S = n! · Σ_{j<m} 1/(x+j)^{n+1}.
+    let fact = Float::from_int(&factorial_int(order), n, NEAR);
+    let mut s = Float::zero(n);
+    for j in 0..m {
+        let d = x.add(&iflt(j, n), n, NEAR);
+        let dpow = float_powi(&d, order + 1, n);
+        s = s.add(&fact.div(&dpow, n, NEAR), n, NEAR);
+    }
+    // ψ⁽ⁿ⁾(x) = ψ⁽ⁿ⁾(z) − (−1)ⁿ S.
+    let raw = if order.is_multiple_of(2) {
+        psi_z.sub(&s, n, NEAR)
+    } else {
+        psi_z.add(&s, n, NEAR)
+    };
+    raw.round(w, NEAR)
+}
+
+/// `(sign_negative, ln|Γ(x)|)` at precision `w` for finite `x` that is not a
+/// non-positive integer; uses reflection (DLMF 5.5.3) for `x < 0`.
+fn signed_ln_gamma_at(x: &Float, w: u64) -> (bool, Float) {
+    if x.sign() == Sign::Positive {
+        return (false, ln_gamma_at(x, w));
+    }
+    // x < 0: |Γ(x)| = π / (|sin πx| · Γ(1−x)); sign(Γ(x)) = sign(sin πx).
+    let n = w + 48 + float_msb(x).max(0) as u64;
+    let one = iflt(1, n);
+    let one_minus_x = one.sub(x, n, NEAR);
+    let lg = ln_gamma_at(&one_minus_x, n);
+    let sinpix = pi_at(n).mul(x, n, NEAR).sin(n, NEAR);
+    let ln_pi = pi_at(n).ln(n, NEAR);
+    let ln_abs_sin = sinpix.abs().ln(n, NEAR);
+    let lnabs = ln_pi
+        .sub(&ln_abs_sin, n, NEAR)
+        .sub(&lg, n, NEAR)
+        .round(w, NEAR);
+    (sinpix.is_sign_negative(), lnabs)
+}
+
+/// `B(a, b) = Γ(a)Γ(b)/Γ(a+b)` at precision `w` via `exp` of log-gammas.
+fn beta_at(a: &Float, b: &Float, w: u64) -> Float {
+    let n = w + 16;
+    let ab = a.add(b, n, NEAR);
+    let (sa, la) = signed_ln_gamma_at(a, n);
+    let (sb, lb) = signed_ln_gamma_at(b, n);
+    let (sab, lab) = signed_ln_gamma_at(&ab, n);
+    let v = la.add(&lb, n, NEAR).sub(&lab, n, NEAR);
+    let mag = v.exp(n, NEAR);
+    let neg = sa ^ sb ^ sab;
+    if neg { mag.neg() } else { mag }.round(w, NEAR)
+}
+
+/// `Yₙ(x)` for order `n ≥ 0` and finite `x > 0` at precision `w` (DLMF 10.8.1).
+fn bessel_y_at(n: u64, x: &Float, w: u64) -> Float {
+    let ax_floor = x.abs().floor().and_then(|i| i.to_i64()).unwrap_or(i64::MAX);
+    // Alternating series reaches ≈ e^{|x|} → ~1.4427·|x| guard bits.
+    let x_guard = (((ax_floor as u128 + 1) * 185 / 128).min(u64::MAX as u128)) as u64;
+    let ns = w + x_guard + n.saturating_mul(4) + 96;
+    let half = x.scale_pow2(-1); // x/2
+    let h2 = half.mul(&half, ns, NEAR); // (x/2)²
+    let ln_half = half.ln(ns, NEAR);
+    let jn = bessel_series_at(n, x, ns, true); // Jₙ(x)
+    let pi = pi_at(ns);
+    // (2/π) ln(x/2) Jₙ.
+    let term_a = ln_half.mul(&jn, ns, NEAR).scale_pow2(1).div(&pi, ns, NEAR);
+    // S1 = (x/2)^{−n} Σ_{k=0}^{n−1} (n−k−1)!/k! (x/2)^{2k}.
+    let half_neg_n = if n == 0 {
+        iflt(1, ns)
+    } else {
+        iflt(1, ns).div(&float_powi(&half, n, ns), ns, NEAR)
+    };
+    let mut s1 = Float::zero(ns);
+    let mut hp = iflt(1, ns); // (x/2)^{2k}
+    for k in 0..n {
+        let coef = Float::from_int(&factorial_int(n - k - 1), ns, NEAR).div(
+            &Float::from_int(&factorial_int(k), ns, NEAR),
+            ns,
+            NEAR,
+        );
+        s1 = s1.add(&coef.mul(&hp, ns, NEAR), ns, NEAR);
+        hp = hp.mul(&h2, ns, NEAR);
+    }
+    let s1 = s1.mul(&half_neg_n, ns, NEAR);
+    // S2 = Σ_{k≥0} (−1)ᵏ (Hₖ + H_{n+k} − 2γ) (x/2)^{2k+n}/(k!(n+k)!).
+    let two_gamma = gamma_at(ns).scale_pow2(1);
+    let mut e =
+        float_powi(&half, n, ns).div(&Float::from_int(&factorial_int(n), ns, NEAR), ns, NEAR);
+    let mut hk = Float::zero(ns); // H₀
+    let mut hnk = harmonic_float(n, ns); // Hₙ
+    let mut s2 = Float::zero(ns);
+    let kmin = (ax_floor.max(0) as u64) + 2;
+    let mut k = 0u64;
+    loop {
+        let psi = hk.add(&hnk, ns, NEAR).sub(&two_gamma, ns, NEAR);
+        let mut term = psi.mul(&e, ns, NEAR);
+        if k % 2 == 1 {
+            term = term.neg();
+        }
+        s2 = s2.add(&term, ns, NEAR);
+        if k > kmin && float_msb(&term) < -(ns as i64) {
+            break;
+        }
+        k += 1;
+        hk = hk.add(&iflt(1, ns).div(&iflt(k as i64, ns), ns, NEAR), ns, NEAR);
+        hnk = hnk.add(
+            &iflt(1, ns).div(&iflt((n + k) as i64, ns), ns, NEAR),
+            ns,
+            NEAR,
+        );
+        let denom = Int::from_u128(k as u128 * (n as u128 + k as u128));
+        e = e
+            .mul(&h2, ns, NEAR)
+            .div(&Float::from_int(&denom, ns, NEAR), ns, NEAR);
+        if e.is_zero() {
+            break;
+        }
+    }
+    // Yₙ = term_a − (1/π)(S1 + S2).
+    let bracket = s1.add(&s2, ns, NEAR).div(&pi, ns, NEAR);
+    term_a.sub(&bracket, ns, NEAR).round(w, NEAR)
+}
+
+/// `Kₙ(x)` for order `n ≥ 0` and finite `x > 0` at precision `w` (DLMF 10.31.1).
+fn bessel_k_at(n: u64, x: &Float, w: u64) -> Float {
+    let ax_floor = x.abs().floor().and_then(|i| i.to_i64()).unwrap_or(i64::MAX);
+    // ln(x/2)·Iₙ ≈ e^{x} must cancel to Kₙ ≈ e^{−x} → ~2.885·x guard bits.
+    let x_guard = (((ax_floor as u128 + 1) * 370 / 128).min(u64::MAX as u128)) as u64;
+    let ns = w + x_guard + n.saturating_mul(4) + 96;
+    let half = x.scale_pow2(-1);
+    let h2 = half.mul(&half, ns, NEAR);
+    let ln_half = half.ln(ns, NEAR);
+    let in_ = bessel_series_at(n, x, ns, false); // Iₙ(x)
+    // piece1 = ½ (x/2)^{−n} Σ_{k=0}^{n−1} (n−k−1)!/k! (−1)ᵏ (x/2)^{2k}.
+    let half_neg_n = if n == 0 {
+        iflt(1, ns)
+    } else {
+        iflt(1, ns).div(&float_powi(&half, n, ns), ns, NEAR)
+    };
+    let mut t1 = Float::zero(ns);
+    let mut hp = iflt(1, ns);
+    for k in 0..n {
+        let mut coef = Float::from_int(&factorial_int(n - k - 1), ns, NEAR).div(
+            &Float::from_int(&factorial_int(k), ns, NEAR),
+            ns,
+            NEAR,
+        );
+        if k % 2 == 1 {
+            coef = coef.neg();
+        }
+        t1 = t1.add(&coef.mul(&hp, ns, NEAR), ns, NEAR);
+        hp = hp.mul(&h2, ns, NEAR);
+    }
+    let piece1 = t1.mul(&half_neg_n, ns, NEAR).scale_pow2(-1);
+    // piece2 = (−1)^{n+1} ln(x/2) Iₙ.
+    let mut piece2 = ln_half.mul(&in_, ns, NEAR);
+    if n.is_multiple_of(2) {
+        piece2 = piece2.neg();
+    }
+    // piece3 = (−1)ⁿ ½ Σ_{k≥0} (Hₖ + H_{n+k} − 2γ) (x/2)^{2k+n}/(k!(n+k)!).
+    let two_gamma = gamma_at(ns).scale_pow2(1);
+    let mut e =
+        float_powi(&half, n, ns).div(&Float::from_int(&factorial_int(n), ns, NEAR), ns, NEAR);
+    let mut hk = Float::zero(ns);
+    let mut hnk = harmonic_float(n, ns);
+    let mut t2 = Float::zero(ns);
+    let kmin = (ax_floor.max(0) as u64) + 2;
+    let mut k = 0u64;
+    loop {
+        let psi = hk.add(&hnk, ns, NEAR).sub(&two_gamma, ns, NEAR);
+        let term = psi.mul(&e, ns, NEAR);
+        t2 = t2.add(&term, ns, NEAR);
+        if k > kmin && float_msb(&term) < -(ns as i64) {
+            break;
+        }
+        k += 1;
+        hk = hk.add(&iflt(1, ns).div(&iflt(k as i64, ns), ns, NEAR), ns, NEAR);
+        hnk = hnk.add(
+            &iflt(1, ns).div(&iflt((n + k) as i64, ns), ns, NEAR),
+            ns,
+            NEAR,
+        );
+        let denom = Int::from_u128(k as u128 * (n as u128 + k as u128));
+        e = e
+            .mul(&h2, ns, NEAR)
+            .div(&Float::from_int(&denom, ns, NEAR), ns, NEAR);
+        if e.is_zero() {
+            break;
+        }
+    }
+    let mut piece3 = t2.scale_pow2(-1);
+    if n % 2 == 1 {
+        piece3 = piece3.neg();
+    }
+    piece1
+        .add(&piece2, ns, NEAR)
+        .add(&piece3, ns, NEAR)
+        .round(w, NEAR)
 }

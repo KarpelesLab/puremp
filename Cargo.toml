@@ -28,7 +28,7 @@ name = "puremp"
 # `float` is a separable layer (not part of the core contract) but is enabled
 # by default for convenience; disable it with `--no-default-features`
 # (optionally re-enabling `rational`/`cli`).
-default = ["std", "rational", "float", "dyadic", "padic", "decimal", "complex", "poly", "interval", "ball", "matrix", "lattice", "identify", "algebraic", "primality", "galois", "cli"]
+default = ["std", "rational", "float", "dyadic", "padic", "decimal", "complex", "poly", "interval", "ball", "matrix", "lattice", "identify", "algebraic", "primality", "galois", "elliptic", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -75,6 +75,9 @@ interval = ["float"]
 ball = ["interval"]
 # Algebraic numbers: exact ℚ(√d) (`Quadratic`) and general real `Algebraic`.
 algebraic = ["rational", "poly", "matrix", "float"]
+# Elliptic curves `y² = x³ + a·x + b` over `GF(p)` (`ModInt`) or `ℚ` (`Rational`),
+# with the chord-and-tangent group law, point orders and naive point counting.
+elliptic = ["rational"]
 
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --lib --features ffi --crate-type staticlib`

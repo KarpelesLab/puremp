@@ -36,6 +36,8 @@
 //! - [`Padic`] — fixed-precision `p`-adic numbers in `ℚ_p` (`padic`).
 //! - [`Quadratic`] / [`Algebraic`] — exact quadratic irrationals `ℚ(√d)` and
 //!   general real algebraic numbers (`algebraic`).
+//! - [`EllipticCurve`] / [`Point`] — elliptic curves `y² = x³ + a·x + b` over
+//!   `GF(p)` or `ℚ`, with the chord-and-tangent group law (`elliptic`).
 //!
 //! `Int`/`Rational` also carry a number-theory toolkit (factorization,
 //! `sqrt_mod`, Jacobi/Legendre, CRT, `random_prime`, combinatorics,
@@ -164,6 +166,9 @@ pub mod quadratic;
 #[cfg(feature = "algebraic")]
 pub mod algebraic;
 
+#[cfg(feature = "elliptic")]
+pub mod elliptic;
+
 #[cfg(feature = "float")]
 pub mod float;
 #[cfg(feature = "float")]
@@ -253,6 +258,9 @@ pub use primality::{Primality, PrimalityCertificate, prove_prime};
 pub use algebraic::Algebraic;
 #[cfg(feature = "algebraic")]
 pub use quadratic::Quadratic;
+
+#[cfg(feature = "elliptic")]
+pub use elliptic::{EllipticCurve, Point};
 
 #[cfg(feature = "float")]
 pub use fixed_float::FixedFloat;

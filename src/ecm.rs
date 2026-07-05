@@ -26,72 +26,79 @@
 //!   `(B1, B2]` by a baby-step/giant-step continuation, accumulating a product
 //!   of coordinate cross-differences reduced by one final `gcd`.
 //!
-//! All arithmetic runs through a Barrett [`Reciprocal`], reusing the core's
-//! modular reduction; nothing here is `unsafe` and the module is
+//! Because the modulus `n` is odd (the caller strips factors of `2`), all curve
+//! arithmetic runs in the Montgomery domain: coordinates and constants are
+//! lifted in once via [`MontCtx`], every `xDBL`/`xADD` multiply and square goes
+//! through Montgomery reduction, and a value is dropped back to a true residue
+//! only where a factor is extracted (`gcd(Z, n)`, which is anyway invariant
+//! under the Montgomery `R` factor). Nothing here is `unsafe` and the module is
 //! dependency-free like the rest of the crate.
 
 use alloc::vec::Vec;
 
 use crate::int::Int;
-use crate::nat::{Nat, Reciprocal};
+use crate::nat::{MontCtx, Nat};
 
-/// Modular arithmetic context for a fixed modulus `n`, backed by a Barrett
-/// reciprocal. Every operand passed to [`ModCtx::mul`] must already be reduced
-/// (`< n`), which is the invariant the curve operations maintain.
+/// Modular arithmetic context for a fixed odd modulus `n`, backed by Montgomery
+/// multiplication. Every curve coordinate and constant is held in the Montgomery
+/// domain (`x ↦ x·R mod n`); [`ModCtx::mul`]/[`ModCtx::sqr`] are Montgomery
+/// multiplies, while [`ModCtx::add`]/[`ModCtx::sub`] act directly on the
+/// representatives (the map is linear). Operands must already be reduced (`< n`),
+/// the invariant the curve operations maintain.
 struct ModCtx {
-    n: Nat,
-    recip: Reciprocal,
+    mont: MontCtx,
 }
 
 impl ModCtx {
     fn new(n: &Nat) -> ModCtx {
         ModCtx {
-            n: n.clone(),
-            recip: Reciprocal::new(n),
+            mont: MontCtx::new(n),
         }
     }
 
-    /// `k mod n` for a machine-word constant.
+    /// The modulus `n`.
+    fn n(&self) -> &Nat {
+        self.mont.modulus()
+    }
+
+    /// Montgomery form of `1` (the neutral element for [`ModCtx::mul`]).
+    fn one(&self) -> &Nat {
+        self.mont.one()
+    }
+
+    /// Montgomery form of the machine-word constant `k mod n`.
     fn small(&self, k: u64) -> Nat {
-        let v = Nat::from_u64(k);
-        if v >= self.n {
-            v.div_rem(&self.n).expect("n != 0").1
-        } else {
-            v
-        }
+        self.mont.to_mont(&Nat::from_u64(k))
+    }
+
+    /// Converts a true residue into the Montgomery domain.
+    fn to_mont(&self, a: &Nat) -> Nat {
+        self.mont.to_mont(a)
+    }
+
+    /// Converts a Montgomery-domain value back to a true residue.
+    fn to_residue(&self, a: &Nat) -> Nat {
+        self.mont.to_residue(a)
     }
 
     /// `(a + b) mod n` for reduced `a, b`.
     fn add(&self, a: &Nat, b: &Nat) -> Nat {
-        let s = a.add(b);
-        if s >= self.n {
-            s.checked_sub(&self.n).expect("s >= n")
-        } else {
-            s
-        }
+        self.mont.add(a, b)
     }
 
     /// `(a − b) mod n` for reduced `a, b`.
     fn sub(&self, a: &Nat, b: &Nat) -> Nat {
-        if a >= b {
-            a.checked_sub(b).expect("a >= b")
-        } else {
-            // n − (b − a), all non-negative.
-            self.n
-                .checked_sub(&b.checked_sub(a).expect("b > a"))
-                .expect("difference < n")
-        }
+        self.mont.sub(a, b)
     }
 
-    /// `(a · b) mod n` for reduced `a, b` (their product is `< n²`, the range
-    /// the Barrett reduction accepts).
+    /// Montgomery product of two Montgomery-form operands.
     fn mul(&self, a: &Nat, b: &Nat) -> Nat {
-        self.recip.reduce(&a.mul(b))
+        self.mont.mul(a, b)
     }
 
-    /// `a² mod n` for reduced `a`.
+    /// Montgomery squaring of a Montgomery-form operand.
     fn sqr(&self, a: &Nat) -> Nat {
-        self.recip.reduce(&a.square())
+        self.mont.sqr(a)
     }
 }
 
@@ -189,15 +196,19 @@ fn suyama_curve(ctx: &ModCtx, sigma: &Nat) -> Curve {
     if den.is_zero() {
         return Curve::Retry;
     }
-    // Invert the denominator; a non-trivial gcd is a factor of n.
-    match Int::from(den.clone()).modinv(&Int::from(ctx.n.clone())) {
+    // The inversion works on the *true* residue, so drop `den` out of the
+    // Montgomery domain first. A non-trivial gcd is a factor of `n`.
+    let den_true = ctx.to_residue(&den);
+    match Int::from(den_true.clone()).modinv(&Int::from(ctx.n().clone())) {
         Some(inv) => {
-            let a24 = ctx.mul(&num, &inv.magnitude());
+            // `inv` is the true inverse; lift it back into the Montgomery domain
+            // so `a24 = num · inv` stays a Montgomery-form residue.
+            let a24 = ctx.mul(&num, &ctx.to_mont(&inv.magnitude()));
             Curve::Ready { a24, base }
         }
         None => {
-            let g = den.gcd(&ctx.n);
-            if g.is_one() || g == ctx.n {
+            let g = den_true.gcd(ctx.n());
+            if g.is_one() || g == *ctx.n() {
                 Curve::Retry
             } else {
                 Curve::Factor(g)
@@ -319,8 +330,9 @@ fn stage2(ctx: &ModCtx, q: &Point, a24: &Nat, primes: &[u64], b1: u64, b2: u64) 
         }
     }
 
-    // Accumulate cross-differences over primes in (b1, b2].
-    let mut acc = Nat::one();
+    // Accumulate cross-differences over primes in (b1, b2]. The running product
+    // lives in the Montgomery domain, so it starts at the Montgomery form of `1`.
+    let mut acc = ctx.one().clone();
     let mut progressed = false;
     for &p in primes {
         if p <= b1 {
@@ -348,7 +360,9 @@ fn stage2(ctx: &ModCtx, q: &Point, a24: &Nat, primes: &[u64], b1: u64, b2: u64) 
         }
     }
     if progressed {
-        nontrivial_gcd(&acc, &ctx.n)
+        // `acc` is a Montgomery-form product; `gcd(acc, n)` is invariant under
+        // the `R` factor, so it exposes the same factor as the true residue.
+        nontrivial_gcd(&acc, ctx.n())
     } else {
         None
     }
@@ -406,6 +420,10 @@ fn ecm_attempt(n: &Nat, b1: u64, b2: u64, curves: u32, rng: &mut SplitMix64) -> 
                 break cand;
             }
         };
+        // The curve arithmetic runs entirely in the Montgomery domain, so lift
+        // the seed in once; every coordinate and constant derived from it stays
+        // in that domain until the final gcd.
+        let sigma = ctx.to_mont(&sigma);
 
         let (a24, base) = match suyama_curve(&ctx, &sigma) {
             Curve::Ready { a24, base } => (a24, base),
@@ -488,6 +506,38 @@ mod tests {
             &prime_at_least(50_000_000_021),
             &prime_at_least(70_000_000_027),
         );
+    }
+
+    #[test]
+    #[ignore = "measurement only: cargo test --release -- --ignored --nocapture measure_ecm"]
+    fn measure_ecm() {
+        use std::time::Instant;
+        // Balanced semiprimes whose factors sit in ECM's stage-1 reach.
+        for &(a, b) in &[
+            (100_003u64, 100_019u64),
+            (10_000_019, 10_000_079),
+            (1_000_000_007, 1_000_000_009),
+            (9_999_999_001, 8_888_888_881),
+            (50_000_000_021, 70_000_000_027),
+        ] {
+            let p = prime_at_least(a);
+            let q = prime_at_least(b);
+            let n = p.mul(&q);
+            let mut best = core::time::Duration::MAX;
+            let _ = ecm_factor(&n);
+            for _ in 0..3 {
+                let t = Instant::now();
+                let f = ecm_factor(&n).expect("ECM splits it");
+                best = best.min(t.elapsed());
+                assert!(n.div_rem(&f).expect("f != 0").1.is_zero());
+            }
+            std::println!(
+                "ecm  {}+{}-bit factors ({}-bit n)  {best:>12?}",
+                p.bit_len(),
+                q.bit_len(),
+                n.bit_len()
+            );
+        }
     }
 
     #[test]

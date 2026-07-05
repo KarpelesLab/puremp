@@ -851,6 +851,118 @@ fn mont_sqr(a: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
     mont_extract(t, s, m)
 }
 
+/// Montgomery arithmetic context for an odd modulus `m > 1` (any limb count).
+///
+/// Encapsulates the one-time setup that [`Nat::modpow_montgomery`] performs
+/// inline — `n0inv = −m⁻¹ mod 2⁶⁴` and `R² mod m`, with `R = 2^(64·k)` — so hot
+/// loops (Pollard rho, ECM) can convert their operands into Montgomery form once
+/// and run every multiply and squaring through [`mont_mul`]/[`mont_sqr`] without
+/// a per-step division-based reduction.
+///
+/// Addition and subtraction need no conversion: the Montgomery map `x ↦ x·R` is
+/// linear, so a mod-`m` add/sub of two Montgomery representatives is the
+/// Montgomery representative of the sum/difference. Likewise `gcd(a, m)` is
+/// invariant under the `R` factor (because `gcd(R, m) = 1` for odd `m`), so a
+/// factor can be extracted from a Montgomery-form value without converting out.
+pub(crate) struct MontCtx {
+    /// Modulus limbs (exactly `k`, top non-zero, odd).
+    m: Vec<Limb>,
+    /// Modulus as a `Nat`, for reductions and comparisons.
+    modulus: Nat,
+    /// `−m⁻¹ mod 2⁶⁴`.
+    n0inv: Limb,
+    /// `R² mod m`; converts a residue into Montgomery form via one `mont_mul`.
+    r2: Nat,
+    /// `R mod m` — the Montgomery form of `1`.
+    one: Nat,
+}
+
+impl MontCtx {
+    /// Builds the context for an odd `modulus > 1`.
+    pub(crate) fn new(modulus: &Nat) -> MontCtx {
+        debug_assert!(!modulus.is_even(), "MontCtx requires an odd modulus");
+        let k = modulus.limbs.len();
+        let m = modulus.limbs.clone();
+        let n0inv = inv_mod_2_64(m[0]).wrapping_neg();
+        let r = Nat::one().shl(k as u64 * LIMB_BITS as u64);
+        let r2 = r.mul(&r).div_rem(modulus).expect("non-zero").1;
+        let one = mont_mul(&Nat::one(), &r2, &m, n0inv);
+        MontCtx {
+            m,
+            modulus: modulus.clone(),
+            n0inv,
+            r2,
+            one,
+        }
+    }
+
+    /// The modulus `m`.
+    #[inline]
+    pub(crate) fn modulus(&self) -> &Nat {
+        &self.modulus
+    }
+
+    /// The Montgomery form of `1` (`R mod m`).
+    #[inline]
+    pub(crate) fn one(&self) -> &Nat {
+        &self.one
+    }
+
+    /// Converts a residue into Montgomery form: `a·R mod m`. Reduces `a` first if
+    /// it is not already `< m`.
+    pub(crate) fn to_mont(&self, a: &Nat) -> Nat {
+        let reduced;
+        let a = if a.cmp_ref(&self.modulus) != Ordering::Less {
+            reduced = a.div_rem(&self.modulus).expect("non-zero").1;
+            &reduced
+        } else {
+            a
+        };
+        mont_mul(a, &self.r2, &self.m, self.n0inv)
+    }
+
+    /// Converts out of Montgomery form: `a·R⁻¹ mod m` (the true residue).
+    pub(crate) fn to_residue(&self, a: &Nat) -> Nat {
+        mont_mul(a, &Nat::one(), &self.m, self.n0inv)
+    }
+
+    /// `a·b·R⁻¹ mod m`: the Montgomery product of two Montgomery-form operands
+    /// (itself in Montgomery form). Requires `a, b < m`.
+    #[inline]
+    pub(crate) fn mul(&self, a: &Nat, b: &Nat) -> Nat {
+        mont_mul(a, b, &self.m, self.n0inv)
+    }
+
+    /// `a²·R⁻¹ mod m`: the Montgomery squaring of a Montgomery-form operand.
+    #[inline]
+    pub(crate) fn sqr(&self, a: &Nat) -> Nat {
+        mont_sqr(a, &self.m, self.n0inv)
+    }
+
+    /// `(a + b) mod m` for reduced `a, b` (identical whether the operands are
+    /// true residues or Montgomery representatives — the map is linear).
+    pub(crate) fn add(&self, a: &Nat, b: &Nat) -> Nat {
+        let s = a.add(b);
+        if s.cmp_ref(&self.modulus) != Ordering::Less {
+            s.checked_sub(&self.modulus).expect("s >= m")
+        } else {
+            s
+        }
+    }
+
+    /// `(a − b) mod m` for reduced `a, b`, returned as the canonical
+    /// representative in `[0, m)`.
+    pub(crate) fn sub(&self, a: &Nat, b: &Nat) -> Nat {
+        if a.cmp_ref(b) != Ordering::Less {
+            a.checked_sub(b).expect("a >= b")
+        } else {
+            self.modulus
+                .checked_sub(&b.checked_sub(a).expect("b > a"))
+                .expect("difference < m")
+        }
+    }
+}
+
 /// Adds the limbs of `val` into `out` starting at limb `offset`, propagating the
 /// carry. `out` must be large enough to hold the result (including any carry).
 #[inline]
@@ -3021,35 +3133,84 @@ fn pollard_rho(n: &Nat, budget: Option<u64>) -> Option<Nat> {
         return Some(Nat::from_u64(2));
     }
     let one = Nat::one();
-    let recip = Reciprocal::new(n);
+    // Work in the Montgomery domain over the odd modulus `n`: `f(x) = x² + c`
+    // becomes a Montgomery squaring plus a mod-`n` add, and the per-step
+    // `gcd(x − y, n)` is invariant under the Montgomery `R` factor
+    // (`gcd(R, n) = 1`), so the difference can be gcd'd directly.
+    let mont = MontCtx::new(n);
+    // Brent's improvement: accumulate the product of the differences `x − y`
+    // over a batch of steps and take a single gcd per batch, backing off to a
+    // per-step gcd only when a batch gcd lands on `n`.
+    const BATCH: u32 = 128;
+    let two_mont = mont.to_mont(&Nat::from_u64(2));
     let mut c = 1u64;
     let mut spent = 0u64;
     loop {
-        let f = |x: &Nat| recip.reduce(&x.square().add(&Nat::from_u64(c)));
-        let (mut x, mut y) = (Nat::from_u64(2), Nat::from_u64(2));
-        let mut d = one.clone();
-        while d == one {
-            x = f(&x);
-            y = f(&f(&y));
-            let diff = if x.cmp_ref(&y) != Ordering::Less {
-                x.checked_sub(&y).unwrap()
-            } else {
-                y.checked_sub(&x).unwrap()
-            };
-            d = if diff.is_zero() {
+        let c_mont = mont.to_mont(&Nat::from_u64(c));
+        let f = |x: &Nat| mont.add(&mont.sqr(x), &c_mont);
+        let (mut x, mut y) = (two_mont.clone(), two_mont.clone());
+        loop {
+            // Run one batch, accumulating `∏ (x − y)` in Montgomery form. The
+            // running product starts at the Montgomery form of `1`.
+            let (xs, ys) = (x.clone(), y.clone());
+            let mut prod = mont.one().clone();
+            let mut steps = 0u32;
+            let mut budget_hit = false;
+            while steps < BATCH {
+                x = f(&x);
+                y = f(&f(&y));
+                steps += 1;
+                spent += 1;
+                let diff = mont.sub(&x, &y);
+                if diff.is_zero() {
+                    // `x` and `y` collided: this polynomial has cycled without a
+                    // factor. Force the batch gcd to `n` so the replay below
+                    // detects the closed cycle and moves to a new polynomial.
+                    prod = Nat::zero();
+                    break;
+                }
+                prod = mont.mul(&prod, &diff);
+                if budget.is_some_and(|limit| spent >= limit) {
+                    budget_hit = true;
+                    break;
+                }
+            }
+            let g = if prod.is_zero() {
                 n.clone()
             } else {
-                diff.gcd(n)
+                prod.gcd(n)
             };
-            spent += 1;
-            if let Some(limit) = budget
-                && spent >= limit
-            {
+            if g != one && g != *n {
+                return Some(g);
+            }
+            if g == *n {
+                // A factor (or a closed cycle) appeared inside the batch: replay
+                // it step by step, taking one gcd per step, to isolate it.
+                let (mut xr, mut yr) = (xs, ys);
+                for _ in 0..steps {
+                    xr = f(&xr);
+                    yr = f(&f(&yr));
+                    let diff = mont.sub(&xr, &yr);
+                    let d = if diff.is_zero() {
+                        n.clone()
+                    } else {
+                        diff.gcd(n)
+                    };
+                    if d != one && d != *n {
+                        return Some(d);
+                    }
+                    if d == *n {
+                        break; // closed cycle: fall through to a new polynomial
+                    }
+                }
+                if budget_hit {
+                    return None;
+                }
+                break; // try a different polynomial
+            }
+            if budget_hit {
                 return None;
             }
-        }
-        if d != *n {
-            return Some(d);
         }
         c += 1; // cycle without a factor: try a different polynomial
     }
@@ -3615,6 +3776,40 @@ mod tests {
             std::println!(
                 "sz={sz:<6} school={school:>11?} kara={kara:>11?} toom3={t3:>11?} toom4={t4:>11?} ntt={ntt:>11?}"
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement only: cargo test --release -- --ignored --nocapture measure_rho"]
+    fn measure_rho() {
+        use std::time::Instant;
+        // Smallest prime ≥ 10^d, via the crate's exact (< 2^64) BPSW test.
+        let prime_near = |start: u64| -> Nat {
+            let mut c = start | 1;
+            loop {
+                let v = Nat::from_u64(c);
+                if v.is_prime_bpsw() {
+                    return v;
+                }
+                c += 2;
+            }
+        };
+        // Balanced semiprimes squarely in Pollard rho's fast range.
+        for &digits in &[6u32, 7, 8, 9, 10] {
+            let base = 10u64.pow(digits);
+            let p = prime_near(base + 12345);
+            let q = prime_near(base + 67891);
+            let n = p.mul(&q);
+            // Warm up, then take the fastest of several full-factorization runs.
+            let mut best = core::time::Duration::MAX;
+            let _ = pollard_rho(&n, Some(1 << 22));
+            for _ in 0..5 {
+                let t = Instant::now();
+                let f = pollard_rho(&n, Some(1 << 22)).expect("rho splits it");
+                best = best.min(t.elapsed());
+                assert!(n.div_rem(&f).expect("f != 0").1.is_zero());
+            }
+            std::println!("rho  {digits:>2}+{digits:>2}-digit semiprime  {best:>12?}");
         }
     }
 

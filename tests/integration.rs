@@ -986,6 +986,100 @@ fn factorization_siqs_range() {
     assert_eq!(f, vec![small, large]);
 }
 
+/// Differential batch: exercise `factorize` over a large, varied population of
+/// composites — random semiprimes of assorted sizes, products of several primes,
+/// prime powers, and numbers mixing small and large factors — and require every
+/// result to be a correct, complete prime factorization (product equals the
+/// input; every factor passes Baillie–PSW; the list is sorted). This is the
+/// invariant that the Montgomery conversion of Pollard rho and ECM must
+/// preserve; `factorize` is deterministic (rho is RNG-free, ECM seeds from `n`),
+/// so each input maps to a fixed factor multiset.
+#[test]
+fn factorization_differential_batch() {
+    use puremp::RandomSource;
+
+    // Deterministic byte source so the batch is reproducible.
+    struct Lcg(u64);
+    impl RandomSource for Lcg {
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for b in dest.iter_mut() {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (self.0 >> 33) as u8;
+            }
+        }
+    }
+    let mut rng = Lcg(0x1234_5678_9abc_def0);
+    let mut prime = |bits: u32| -> Int { Int::random_prime(bits, &mut rng) };
+
+    // Assert that `n` factors completely and correctly.
+    let check = |n: &Int| {
+        let f = n.factorize();
+        // Product of all factors reconstructs the input.
+        let prod = f.iter().fold(Int::ONE, |a, p| a.mul(p));
+        assert_eq!(&prod, n, "factors of {n} must multiply back to it");
+        // Every factor is a genuine prime.
+        assert!(
+            f.iter().all(|p| p.is_prime_bpsw()),
+            "every factor of {n} must be prime: got {f:?}"
+        );
+        // The list is sorted (the documented contract).
+        assert!(
+            f.windows(2).all(|w| w[0] <= w[1]),
+            "factor list for {n} must be sorted"
+        );
+    };
+
+    // Random semiprimes across a range of (balanced and unbalanced) sizes that
+    // land in the rho / ECM buckets.
+    for &(a, b) in &[
+        (12u32, 12u32),
+        (16, 16),
+        (20, 24),
+        (24, 24),
+        (28, 30),
+        (32, 32),
+        (18, 40),
+        (10, 44),
+    ] {
+        for _ in 0..3 {
+            check(&prime(a).mul(&prime(b)));
+        }
+    }
+
+    // Products of three and four primes (multiple splits, some repeats likely).
+    for _ in 0..4 {
+        check(&prime(14).mul(&prime(18)).mul(&prime(22)));
+        check(&prime(12).mul(&prime(16)).mul(&prime(20)).mul(&prime(10)));
+    }
+
+    // Prime powers p^e (the split must recover the base with full multiplicity).
+    for &(bits, e) in &[(16u32, 2u32), (20, 3), (24, 2), (10, 5)] {
+        let p = prime(bits);
+        let n = (0..e).fold(Int::ONE, |a, _| a.mul(&p));
+        let f = n.factorize();
+        assert_eq!(f.len(), e as usize, "p^{e} must yield e factors");
+        assert!(f.iter().all(|x| *x == p), "all factors equal the base p");
+    }
+
+    // Small factor times a large prime: trial division / rho clears the small
+    // side, the large prime is confirmed prime and returned intact.
+    for &small in &[3u64, 5, 97, 4099, 65537] {
+        let s = Int::from_i64(small as i64);
+        let big = prime(48);
+        check(&s.mul(&big));
+    }
+
+    // Highly composite small numbers (many tiny factors with multiplicity).
+    for &n in &[
+        720u64,
+        1_000_000u64,
+        2u64.pow(10) * 3u64.pow(5) * 5u64.pow(3),
+        6469693230, // primorial 2·3·5·7·11·13·17·19·23·29
+    ] {
+        check(&Int::from_i64(n as i64));
+    }
+}
+
 #[test]
 fn continued_fractions() {
     let r = |s: &str| -> Rational { s.parse().unwrap() };

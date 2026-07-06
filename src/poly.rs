@@ -29,6 +29,16 @@ const POLY_KARATSUBA_THRESHOLD: usize = 24;
 #[cfg(feature = "int")]
 const KRONECKER_THRESHOLD: usize = 32;
 
+/// Smaller-operand coefficient count at or above which `Poly<ModInt>::mul`
+/// routes through Kronecker substitution over `GF(p)` (pack residues → one fast
+/// integer multiply → unpack and reduce mod `p`). Below it, the generic
+/// Karatsuba path wins. Chosen from benchmarking (see `examples/poly_bench.rs`):
+/// the crossover sits near 8 coefficients for both word-size and multi-limb
+/// primes; 16 clears the noise with a ~2-3x win while leaving the smallest
+/// products on the Karatsuba base case (and differential reference).
+#[cfg(feature = "int")]
+const MODINT_KRONECKER_THRESHOLD: usize = 16;
+
 /// Divisor/quotient degree at or above which `Poly::div_rem` dispatches to
 /// Newton-iteration fast division. Set high deliberately: benchmarking on this
 /// codebase (whose coefficient arithmetic is already fast) shows schoolbook long
@@ -759,6 +769,89 @@ impl Poly<Int> {
             return Poly::zero();
         }
         Poly::new(kronecker_convolve(self.coeffs(), rhs.coeffs()))
+    }
+}
+
+// ===========================================================================
+// Kronecker-substitution multiplication for polynomials over GF(p) (`ModInt`).
+//
+// Coefficients are residues in `[0, p)`, all sharing one modulus. Evaluate both
+// operands at `X = 2ᵏ` for `k` wide enough that every product coefficient — an
+// integer sum of ≤ min(nₐ, n_b) products of two values `< p` — fits in its
+// `k`-bit slot without carrying into its neighbour, form the two big integers,
+// one fast `Int` multiply, read the base-`2ᵏ` digits back out and reduce each
+// mod `p`. Everything is non-negative, so no sign bias is needed. Reduction mod
+// `p` is a ring homomorphism, so the recovered residues are bit-identical to the
+// schoolbook/Karatsuba convolution.
+// ===========================================================================
+
+/// Kronecker multiply hook for `Poly<ModInt>` over `GF(p)` (see
+/// [`Ring::poly_mul`]). Returns `None` below the degree threshold so small
+/// products stay on the Karatsuba path.
+#[cfg(feature = "int")]
+pub(crate) fn kronecker_mul_modint(
+    a: &[crate::mod_int::ModInt],
+    b: &[crate::mod_int::ModInt],
+) -> Option<Vec<crate::mod_int::ModInt>> {
+    if a.is_empty() || b.is_empty() {
+        return Some(Vec::new());
+    }
+    if a.len().min(b.len()) < MODINT_KRONECKER_THRESHOLD {
+        return None;
+    }
+    Some(kronecker_convolve_modint(a, b))
+}
+
+/// Core Kronecker product of two nonempty `ModInt` coefficient slices sharing a
+/// modulus `p`. Returns the product coefficients (length `nₐ + n_b − 1`), each
+/// reduced mod `p` — exactly the schoolbook convolution over `GF(p)`.
+#[cfg(feature = "int")]
+fn kronecker_convolve_modint(
+    a: &[crate::mod_int::ModInt],
+    b: &[crate::mod_int::ModInt],
+) -> Vec<crate::mod_int::ModInt> {
+    // Slot width `k`: with every residue `< p` (so `bit_len(p)` bits), each
+    // product is `< 2^{2·bit_len(p)}` and a sum of ≤ `min_len` of them is
+    // `< min_len · 2^{2·bit_len(p)} ≤ 2^{2·bit_len(p) + clog}`, where
+    // `clog = ⌈log2(min_len)⌉`. So `k = 2·bit_len(p) + clog` keeps every slot
+    // in `[0, 2ᵏ)` with no overlap.
+    let sample = &a[0];
+    let bp = sample.modulus().bit_len();
+    let min_len = a.len().min(b.len());
+    let clog = if min_len <= 1 {
+        0
+    } else {
+        (min_len - 1).ilog2() + 1
+    };
+    let k = 2 * bp + clog;
+    let num = a.len() + b.len() - 1;
+
+    let ai: Vec<Int> = a.iter().map(|c| c.to_int()).collect();
+    let bi: Vec<Int> = b.iter().map(|c| c.to_int()).collect();
+    let prod = kronecker_pack(&ai, k).mul(&kronecker_pack(&bi, k));
+    // Every digit is a non-negative `< 2ᵏ` product coefficient; reduce mod `p`
+    // back into the shared ring.
+    kronecker_unpack(&prod, k, num)
+        .into_iter()
+        .map(|d| sample.of(d))
+        .collect()
+}
+
+#[cfg(feature = "int")]
+impl Poly<crate::mod_int::ModInt> {
+    /// Multiplies `self · rhs` over `GF(p)` by **Kronecker substitution** (pack
+    /// residues into big integers, one fast `Int` multiply, unpack and reduce
+    /// mod `p`). Bit-identical to [`Poly::mul`](Poly::mul) for every input,
+    /// which itself dispatches here once both operands reach the internal
+    /// Kronecker degree threshold.
+    pub fn mul_kronecker(
+        &self,
+        rhs: &Poly<crate::mod_int::ModInt>,
+    ) -> Poly<crate::mod_int::ModInt> {
+        if self.is_zero() || rhs.is_zero() {
+            return Poly::zero();
+        }
+        Poly::new(kronecker_convolve_modint(self.coeffs(), rhs.coeffs()))
     }
 }
 
@@ -1502,5 +1595,74 @@ mod fast_tests {
         assert_eq!(a.mul_schoolbook(&b), a.mul_kronecker(&b));
         assert!(Poly::<Int>::zero().mul_kronecker(&b).is_zero());
         assert!(b.mul_kronecker(&Poly::<Int>::zero()).is_zero());
+    }
+
+    // ---- Kronecker over GF(p) (`ModInt`) ----
+
+    /// A random `Poly<ModInt>` of the requested degree with residues drawn from
+    /// the *full* range `[0, p)`, so multi-limb primes exercise wide slots.
+    fn rand_poly_mod_full(rng: &mut Lcg, deg: usize, p: &Int) -> Poly<ModInt> {
+        let sample = ModInt::new(Int::ZERO, p.clone());
+        let words = (p.bit_len() / 60 + 1) as usize;
+        let mk = |rng: &mut Lcg| {
+            let mut m = Int::from(rng.range(i64::MAX));
+            for _ in 0..words {
+                m = m
+                    .mul(&Int::from(rng.range(i64::MAX)))
+                    .add(&Int::from(rng.range(i64::MAX)));
+            }
+            sample.of(m)
+        };
+        let mut v: Vec<ModInt> = (0..deg).map(|_| mk(rng)).collect();
+        loop {
+            let lead = mk(rng);
+            if !lead.is_zero() {
+                v.push(lead);
+                break;
+            }
+        }
+        Poly::new(v)
+    }
+
+    #[test]
+    fn kronecker_matches_karatsuba_gfp() {
+        // Word-size and multi-limb primes; degrees straddling the threshold.
+        let big = Int::from(1_000_000_007)
+            .mul(&Int::from(1_000_000_009))
+            .mul(&Int::from(1_000_000_021));
+        for p in [Int::from(2), Int::from(97), Int::from(2_000_003), big] {
+            let mut rng = Lcg::new(42);
+            for _ in 0..60 {
+                let na = 1 + rng.range(100) as usize;
+                let nb = 1 + rng.range(100) as usize;
+                let a = rand_poly_mod_full(&mut rng, na, &p);
+                let b = rand_poly_mod_full(&mut rng, nb, &p);
+                // `mul` routes through the Kronecker hook above the threshold;
+                // `mul_schoolbook` is the differential reference.
+                assert_eq!(a.mul_schoolbook(&b), a.mul(&b), "p={p} na={na} nb={nb}");
+                assert_eq!(a.mul_schoolbook(&b), a.mul_kronecker(&b));
+            }
+        }
+    }
+
+    #[test]
+    fn kronecker_gfp_edge_cases() {
+        let p = Int::from(2_000_003);
+        let sample = ModInt::new(Int::ZERO, p.clone());
+        let c = |v: i64| sample.of(Int::from(v));
+        // degree-0, single term against a longer poly, and a poly with interior
+        // zero coefficients (all straddling the threshold via a long operand).
+        let long = rand_poly_mod_full(&mut Lcg::new(9), 50, &p);
+        for a in [
+            Poly::new(vec![c(5)]),
+            Poly::new(vec![c(0), c(0), c(3)]),
+            Poly::new(vec![c(7), c(0), c(0), c(0), c(11)]),
+        ] {
+            assert_eq!(a.mul_schoolbook(&long), a.mul(&long));
+            assert_eq!(a.mul_schoolbook(&long), a.mul_kronecker(&long));
+        }
+        // zero operands short-circuit
+        assert!(Poly::<ModInt>::zero().mul_kronecker(&long).is_zero());
+        assert!(long.mul_kronecker(&Poly::<ModInt>::zero()).is_zero());
     }
 }

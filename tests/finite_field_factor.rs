@@ -287,3 +287,45 @@ fn squarefull_over_gf7() {
     mults.sort_unstable();
     assert_eq!(mults, vec![1, 3]);
 }
+
+// --------------------------------------------------------------------------
+// High-degree GF(p): exercises the Kronecker `Poly<ModInt>::mul` hook inside
+// distinct-degree / equal-degree factorization (powmod squares degree-~N polys).
+// --------------------------------------------------------------------------
+
+/// A tiny LCG so the test is deterministic without an RNG dependency.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+}
+
+#[test]
+fn high_degree_gfp_factors_back() {
+    // Build a degree-~120 polynomial over GF(1_000_003) as a product of many
+    // random low-degree factors, well above the Kronecker threshold so the
+    // multiplies in factor()/powmod route through the packed path. The
+    // reconstruction check (product of factors == input) is the differential
+    // guarantee: an incorrect Kronecker product would corrupt it.
+    let p = 1_000_003;
+    let mut rng = Lcg(0x1234_5678);
+    let mut f = poly_fp(&[1], p); // constant 1
+    while f.degree().unwrap_or(0) < 120 {
+        let deg = 1 + (rng.next() as usize % 4);
+        let mut coeffs: Vec<i64> = (0..deg).map(|_| (rng.next() % p as u64) as i64).collect();
+        coeffs.push(1 + (rng.next() % (p as u64 - 1)) as i64); // nonzero leading
+        let g = poly_fp(&coeffs, p);
+        f = f.mul(&g);
+    }
+    // factor() must reconstruct f and return only irreducible factors.
+    let factors = check_full(&f);
+    assert!(!factors.is_empty());
+    // The product of factor degrees × multiplicity equals deg(f).
+    let total: usize = factors.iter().map(|(g, m)| g.degree().unwrap() * m).sum();
+    assert_eq!(total, f.degree().unwrap());
+}

@@ -216,6 +216,10 @@ impl Ring for crate::decimal::Decimal {
 impl Ring for crate::mod_int::ModInt {
     // Modular integer arithmetic is exact.
     const EXACT: bool = true;
+    #[cfg(feature = "poly")]
+    fn poly_mul(a: &[Self], b: &[Self]) -> Option<alloc::vec::Vec<Self>> {
+        crate::poly::kronecker_mul_modint(a, b)
+    }
     /// Zero in the same ring `ℤ/nℤ` as `self` (shares the modulus).
     #[inline]
     fn zero(&self) -> Self {

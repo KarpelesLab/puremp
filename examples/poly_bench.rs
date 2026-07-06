@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use puremp::Ring;
-use puremp::{Int, ModInt, Poly};
+use puremp::{FactorOverField, Int, ModInt, Poly};
 
 struct Lcg(u64);
 impl Lcg {
@@ -188,8 +188,163 @@ fn bench_gcd() {
     }
 }
 
+// ---- Karatsuba vs Kronecker for Poly<ModInt> over GF(p) ----
+
+fn rand_mod_poly_p(rng: &mut Lcg, n: usize, p: &Int) -> Poly<ModInt> {
+    // Sample residues in [0, p) by rejection from a power-of-two-ish range built
+    // out of 62-bit LCG words.
+    let sample = ModInt::new(Int::ZERO, p.clone());
+    let words = (p.bit_len() / 62 + 1) as usize;
+    let mk = |rng: &mut Lcg| {
+        let mut m = Int::from((rng.next() >> 1) as i64);
+        for _ in 0..words {
+            m = m
+                .mul(&Int::from((rng.next() >> 1) as i64))
+                .add(&Int::from((rng.next() >> 1) as i64));
+        }
+        sample.of(m)
+    };
+    let mut v: Vec<ModInt> = (0..n).map(|_| mk(rng)).collect();
+    // Nonzero leading coefficient.
+    let mut lead = mk(rng);
+    while lead.is_zero() {
+        lead = mk(rng);
+    }
+    v.push(lead);
+    Poly::new(v)
+}
+
+/// Honest Karatsuba baseline over GF(p), independent of the `Poly::mul` hook,
+/// bottoming out in schoolbook. This mirrors the pre-change `Poly<ModInt>::mul`.
+fn karatsuba_mod(a: &[ModInt], b: &[ModInt]) -> Vec<ModInt> {
+    let n = a.len().min(b.len());
+    if n < 24 {
+        let zero = a[0].zero();
+        let mut out = vec![zero; a.len() + b.len() - 1];
+        for (i, x) in a.iter().enumerate() {
+            for (j, y) in b.iter().enumerate() {
+                out[i + j] = out[i + j].clone() + x.clone() * y.clone();
+            }
+        }
+        return out;
+    }
+    let m = a.len().max(b.len()) / 2;
+    let split = |s: &[ModInt]| -> (Vec<ModInt>, Vec<ModInt>) {
+        if m >= s.len() {
+            (s.to_vec(), Vec::new())
+        } else {
+            (s[..m].to_vec(), s[m..].to_vec())
+        }
+    };
+    let add = |x: &[ModInt], y: &[ModInt]| -> Vec<ModInt> {
+        let mut out = x.to_vec();
+        if out.len() < y.len() {
+            out.resize(y.len(), a[0].zero());
+        }
+        for (i, c) in y.iter().enumerate() {
+            out[i] = out[i].clone() + c.clone();
+        }
+        out
+    };
+    let (a0, a1) = split(a);
+    let (b0, b1) = split(b);
+    let z0 = karatsuba_mod(&a0, &b0);
+    let use_hi = !a1.is_empty() && !b1.is_empty();
+    let z2 = if use_hi {
+        karatsuba_mod(&a1, &b1)
+    } else {
+        Vec::new()
+    };
+    let sa = add(&a0, &a1);
+    let sb = add(&b0, &b1);
+    let mid = karatsuba_mod(&sa, &sb);
+    let mut out = vec![a[0].zero(); a.len() + b.len() - 1];
+    for (i, c) in z0.iter().enumerate() {
+        out[i] = out[i].clone() + c.clone();
+    }
+    for (i, c) in mid.iter().enumerate() {
+        out[i + m] = out[i + m].clone() + c.clone();
+    }
+    for (i, c) in z0.iter().enumerate() {
+        out[i + m] = out[i + m].clone() - c.clone();
+    }
+    for (i, c) in z2.iter().enumerate() {
+        out[i + m] = out[i + m].clone() - c.clone();
+        out[i + 2 * m] = out[i + 2 * m].clone() + c.clone();
+    }
+    out
+}
+
+fn bench_kronecker_modint() {
+    for (name, p) in &[
+        ("word prime 1e9+7", Int::from_u64(1_000_000_007)),
+        (
+            "128-bit prime",
+            Int::from_u64(1_000_000_007)
+                .mul(&Int::from_u64(1_000_000_009))
+                .mul(&Int::from_u64(1_000_000_021))
+                .mul(&Int::from_u64(9))
+                .add(&Int::from_u64(1)),
+        ),
+    ] {
+        let p = p.clone();
+        println!(
+            "\n== Poly<GF(p)> multiply: Karatsuba vs Kronecker ({name}, {} bits) ==",
+            p.bit_len()
+        );
+        println!(
+            "{:>6}  {:>12}  {:>12}  {:>8}",
+            "deg", "karatsuba", "kronecker", "speedup"
+        );
+        let mut rng = Lcg::new(7);
+        for &n in &[32usize, 64, 128, 256, 512, 1024, 2048] {
+            let a = rand_mod_poly_p(&mut rng, n, &p);
+            let b = rand_mod_poly_p(&mut rng, n, &p);
+            let t_kara = time(|| {
+                std::hint::black_box(karatsuba_mod(a.coeffs(), b.coeffs()));
+            });
+            let t_kron = time(|| {
+                std::hint::black_box(a.mul_kronecker(&b));
+            });
+            assert_eq!(
+                Poly::new(karatsuba_mod(a.coeffs(), b.coeffs())),
+                a.mul_kronecker(&b)
+            );
+            println!(
+                "{n:>6}  {:>12?}  {:>12?}  {:>7.2}x",
+                t_kara,
+                t_kron,
+                t_kara.as_secs_f64() / t_kron.as_secs_f64()
+            );
+        }
+    }
+}
+
+fn bench_cz_factor() {
+    println!("\n== End-to-end Cantor–Zassenhaus factorization (Poly<GF(1e9+7)>) ==");
+    println!("{:>6}  {:>14}", "deg", "factor()");
+    let p = Int::from_u64(1_000_000_007);
+    let mut rng = Lcg::new(11);
+    for &deg in &[64usize, 128, 256, 512] {
+        // Build a product of random low-degree factors so the polynomial really
+        // factors and DDF/EDF do work.
+        let mut f = Poly::constant(ModInt::new(Int::ONE, p.clone()));
+        while f.degree().unwrap_or(0) < deg {
+            let sz = 3 + (rng.next() as usize % 6);
+            let g = rand_mod_poly_p(&mut rng, sz, &p);
+            f = f.mul(&g);
+        }
+        let t = time(|| {
+            std::hint::black_box(f.factor());
+        });
+        println!("{:>6}  {:>14?}", f.degree().unwrap(), t);
+    }
+}
+
 fn main() {
     bench_kronecker();
     bench_division();
     bench_gcd();
+    bench_kronecker_modint();
+    bench_cz_factor();
 }

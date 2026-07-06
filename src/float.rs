@@ -1883,11 +1883,27 @@ fn odd_series_scale(x: &Float, w: u64) -> Option<u64> {
     Some(w + 32 + (-e).max(0) as u64)
 }
 
+/// Working precisions at or above this evaluate the odd `atanh`/`atan` series by
+/// rectangular splitting ([`odd_series_rect`]); below it the term-by-term
+/// [`atanh_series_simple`]/[`atan_series_simple`] win. From `bench_transc_rect`:
+/// ~0.9× at 1024, ~1.2–1.3× at 1536, rising to ~5–6× at 64k.
+const ODD_SERIES_RECT_THRESHOLD: u64 = 1536;
+
 /// `atanh(x) = x + x³/3 + x⁵/5 + …` at working precision `w` (needs
-/// `0 ≤ x < 1`; the `ln` reduction supplies `x ≤ 1/3`). The sum runs in scaled
-/// integer arithmetic: per term one small multiply plus one single-limb
-/// division instead of full Float operations.
+/// `0 ≤ x < 1`; the `ln` reduction supplies `x ≤ 1/3`). Dispatches to the
+/// `O(√T)` rectangular series at high precision and the `O(T)` term-by-term
+/// series below the crossover; both round through the same Ziv wrapper.
 fn atanh_series(x: &Float, w: u64) -> Float {
+    if w >= ODD_SERIES_RECT_THRESHOLD {
+        odd_series_rect(x, w, false)
+    } else {
+        atanh_series_simple(x, w)
+    }
+}
+
+/// Term-by-term `atanh` series in scaled integer arithmetic: per term one small
+/// multiply plus one single-limb division instead of full Float operations.
+fn atanh_series_simple(x: &Float, w: u64) -> Float {
     debug_assert!(!x.is_sign_negative(), "atanh series needs x >= 0");
     let Some(n) = odd_series_scale(x, w) else {
         return x.round(w, NEAR);
@@ -1910,9 +1926,19 @@ fn atanh_series(x: &Float, w: u64) -> Float {
 }
 
 /// `atan(x) = x − x³/3 + x⁵/5 − …` at working precision `w` (needs
-/// `0 ≤ x ≤ 1/4`, supplied by the halving reduction), in scaled integer
-/// arithmetic like [`atanh_series`].
+/// `0 ≤ x ≤ 1/4`, supplied by the halving reduction). Dispatches like
+/// [`atanh_series`] between the rectangular and term-by-term series.
 fn atan_series(x: &Float, w: u64) -> Float {
+    if w >= ODD_SERIES_RECT_THRESHOLD {
+        odd_series_rect(x, w, true)
+    } else {
+        atan_series_simple(x, w)
+    }
+}
+
+/// Term-by-term `atan` series in scaled integer arithmetic like
+/// [`atanh_series_simple`].
+fn atan_series_simple(x: &Float, w: u64) -> Float {
     debug_assert!(!x.is_sign_negative(), "atan series needs x >= 0");
     let Some(n) = odd_series_scale(x, w) else {
         return x.round(w, NEAR);
@@ -1938,6 +1964,37 @@ fn atan_series(x: &Float, w: u64) -> Float {
         sub = !sub;
         k += 1;
     }
+    Float::round_raw(false, sum, -(n as i64), w, NEAR).0
+}
+
+/// The odd series `x·Σ_{k≥0} σ_k x^{2k}/(2k+1)` (`atanh` for `σ_k = +1`, `atan`
+/// for `σ_k = (−1)^k`) evaluated by **rectangular splitting** on `z = x²`. The
+/// bracket `Σ_k σ_k z^k/(2k+1)` has term ratio `t_k/t_{k-1} = ±z·(2k−1)/(2k+1)`
+/// (numerator factor `p(k)=2k−1`, denominator `q(k)=2k+1`), so it feeds directly
+/// into [`power_series_rect`]. Same working scale `2^-n` and single final
+/// rounding of the scaled `x·bracket` as the term-by-term versions, so the
+/// correctly-rounded result is identical.
+fn odd_series_rect(x: &Float, w: u64, alternating: bool) -> Float {
+    debug_assert!(!x.is_sign_negative(), "odd series needs x >= 0");
+    let Some(n) = odd_series_scale(x, w) else {
+        return x.round(w, NEAR);
+    };
+    let xs = scaled_int(x, n as i64).magnitude();
+    let z = xs.square().shr(n); // x² · 2^n
+    let t = series_term_count(&z, n, |k| 2 * k - 1, |k| 2 * k + 1);
+    let c = rect_block_width(t);
+    let powers = scaled_powers(&z, n, c);
+    let bracket = power_series_rect(
+        n,
+        c,
+        &powers,
+        alternating,
+        true,
+        |k| 2 * k - 1,
+        |k| 2 * k + 1,
+    );
+    // sum = x · bracket, at scale 2^-n, rounded once (matches the simple series).
+    let sum = xs.mul(&bracket).shr(n);
     Float::round_raw(false, sum, -(n as i64), w, NEAR).0
 }
 
@@ -2224,6 +2281,50 @@ fn ln2_at(w: u64) -> Float {
     Float::round_raw(false, sum, -(n as i64), w, NEAR).0
 }
 
+/// Working precisions at or above this evaluate the `exp` Taylor sum by
+/// rectangular splitting ([`exp_taylor_sum_rect`]); below it the term-by-term
+/// recurrence ([`exp_taylor_sum_simple`]) wins. (After the `√w` argument
+/// halvings the sum is only `O(√w)` terms, so the rectangular win is smaller
+/// than for the odd series and it briefly regresses near 1k bits.) From
+/// `bench_transc_rect`: ~1× at ≤512, a dip at 1024, then ~1.8× at 1536 rising
+/// to ~10× at 64k.
+const EXP_RECT_THRESHOLD: u64 = 1536;
+
+/// `exp(R/2^n) · 2^n` as a scaled integer, term by term: per term one small
+/// multiplication and one single-limb division. `R = rs` may be negative.
+fn exp_taylor_sum_simple(rs: &Int, n: u64) -> Int {
+    let mut sum = Int::ONE.mul_2k(n as u32);
+    let mut term = sum.clone();
+    let mut kk: i64 = 1;
+    loop {
+        term = term
+            .mul(rs)
+            .div_2k_trunc(n as u32)
+            .div_trunc(&Int::from_i64(kk));
+        if term.is_zero() {
+            break;
+        }
+        sum = sum.add(&term);
+        kk += 1;
+    }
+    sum
+}
+
+/// `exp(R/2^n) · 2^n` as a scaled integer, by rectangular splitting. `exp` has
+/// `p(k)=1, q(k)=k`; a negative `R` is folded into the alternating flag (the
+/// baby-step powers run on `|R|`), so the sum stays non-negative.
+fn exp_taylor_sum_rect(rs: &Int, n: u64) -> Int {
+    let zmag = rs.magnitude();
+    if zmag.is_zero() {
+        return Int::ONE.mul_2k(n as u32); // exp(0) = 1
+    }
+    let t = series_term_count(&zmag, n, |_| 1, |k| k);
+    let c = rect_block_width(t);
+    let powers = scaled_powers(&zmag, n, c);
+    let sum = power_series_rect(n, c, &powers, rs.is_negative(), false, |_| 1, |k| k);
+    Int::from(sum)
+}
+
 /// `e^x` at precision `w` via range reduction `x = k·ln2 + r` and a Taylor sum.
 ///
 /// A second reduction stage `exp(r) = exp(r/2^j)^(2^j)` with `j ≈ √w` balances
@@ -2246,21 +2347,14 @@ fn exp_at(x: &Float, w: u64) -> Float {
     // lose < 1 ulp each, well inside the guard bits above.
     // R = ⌊r·2^n⌋; |r| < ln2/2^(j+1), so |R| < 2^(n−j−1).
     let rs = scaled_int(&r, n as i64);
-    // exp(R/2^n) = Σ (R/2^n)^k/k!, all terms scaled by 2^n.
-    let mut sum = Int::ONE.mul_2k(n as u32);
-    let mut term = sum.clone();
-    let mut kk: i64 = 1;
-    loop {
-        term = term
-            .mul(&rs)
-            .div_2k_trunc(n as u32)
-            .div_trunc(&Int::from_i64(kk));
-        if term.is_zero() {
-            break;
-        }
-        sum = sum.add(&term);
-        kk += 1;
-    }
+    // exp(R/2^n) = Σ (R/2^n)^k/k!, all terms scaled by 2^n. The high-precision
+    // path evaluates it by rectangular splitting; below the crossover the cheap
+    // term-by-term recurrence wins.
+    let mut sum = if w >= EXP_RECT_THRESHOLD {
+        exp_taylor_sum_rect(&rs, n)
+    } else {
+        exp_taylor_sum_simple(&rs, n)
+    };
     // Undo the argument halvings: exp(r) = exp(r/2^j)^(2^j). The sum stays
     // near 2^n (r is tiny), so each squaring is one n-bit multiply.
     for _ in 0..j {
@@ -2461,9 +2555,10 @@ fn sin_cos_series_rect(r: &Float, w: u64) -> (Float, Float) {
     for j in 2..=c {
         powers.push(powers[j - 1].mul(&z).shr(n));
     }
-    // cos: d(m) = (2m−1)(2m); sin bracket: d(k) = (2k)(2k+1).
-    let cos = alt_series_rect(n, c, &powers, |m| (2 * m - 1) * (2 * m));
-    let bracket = alt_series_rect(n, c, &powers, |k| (2 * k) * (2 * k + 1));
+    // cos: q(m) = (2m−1)(2m); sin bracket: q(k) = (2k)(2k+1); both alternating,
+    // no numerator factor (p ≡ 1).
+    let cos = power_series_rect(n, c, &powers, true, false, |_| 1, |m| (2 * m - 1) * (2 * m));
+    let bracket = power_series_rect(n, c, &powers, true, false, |_| 1, |k| (2 * k) * (2 * k + 1));
     let bracket_f = Float::round_raw(false, bracket, -(n as i64), w, NEAR).0;
     (
         r.mul(&bracket_f, w, NEAR),
@@ -2493,13 +2588,31 @@ fn sin_cos_term_count(z: &Nat, n: u64) -> u64 {
     }
 }
 
-/// Evaluates `S = Σ_{m≥0} (−1)^m z^m / ∏_{j=1}^m d(j)` at scale `2^-n` by
-/// rectangular splitting, returning the non-negative scaled sum. `powers[j]`
-/// must hold `z^j · 2^n` for `j = 0..=c`, and `z < 1` (`d` grows so the sum
-/// converges). The running block-leading term `b = t_{iC}·2^n` is advanced by a
-/// single full multiply by `z^C` per block; each block sum is one full multiply
-/// `b·W` plus small products/divides by the block's integer coefficients.
-fn alt_series_rect(n: u64, c: usize, powers: &[Nat], d: impl Fn(u64) -> u64) -> Nat {
+/// Evaluates the power series `S = Σ_{k≥0} σ_k · z^k · ∏_{j=1}^k p(j)/q(j)` at
+/// scale `2^-n` by rectangular splitting (Brent & Zimmermann, *MCA* §4.4.3),
+/// returning the non-negative scaled sum. The consecutive-term ratio is the
+/// rational function `t_k/t_{k-1} = ±z·p(k)/q(k)` (the sign alternates when
+/// `alternating`), which covers every ascending transcendental series here:
+/// `exp` (`p=1, q(k)=k`), `atan`/`atanh` (`p(k)=2k−1, q(k)=2k+1`), `erf`
+/// (`p=1, q(k)=2k+1`), `sin`/`cos` (`p=1`, `q` a quadratic). `powers[j]` must
+/// hold `z^j · 2^n` for `j = 0..=c`, with `z < 1` and `q` growing so the sum
+/// converges; the leading term is `t_0 = 1`. The running block-leading term
+/// `b = t_{iC}·2^n` is advanced by a single full multiply by `z^C` per block;
+/// each block sum is one full multiply `b·W` plus small products/divides by the
+/// block's integer coefficients — `O(√T)` full-width multiplies for `T` terms.
+///
+/// `has_numer` must be `true` iff `p` is non-trivial; the common `p ≡ 1` case
+/// (every series except `atan`/`atanh`) then skips the numerator prefix products
+/// entirely, so that path is exactly the pure-denominator recurrence.
+fn power_series_rect(
+    n: u64,
+    c: usize,
+    powers: &[Nat],
+    alternating: bool,
+    has_numer: bool,
+    p: impl Fn(u64) -> u64,
+    q: impl Fn(u64) -> u64,
+) -> Nat {
     let y = &powers[c]; // z^C · 2^n
     let mut acc = Int::ZERO; // Σ block sums, scale 2^n
     let mut b_mag = powers[0].clone(); // |t_{iC}|·2^n, starts at t_0 = 1 → 2^n
@@ -2507,24 +2620,40 @@ fn alt_series_rect(n: u64, c: usize, powers: &[Nat], d: impl Fn(u64) -> u64) -> 
     let mut base = 0u64; // iC, first term index of the current block
     let cap = 2 * (base_cap(c) + c as u64);
     while !b_mag.is_zero() && base <= cap {
-        // Block covers m = base .. base+C−1. Build, from the top down,
-        //   W    = Σ_{j=0}^{C−1} (−1)^j · num_j · powers[j]   (signed)
-        //   num_j = ∏_{l=base+j+1}^{base+C−1} d(l),   num_{C−1} = 1,  num_0 = Den
-        // so that the block sum = b · W / (2^n · Den).
-        let mut w_acc = Int::ZERO;
-        let mut num = Nat::one();
-        for j in (0..c).rev() {
-            let contrib = Int::from(num.mul(&powers[j]));
-            w_acc = if j % 2 == 0 {
-                w_acc.add(&contrib)
-            } else {
-                w_acc.sub(&contrib)
-            };
-            if j > 0 {
-                num = num.mul(&Nat::from_u64(d(base + j as u64)));
+        // Block covers k = base .. base+C−1 (local index j = k−base). Prefix
+        // products of the numerator factor p: prep[j] = ∏_{l=1}^{j} p(base+l)
+        // (empty, i.e. all 1, when the series has no numerator factor).
+        let mut prep = alloc::vec::Vec::new();
+        if has_numer {
+            prep.reserve(c);
+            prep.push(Nat::one());
+            for j in 1..c {
+                prep.push(prep[j - 1].mul(&Nat::from_u64(p(base + j as u64))));
             }
         }
-        let den = num; // = ∏_{l=base+1}^{base+C−1} d(l)
+        // Build, from the top down,
+        //   W     = Σ_{j=0}^{C−1} (±)^j · prep[j] · suf_j · powers[j]   (signed)
+        //   suf_j = ∏_{l=base+j+1}^{base+C−1} q(l),  suf_{C−1} = 1,  suf_0 = Den
+        // so that the block sum = b · W / (2^n · Den), Den = ∏ q over the block.
+        let mut w_acc = Int::ZERO;
+        let mut suf = Nat::one();
+        for j in (0..c).rev() {
+            let coef = if has_numer {
+                prep[j].mul(&suf)
+            } else {
+                suf.clone()
+            };
+            let contrib = Int::from(coef.mul(&powers[j]));
+            w_acc = if alternating && j % 2 == 1 {
+                w_acc.sub(&contrib)
+            } else {
+                w_acc.add(&contrib)
+            };
+            if j > 0 {
+                suf = suf.mul(&Nat::from_u64(q(base + j as u64)));
+            }
+        }
+        let den = suf; // = ∏_{l=base+1}^{base+C−1} q(l)
         // Block sum magnitude = (|b|·|W| ≫ n) / Den, sign = b_neg ⊕ (W<0).
         let block_mag = b_mag
             .mul(&w_acc.magnitude())
@@ -2539,10 +2668,16 @@ fn alt_series_rect(n: u64, c: usize, powers: &[Nat], d: impl Fn(u64) -> u64) -> 
         } else {
             acc.add(&block)
         };
-        // Advance b to t_{(i+1)C}·2^n = b·(−1)^C·z^C / (Den·d(base+C)).
-        let den_adv = den.mul(&Nat::from_u64(d(base + c as u64)));
-        b_mag = b_mag.mul(y).shr(n).div_rem(&den_adv).expect("> 0").0;
-        if c % 2 == 1 {
+        // Advance b to t_{(i+1)C}·2^n = b·(±)^C·z^C·prep[C−1]·p(base+C) /
+        // (Den·q(base+C)).
+        let den_adv = den.mul(&Nat::from_u64(q(base + c as u64)));
+        let mut num = b_mag.mul(y);
+        if has_numer {
+            let num_adv = prep[c - 1].mul(&Nat::from_u64(p(base + c as u64)));
+            num = num.mul(&num_adv);
+        }
+        b_mag = num.shr(n).div_rem(&den_adv).expect("> 0").0;
+        if alternating && c % 2 == 1 {
             b_neg = !b_neg;
         }
         base += c as u64;
@@ -2555,6 +2690,53 @@ fn alt_series_rect(n: u64, c: usize, powers: &[Nat], d: impl Fn(u64) -> u64) -> 
 /// leading-term underflow that normally halts it is delayed by rounding.
 fn base_cap(c: usize) -> u64 {
     4 * c as u64 * c as u64 + 64
+}
+
+/// Baby-step powers `z^j · 2^n` for `j = 0..=c` (the giant step `z^C` is the
+/// last entry), given `z` as its scaled representation `z·2^n` with `z < 1`.
+fn scaled_powers(z: &Nat, n: u64, c: usize) -> alloc::vec::Vec<Nat> {
+    let mut powers = alloc::vec::Vec::with_capacity(c + 1);
+    powers.push(Nat::one().shl(n)); // z^0 = 1
+    if c >= 1 {
+        powers.push(z.clone()); // z^1
+    }
+    for j in 2..=c {
+        powers.push(powers[j - 1].mul(z).shr(n));
+    }
+    powers
+}
+
+/// Rectangular block width `C ≈ √(2T)` (at least 2) for a `T`-term series.
+fn rect_block_width(t: u64) -> usize {
+    let two_t = 2 * t.max(1);
+    let mut c = two_t.isqrt();
+    if c * c < two_t {
+        c += 1;
+    }
+    (c as usize).max(2)
+}
+
+/// Number of terms until `|t_k| < 2^-n` for `t_k = z^k·∏p/∏q` (with `z` given as
+/// `z·2^n`, `z < 1`), tracking `log₂|t_k|` in a running integer. Used only to
+/// size the block width, so a rough estimate is fine — the block loop itself
+/// stops exactly when its leading term underflows. No-`std`-safe (integer only).
+fn series_term_count(z: &Nat, n: u64, p: impl Fn(u64) -> u64, q: impl Fn(u64) -> u64) -> u64 {
+    // log₂(z·2^n / 2^n) ≈ bit_len(z) − 1 − n  (negative, since z < 1).
+    let log2z = z.bit_len() as i64 - 1 - n as i64;
+    let mut lg = 0i64; // running log₂|t_k|
+    let mut k = 0u64;
+    loop {
+        k += 1;
+        let pk = p(k).max(1);
+        let qk = q(k).max(1);
+        // ⌊log₂⌋ of the u64 factors.
+        let log2p = 63 - pk.leading_zeros() as i64;
+        let log2q = 63 - qk.leading_zeros() as i64;
+        lg += log2z + log2p - log2q;
+        if lg < -(n as i64) || k >= n.max(1) {
+            return k;
+        }
+    }
 }
 
 /// `atan(x)` for finite non-zero `x` at precision `w`.
@@ -2649,11 +2831,32 @@ fn erf_series(a: &Float, w: u64) -> Float {
     let a2c = ceil_sq_i64(a, w).max(0) as u64;
     // 1.4427 ≈ log₂ e, so a2c·185/128 ≥ a²·log₂ e bounds the peak-term growth.
     let n = w + a2c.saturating_mul(185) / 128 + 16;
-    // Term ratio tₙ/tₙ₋₁ = 2a²/(2n+1); t₀ = a. Everything scaled by 2ⁿ.
+    // The Kummer sum `a·Σ (2a²)ⁿ/(1·3···(2n+1))`, scaled by 2ⁿ.
     let as_ = scaled_int(a, n as i64).magnitude();
+    let sum = if w >= ERF_RECT_THRESHOLD {
+        erf_kummer_sum_rect(&as_, n)
+    } else {
+        erf_kummer_sum_simple(&as_, n)
+    };
+    let s = Float::round_raw(false, sum, -(n as i64), n, NEAR).0;
+    // erf = (2/√π)·e^{−a²}·S.
+    let sqrtpi = pi_at(n).sqrt(n, NEAR);
+    let factor = iflt(2, n).div(&sqrtpi, n, NEAR);
+    let em = a.mul(a, n, NEAR).neg().exp(n, NEAR);
+    factor.mul(&em, n, NEAR).mul(&s, n, NEAR).round(w, NEAR)
+}
+
+/// Working precisions at or above this evaluate the `erf` Kummer sum by
+/// rectangular splitting; below it the term-by-term recurrence wins. From
+/// `bench_transc_rect`: ~1.1× at 1024, rising to ~11× at 64k.
+const ERF_RECT_THRESHOLD: u64 = 1024;
+
+/// The Kummer sum `a·Σ (2a²)ⁿ/(1·3···(2n+1)) · 2ⁿ`, term by term. Term ratio
+/// `tₙ/tₙ₋₁ = 2a²/(2n+1)`, `t₀ = a`; `as_ = a·2ⁿ`.
+fn erf_kummer_sum_simple(as_: &Nat, n: u64) -> Nat {
     let two_a2 = as_.square().shr(n).shl(1); // 2a² · 2ⁿ
     let mut term = as_.clone();
-    let mut sum = as_;
+    let mut sum = as_.clone();
     let mut k = 1u64;
     loop {
         term = term
@@ -2668,12 +2871,21 @@ fn erf_series(a: &Float, w: u64) -> Float {
         sum = sum.add(&term);
         k += 1;
     }
-    let s = Float::round_raw(false, sum, -(n as i64), n, NEAR).0;
-    // erf = (2/√π)·e^{−a²}·S.
-    let sqrtpi = pi_at(n).sqrt(n, NEAR);
-    let factor = iflt(2, n).div(&sqrtpi, n, NEAR);
-    let em = a.mul(a, n, NEAR).neg().exp(n, NEAR);
-    factor.mul(&em, n, NEAR).mul(&s, n, NEAR).round(w, NEAR)
+    sum
+}
+
+/// The Kummer sum by rectangular splitting: bracket `Σ z^k/∏(2j+1)` on
+/// `z = 2a²` (`p=1, q(k)=2k+1`, non-alternating), then `sum = a·bracket`.
+fn erf_kummer_sum_rect(as_: &Nat, n: u64) -> Nat {
+    let z = as_.square().shr(n).shl(1); // 2a² · 2ⁿ
+    if z.is_zero() {
+        return as_.clone(); // a so tiny the sum collapses to its first term
+    }
+    let t = series_term_count(&z, n, |_| 1, |k| 2 * k + 1);
+    let c = rect_block_width(t);
+    let powers = scaled_powers(&z, n, c);
+    let bracket = power_series_rect(n, c, &powers, false, false, |_| 1, |k| 2 * k + 1);
+    as_.mul(&bracket).shr(n)
 }
 
 /// `erfc(a)` for `a > 0` via the continued fraction (DLMF 7.9.3)
@@ -3771,6 +3983,252 @@ mod sin_cos_rect_tests {
                 tr * 1e3,
                 ts / tr
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod transc_rect_tests {
+    extern crate std;
+    use std::println;
+
+    use super::*;
+    use crate::RoundingMode::{AwayFromZero, Nearest, TowardNegative, TowardPositive, TowardZero};
+
+    const MODES: [RoundingMode; 5] = [
+        Nearest,
+        TowardZero,
+        TowardPositive,
+        TowardNegative,
+        AwayFromZero,
+    ];
+
+    fn bit_identical(a: &Float, b: &Float) -> bool {
+        a.repr == b.repr && a.precision == b.precision
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        /// A positive fraction `num/den ∈ (0, 1)` at precision `p` (`den ≥ 2`);
+        /// strictly below 1 so the odd series (which diverge at `x = 1`)
+        /// converge.
+        fn frac(&mut self, p: u64, den: u64) -> Float {
+            let num = 1 + self.next() % (den - 1);
+            Float::from_int(&Int::from_u64(num), p, NEAR).div(
+                &Float::from_int(&Int::from_u64(den), p, NEAR),
+                p,
+                NEAR,
+            )
+        }
+    }
+
+    /// Correctly-rounded value of a raw series through the shared Ziv wrapper.
+    fn crr(prec: u64, mode: RoundingMode, f: impl Fn(u64) -> Float) -> Float {
+        Float::ziv(prec, mode, f)
+    }
+
+    /// exp(r) for small |r| < 1, forcing the rectangular or term-by-term sum.
+    fn exp_small(r: &Float, prec: u64, mode: RoundingMode, rect: bool) -> Float {
+        crr(prec, mode, |w| {
+            let rs = scaled_int(r, w as i64);
+            let sum = if rect {
+                exp_taylor_sum_rect(&rs, w)
+            } else {
+                exp_taylor_sum_simple(&rs, w)
+            };
+            Float::round_raw(false, sum.magnitude(), -(w as i64), w, NEAR).0
+        })
+    }
+
+    /// The erf Kummer pre-factor sum a·Σ…, forcing the path.
+    fn erf_kummer(a: &Float, prec: u64, mode: RoundingMode, rect: bool) -> Float {
+        crr(prec, mode, |w| {
+            let as_ = scaled_int(a, w as i64).magnitude();
+            let sum = if rect {
+                erf_kummer_sum_rect(&as_, w)
+            } else {
+                erf_kummer_sum_simple(&as_, w)
+            };
+            Float::round_raw(false, sum, -(w as i64), w, NEAR).0
+        })
+    }
+
+    fn differential(precisions: &[u64], per_prec: usize) {
+        differential_modes(precisions, per_prec, &MODES);
+    }
+
+    fn differential_modes(precisions: &[u64], per_prec: usize, modes: &[RoundingMode]) {
+        let mut rng = Rng(0x0bad_c0de_1234_5678);
+        for &p in precisions {
+            for _ in 0..per_prec {
+                for &mode in modes {
+                    // atanh: x ∈ (0, 1/3); atan: x ∈ (0, 1/4).
+                    let xa = rng.frac(p + 96, 3);
+                    let s = crr(p, mode, |w| atanh_series_simple(&xa, w));
+                    let r = crr(p, mode, |w| odd_series_rect(&xa, w, false));
+                    assert!(bit_identical(&s, &r), "atanh p={p} mode={mode:?}");
+                    let xt = rng.frac(p + 96, 4);
+                    let s = crr(p, mode, |w| atan_series_simple(&xt, w));
+                    let r = crr(p, mode, |w| odd_series_rect(&xt, w, true));
+                    assert!(bit_identical(&s, &r), "atan p={p} mode={mode:?}");
+                    // exp: r ∈ (−1, 1), scaled small to mirror the reduced argument.
+                    let mut re = rng.frac(p + 96, 1 << 20).scale_pow2(-1);
+                    if rng.next() & 1 == 0 {
+                        re = re.neg();
+                    }
+                    let s = exp_small(&re, p, mode, false);
+                    let r = exp_small(&re, p, mode, true);
+                    assert!(bit_identical(&s, &r), "exp p={p} mode={mode:?}");
+                    // erf pre-factor: a ∈ (0, 3).
+                    let a = rng.frac(p + 96, 3000).mul(
+                        &Float::from_int(&Int::from_i64(3), p + 96, NEAR),
+                        p + 96,
+                        NEAR,
+                    );
+                    let s = erf_kummer(&a, p, mode, false);
+                    let r = erf_kummer(&a, p, mode, true);
+                    assert!(bit_identical(&s, &r), "erf p={p} mode={mode:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rect_matches_simple_fast() {
+        // The rect and simple series are compared directly (not via the
+        // threshold dispatch), so modest precisions already exercise every
+        // rect block path (C ≥ 2); heavier straddles live in the ignored test.
+        differential(&[256, 640, 1200], 2);
+    }
+
+    #[test]
+    #[ignore = "heavy: run with --release --ignored"]
+    fn rect_matches_simple_heavy() {
+        // All five rounding modes, straddling every crossover (1536 odd,
+        // 2048 erf, 3072 exp) and well beyond.
+        differential(&[1536, 2048, 3072, 4096, 12000, 48000], 3);
+    }
+
+    #[test]
+    fn known_values() {
+        let p = 4096; // above every crossover → exercises the rect paths
+        let n = Nearest;
+        // exp(1) = e; ln(e) = 1.
+        let e = iflt(1, p).exp(p, n);
+        assert!(bit_identical(&e.ln(p, n), &iflt(1, p)));
+        // atan(1) = π/4.
+        let at1 = iflt(1, p).atan(p, n);
+        let pi4 = Float::pi(p, n).scale_pow2(-2);
+        assert!(at1.sub(&pi4, p, n).abs() < rflt(1, 1i64 << 60, p));
+        // ln(e^x) = x for a generic x (drives atanh).
+        let x = rflt(7, 10, p);
+        assert!(x.exp(p, n).ln(p, n).sub(&x, p, n).abs() < rflt(1, 1i64 << 60, p));
+        // erf(0) = 0, erf(1) known.
+        assert!(Float::zero(p).erf(p, n).is_zero());
+        let erf1 = iflt(1, p).erf(p, n);
+        assert!(erf1 > rflt(842, 1000, p) && erf1 < rflt(843, 1000, p));
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored bench_transc_rect --nocapture"]
+    fn bench_transc_rect() {
+        use std::time::Instant;
+        fn t(iters: u32, mut f: impl FnMut()) -> f64 {
+            f();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let s = Instant::now();
+                for _ in 0..iters {
+                    f();
+                }
+                best = best.min(s.elapsed().as_secs_f64() / iters as f64);
+            }
+            best
+        }
+        let widths = [
+            256u64, 512, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 65536,
+        ];
+        for &w in &widths {
+            let iters: u32 = if w <= 1024 {
+                200
+            } else if w <= 4096 {
+                40
+            } else if w <= 16384 {
+                8
+            } else {
+                2
+            };
+            // atanh at x = 1/3, atan at x = 1/4 (worst-case series length).
+            let xa = rflt(1, 3, w + 96);
+            let xt = rflt(1, 4, w + 96);
+            let re = rflt(1, 3, w + 96); // exp reduced arg ~ ln2/2
+            let a = rflt(3, 2, w + 96); // erf argument
+            let rows: [(&str, f64, f64); 4] = [
+                (
+                    "atanh",
+                    t(iters, || {
+                        std::hint::black_box(atanh_series_simple(&xa, w));
+                    }),
+                    t(iters, || {
+                        std::hint::black_box(odd_series_rect(&xa, w, false));
+                    }),
+                ),
+                (
+                    "atan ",
+                    t(iters, || {
+                        std::hint::black_box(atan_series_simple(&xt, w));
+                    }),
+                    t(iters, || {
+                        std::hint::black_box(odd_series_rect(&xt, w, true));
+                    }),
+                ),
+                (
+                    "exp  ",
+                    {
+                        let rs = scaled_int(&re, (w + 16) as i64);
+                        t(iters, || {
+                            std::hint::black_box(exp_taylor_sum_simple(&rs, w + 16));
+                        })
+                    },
+                    {
+                        let rs = scaled_int(&re, (w + 16) as i64);
+                        t(iters, || {
+                            std::hint::black_box(exp_taylor_sum_rect(&rs, w + 16));
+                        })
+                    },
+                ),
+                (
+                    "erf  ",
+                    {
+                        let as_ = scaled_int(&a, (w + 32) as i64).magnitude();
+                        t(iters, || {
+                            std::hint::black_box(erf_kummer_sum_simple(&as_, w + 32));
+                        })
+                    },
+                    {
+                        let as_ = scaled_int(&a, (w + 32) as i64).magnitude();
+                        t(iters, || {
+                            std::hint::black_box(erf_kummer_sum_rect(&as_, w + 32));
+                        })
+                    },
+                ),
+            ];
+            for (name, ts, tr) in rows {
+                println!(
+                    "{name}  w={w:>6}   simple {:>9.4}ms   rect {:>9.4}ms   {:>5.2}x",
+                    ts * 1e3,
+                    tr * 1e3,
+                    ts / tr
+                );
+            }
         }
     }
 }

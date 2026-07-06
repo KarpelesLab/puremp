@@ -12,15 +12,60 @@ use core::fmt;
 use alloc::rc::Rc;
 
 use crate::int::Int;
-use crate::nat::{Nat, Reciprocal};
+use crate::nat::{MontCtx, Nat, Reciprocal};
 
-/// The shared modulus context (modulus + precomputed reciprocal).
-struct Ring {
-    modulus: Nat,
-    recip: Reciprocal,
+/// How a ring reduces products: Montgomery for odd moduli (values are held in
+/// Montgomery form `x·R mod m`), Barrett for even ones (values are the plain
+/// canonical residue `x mod m`).
+enum Backend {
+    /// Even modulus: no Montgomery. Stored value is the canonical residue.
+    Barrett(Reciprocal),
+    /// Odd modulus: stored value is the Montgomery representative `x·R mod m`.
+    Mont(MontCtx),
 }
 
-/// An element of `ℤ/mℤ`, represented by its canonical residue in `[0, m)`.
+/// The shared modulus context (modulus + the reduction backend).
+struct Ring {
+    modulus: Nat,
+    backend: Backend,
+}
+
+impl Ring {
+    /// Builds the shared ring for modulus `m >= 2`, choosing Montgomery for odd
+    /// `m` and Barrett for even `m`.
+    fn new(m: Nat) -> Ring {
+        let backend = if m.is_even() {
+            Backend::Barrett(Reciprocal::new(&m))
+        } else {
+            Backend::Mont(MontCtx::new(&m))
+        };
+        Ring {
+            modulus: m,
+            backend,
+        }
+    }
+
+    /// Maps a canonical residue in `[0, m)` to the ring's internal stored form
+    /// (Montgomery representative for odd `m`, identity for even `m`).
+    fn encode(&self, residue: Nat) -> Nat {
+        match &self.backend {
+            Backend::Barrett(_) => residue,
+            Backend::Mont(ctx) => ctx.to_mont(&residue),
+        }
+    }
+
+    /// Maps an internal stored value back to its canonical residue in `[0, m)`.
+    fn decode(&self, value: &Nat) -> Nat {
+        match &self.backend {
+            Backend::Barrett(_) => value.clone(),
+            Backend::Mont(ctx) => ctx.to_residue(value),
+        }
+    }
+}
+
+/// An element of `ℤ/mℤ`. Its canonical residue lives in `[0, m)`; internally the
+/// value is held in Montgomery form for odd moduli (so `*`/`pow` skip the
+/// separate reduction) and as the plain residue for even moduli.
 #[derive(Clone)]
 pub struct ModInt {
     value: Nat,
@@ -32,39 +77,36 @@ impl ModInt {
     pub fn new(value: Int, modulus: Int) -> ModInt {
         assert!(modulus > Int::ONE, "ModInt: modulus must be >= 2");
         let m = modulus.magnitude();
-        let ring = Rc::new(Ring {
-            recip: Reciprocal::new(&m),
-            modulus: m,
-        });
+        let ring = Rc::new(Ring::new(m));
         let residue = value.rem_euclid(&modulus).magnitude();
         ModInt {
-            value: residue,
+            value: ring.encode(residue),
             ring,
         }
     }
 
     /// Builds another residue in the *same* ring as `self` (sharing the modulus
-    /// and its precomputed reciprocal).
+    /// and its precomputed reduction backend).
     pub fn of(&self, value: Int) -> ModInt {
         let residue = value
             .rem_euclid(&Int::from(self.ring.modulus.clone()))
             .magnitude();
         ModInt {
-            value: residue,
+            value: self.ring.encode(residue),
             ring: self.ring.clone(),
         }
     }
 
     /// Returns the canonical residue in `[0, m)`.
     #[inline]
-    pub fn residue(&self) -> &Nat {
-        &self.value
+    pub fn residue(&self) -> Nat {
+        self.ring.decode(&self.value)
     }
 
     /// Returns the residue as an [`Int`] in `[0, m)`.
     #[inline]
     pub fn to_int(&self) -> Int {
-        Int::from(self.value.clone())
+        Int::from(self.ring.decode(&self.value))
     }
 
     /// Returns the modulus.
@@ -121,7 +163,11 @@ impl ModInt {
     /// Returns `self · rhs`.
     pub fn mul(&self, rhs: &ModInt) -> ModInt {
         self.same_ring(rhs);
-        self.wrap(self.ring.recip.reduce(&self.value.mul(&rhs.value)))
+        let v = match &self.ring.backend {
+            Backend::Barrett(recip) => recip.reduce(&self.value.mul(&rhs.value)),
+            Backend::Mont(ctx) => ctx.mul(&self.value, &rhs.value),
+        };
+        self.wrap(v)
     }
 
     /// Returns `-self`.
@@ -135,8 +181,16 @@ impl ModInt {
 
     /// Returns the modular inverse `self⁻¹`, or `None` if `gcd(self, m) != 1`.
     pub fn inv(&self) -> Option<ModInt> {
-        let inv = self.to_int().modinv(&self.modulus())?;
-        Some(self.wrap(inv.magnitude()))
+        match &self.ring.backend {
+            // Barrett/even: the stored value is the true residue; invert directly.
+            Backend::Barrett(_) => {
+                let inv = self.to_int().modinv(&self.modulus())?;
+                Some(self.wrap(inv.magnitude()))
+            }
+            // Montgomery/odd: invert in the Montgomery domain (stored form → stored
+            // form) without converting out and back in.
+            Backend::Mont(ctx) => Some(self.wrap(ctx.inv(&self.value)?)),
+        }
     }
 
     /// Returns `self / rhs = self · rhs⁻¹`. Panics if `rhs` is not invertible.
@@ -152,7 +206,11 @@ impl ModInt {
                 .expect("ModInt::pow: base not invertible for a negative exponent")
                 .pow(&exp.abs());
         }
-        self.wrap(self.value.modpow(&exp.magnitude(), &self.ring.modulus))
+        let v = match &self.ring.backend {
+            Backend::Barrett(_) => self.value.modpow(&exp.magnitude(), &self.ring.modulus),
+            Backend::Mont(ctx) => ctx.pow(&self.value, &exp.magnitude()),
+        };
+        self.wrap(v)
     }
 }
 
@@ -166,13 +224,13 @@ impl Eq for ModInt {}
 
 impl fmt::Display for ModInt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.value, f)
+        fmt::Display::fmt(&self.residue(), f)
     }
 }
 
 impl fmt::Debug for ModInt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ModInt({} mod {})", self.value, self.ring.modulus)
+        write!(f, "ModInt({} mod {})", self.residue(), self.ring.modulus)
     }
 }
 

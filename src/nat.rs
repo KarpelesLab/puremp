@@ -889,6 +889,9 @@ pub(crate) struct MontCtx {
     n0inv: Limb,
     /// `R² mod m`; converts a residue into Montgomery form via one `mont_mul`.
     r2: Nat,
+    /// `R³ mod m`; turns the integer inverse of a Montgomery representative back
+    /// into Montgomery form with a single `mont_mul` (see [`MontCtx::inv`]).
+    r3: Nat,
     /// `R mod m` — the Montgomery form of `1`.
     one: Nat,
 }
@@ -902,12 +905,14 @@ impl MontCtx {
         let n0inv = inv_mod_2_64(m[0]).wrapping_neg();
         let r = Nat::one().shl(k as u64 * LIMB_BITS as u64);
         let r2 = r.mul(&r).div_rem(modulus).expect("non-zero").1;
+        let r3 = r2.mul(&r).div_rem(modulus).expect("non-zero").1;
         let one = mont_mul(&Nat::one(), &r2, &m, n0inv);
         MontCtx {
             m,
             modulus: modulus.clone(),
             n0inv,
             r2,
+            r3,
             one,
         }
     }
@@ -976,6 +981,32 @@ impl MontCtx {
                 .checked_sub(&b.checked_sub(a).expect("b > a"))
                 .expect("difference < m")
         }
+    }
+
+    /// `base^exp` (Montgomery form → Montgomery form): the Montgomery
+    /// representative raised to `exp`, via a windowed square-and-multiply that
+    /// stays entirely in Montgomery form. `base` must be a reduced Montgomery
+    /// representative (`< m`).
+    pub(crate) fn pow(&self, base: &Nat, exp: &Nat) -> Nat {
+        modpow_windowed(base.clone(), self.one.clone(), exp, |a, b| {
+            if core::ptr::eq(a, b) {
+                mont_sqr(a, &self.m, self.n0inv)
+            } else {
+                mont_mul(a, b, &self.m, self.n0inv)
+            }
+        })
+    }
+
+    /// Montgomery-domain inverse: given `u = a·R mod m`, returns `a⁻¹·R mod m`
+    /// (the Montgomery form of the modular inverse), or `None` when
+    /// `gcd(a, m) ≠ 1`.
+    ///
+    /// The integer inverse of the representative is `(a·R)⁻¹ = a⁻¹·R⁻¹`; one
+    /// `mont_mul` by `R³` maps it back into Montgomery form
+    /// (`a⁻¹R⁻¹ · R³ · R⁻¹ = a⁻¹R`), avoiding a separate convert-out/convert-in.
+    pub(crate) fn inv(&self, u: &Nat) -> Option<Nat> {
+        let inv = Int::from(u.clone()).modinv(&Int::from(self.modulus.clone()))?;
+        Some(mont_mul(&inv.magnitude(), &self.r3, &self.m, self.n0inv))
     }
 }
 
@@ -4915,6 +4946,109 @@ mod tests {
             }
             let th = t1.elapsed().as_secs_f64() * 1e3 / reps as f64;
             println!("{limbs:>8} {tl:>13.3} {th:>13.3} {:>9.2}", tl / th);
+        }
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run with --release --ignored"]
+    fn montgomery_vs_barrett_modint_bench() {
+        use std::hint::black_box;
+        use std::println;
+        use std::time::Instant;
+        // Deterministic random odd Nat of `bits` bits (top bit set, low bit set).
+        let mk = |bits: usize, seed: u64| {
+            let k = bits.div_ceil(LIMB_BITS as usize);
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            let mut limbs = alloc::vec::Vec::with_capacity(k);
+            for _ in 0..k {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                limbs.push(s as Limb);
+            }
+            let top = (bits - 1) % LIMB_BITS as usize;
+            limbs[k - 1] |= 1 << top; // ensure exactly `bits` bits
+            limbs[0] |= 1; // odd
+            Nat::from_limbs(&limbs)
+        };
+        println!(
+            "{:>6} {:>8} {:>12} {:>12} {:>9}   {:>12} {:>12} {:>9}",
+            "bits",
+            "limbs",
+            "mul-bar(ns)",
+            "mul-mont(ns)",
+            "speedup",
+            "pow-bar(ms)",
+            "pow-mont(ms)",
+            "speedup"
+        );
+        for &bits in &[64usize, 256, 1024, 4096] {
+            let m = mk(bits, 0x11 ^ bits as u64);
+            let a0 = mk(bits, 0x22 ^ bits as u64).div_rem(&m).unwrap().1;
+            let b0 = mk(bits, 0x33 ^ bits as u64).div_rem(&m).unwrap().1;
+
+            // --- mul: Barrett reduce vs resident Montgomery mul ---
+            let recip = Reciprocal::new(&m);
+            let ctx = MontCtx::new(&m);
+            let am = ctx.to_mont(&a0);
+            let bm = ctx.to_mont(&b0);
+            let reps: usize = if bits <= 256 {
+                200_000
+            } else if bits <= 1024 {
+                20_000
+            } else {
+                2_000
+            };
+            // Chain each product back in to defeat the optimizer.
+            let t0 = Instant::now();
+            let mut a = a0.clone();
+            for _ in 0..reps {
+                a = recip.reduce(&a.mul(&b0));
+            }
+            black_box(&a);
+            let tb = t0.elapsed().as_secs_f64() * 1e9 / reps as f64;
+            let t1 = Instant::now();
+            let mut a = am.clone();
+            for _ in 0..reps {
+                a = ctx.mul(&a, &bm);
+            }
+            black_box(&a);
+            let tm = t1.elapsed().as_secs_f64() * 1e9 / reps as f64;
+
+            // --- pow: Barrett modpow vs Montgomery modpow (same odd modulus) ---
+            let e = mk(bits, 0x44 ^ bits as u64);
+            let preps: usize = if bits <= 256 {
+                2000
+            } else if bits <= 1024 {
+                200
+            } else {
+                20
+            };
+            let rb = a0.modpow_barrett(&e, &m);
+            let rm = a0.modpow_montgomery(&e, &m);
+            assert_eq!(rb, rm, "pow mismatch at {bits} bits");
+            let t2 = Instant::now();
+            for _ in 0..preps {
+                black_box(a0.modpow_barrett(&e, &m));
+            }
+            let pb = t2.elapsed().as_secs_f64() * 1e3 / preps as f64;
+            let t3 = Instant::now();
+            for _ in 0..preps {
+                black_box(a0.modpow_montgomery(&e, &m));
+            }
+            let pm = t3.elapsed().as_secs_f64() * 1e3 / preps as f64;
+
+            println!(
+                "{:>6} {:>8} {:>12.2} {:>12.2} {:>9.2}   {:>12.4} {:>12.4} {:>9.2}",
+                bits,
+                m.limbs.len(),
+                tb,
+                tm,
+                tb / tm,
+                pb,
+                pm,
+                pb / pm
+            );
         }
     }
 

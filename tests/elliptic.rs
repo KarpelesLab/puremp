@@ -262,3 +262,64 @@ fn rational_curve_doublings() {
     // (-2)P = -(2P).
     assert_eq!(p.scalar_mul(&Int::from(-2)), -&p2);
 }
+
+/// Timing benchmark: `EllipticCurve::<ModInt>::scalar_mul` over prime fields of
+/// several sizes. With `ModInt` Montgomery-resident for odd moduli this is the
+/// end-to-end effect on the group law; compare against a Barrett-only build by
+/// temporarily forcing the Barrett backend in `ModInt`'s ring setup.
+#[test]
+#[ignore = "timing benchmark; run with --release --ignored --nocapture"]
+fn scalar_mul_bench() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    // A pseudo-random prime of about `bits` bits (deterministic).
+    let prime = |bits: u32, seed: u64| {
+        let mut s = seed;
+        let words = bits.div_ceil(64) as usize;
+        let two64 = Int::from_u64(1u64 << 32) * Int::from_u64(1u64 << 32); // 2^64
+        let mut n = Int::ZERO;
+        for i in 0..words {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let mut w = s;
+            if i == words - 1 {
+                w |= 1u64 << ((bits - 1) % 64); // force ~`bits` bits (top bit set)
+            }
+            n = &n * &two64 + Int::from_u64(w);
+        }
+        n.next_prime()
+    };
+    println!("{:>6} {:>10} {:>14}", "bits", "scalars", "scalar_mul(ms)");
+    for &bits in &[64u32, 256, 1024] {
+        let p = prime(bits, 0xDEAD_BEEF ^ bits as u64);
+        let mk = |v: i64| ModInt::new(Int::from(v), p.clone());
+        let curve = EllipticCurve::new(mk(2), mk(3)).expect("non-singular");
+        // Find a base point by scanning x-coordinates.
+        let mut point = None;
+        for x in 1i64..1000 {
+            if let Some(pt) = curve.point_from_x(&mk(x)) {
+                point = Some(pt);
+                break;
+            }
+        }
+        let point = point.expect("a base point exists");
+        // A scalar of full field size.
+        let k = &p - Int::from(3);
+        let reps: usize = if bits <= 64 {
+            2000
+        } else if bits <= 256 {
+            300
+        } else {
+            20
+        };
+        // Warm / correctness sanity: result must be on the curve.
+        assert!(point.scalar_mul(&k).is_on_curve() || point.scalar_mul(&k).is_infinity());
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            black_box(point.scalar_mul(&k));
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        println!("{bits:>6} {reps:>10} {ms:>14.4}");
+    }
+}

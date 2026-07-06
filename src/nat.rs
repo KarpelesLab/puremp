@@ -2496,6 +2496,87 @@ impl Nat {
         nq.normalize();
         (nq, rem >> s)
     }
+
+    /// Single-limb remainder `self mod d` (`d != 0`) without materializing the
+    /// quotient. A Horner pass over the limbs using the host's 128-by-64 divide;
+    /// cheaper than [`Nat::divmod_small`] (no quotient allocation) and used by
+    /// the small-prime trial-division prefilter, where only divisibility matters.
+    #[inline]
+    fn rem_small(&self, d: Limb) -> Limb {
+        debug_assert!(d != 0, "rem_small by zero");
+        let mut rem: Limb = 0;
+        for &limb in self.limbs.iter().rev() {
+            rem = ((((rem as u128) << LIMB_BITS) | limb as u128) % d as u128) as Limb;
+        }
+        rem
+    }
+
+    /// Returns the value as a `u64` if it fits in a single limb, else `None`.
+    /// A cheap, allocation-free way to compare a `Nat` against a small constant.
+    #[inline]
+    fn as_u64(&self) -> Option<u64> {
+        match self.limbs.len() {
+            0 => Some(0),
+            1 => Some(self.limbs[0]),
+            _ => None,
+        }
+    }
+}
+
+/// Odd primes below 1000, used by the Baillie–PSW trial-division prefilter to
+/// reject the overwhelming majority of composites with a handful of single-limb
+/// remainders instead of a full Miller–Rabin + strong-Lucas test. The list is
+/// grouped on the fly into blocks whose product fits in a `u64`, so one
+/// big-integer remainder per block serves all its primes (since `p | M` implies
+/// `n mod p == (n mod M) mod p`). The 1000 bound was chosen empirically (see the
+/// `measure_prime_prefilter` bench); it clears ~84% of random odd composites,
+/// within ~6 points of the asymptotic ceiling, while a 10× larger bound costs
+/// far more per survivor for only a few points more.
+static SMALL_PRIMES: &[u32] = &[
+    3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+    101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193,
+    197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293, 307,
+    311, 313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383, 389, 397, 401, 409, 419, 421,
+    431, 433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541, 547,
+    557, 563, 569, 571, 577, 587, 593, 599, 601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659,
+    661, 673, 677, 683, 691, 701, 709, 719, 727, 733, 739, 743, 751, 757, 761, 769, 773, 787, 797,
+    809, 811, 821, 823, 827, 829, 839, 853, 857, 859, 863, 877, 881, 883, 887, 907, 911, 919, 929,
+    937, 941, 947, 953, 967, 971, 977, 983, 991, 997,
+];
+
+/// Trial-division prefilter for odd `n > 3`: probes divisibility by every prime
+/// in [`SMALL_PRIMES`]. Returns `Some(verdict)` when some small prime `p`
+/// divides `n` — `Some(true)` if `n == p` (so `n` is that prime), `Some(false)`
+/// otherwise (a proper factor, so composite). Returns `None` when no small prime
+/// divides `n`, in which case the caller must run the full test.
+///
+/// Primes are consumed in greedy blocks whose product stays within a `u64`, so
+/// only one big-integer remainder is taken per block.
+fn small_prime_verdict(n: &Nat) -> Option<bool> {
+    let mut i = 0;
+    while i < SMALL_PRIMES.len() {
+        // Grow a block product `m` (starts at 1) until the next prime would
+        // overflow a limb.
+        let start = i;
+        let mut m: Limb = 1;
+        while i < SMALL_PRIMES.len() {
+            match m.checked_mul(SMALL_PRIMES[i] as Limb) {
+                Some(v) => {
+                    m = v;
+                    i += 1;
+                }
+                None => break,
+            }
+        }
+        // n mod m; then n mod p = (n mod m) mod p for each p in the block.
+        let r = n.rem_small(m);
+        for &p in &SMALL_PRIMES[start..i] {
+            if r.is_multiple_of(p as Limb) {
+                return Some(n.as_u64() == Some(p as u64));
+            }
+        }
+    }
+    None
 }
 
 /// Möller–Granlund reciprocal of a normalized (top bit set) divisor:
@@ -2963,11 +3044,39 @@ impl Nat {
         if c.is_even() {
             c = c.add(&Nat::one()); // start at an odd candidate ≥ 3
         }
+        // Incremental small-prime residue sieve: residues[i] = c mod p_i, seeded
+        // once from the big candidate and then advanced by +2 per step with cheap
+        // single-limb arithmetic. A candidate with a small factor (residue 0) is
+        // skipped without a full test; survivors still go through `is_prime_bpsw`,
+        // which owns the verdict.
+        let mut residues: Vec<Limb> = SMALL_PRIMES
+            .iter()
+            .map(|&p| c.rem_small(p as Limb))
+            .collect();
         loop {
-            if c.is_prime_bpsw() {
+            let mut small_factor = false;
+            for (i, &p) in SMALL_PRIMES.iter().enumerate() {
+                if residues[i] == 0 {
+                    // c is divisible by p: prime only if c == p.
+                    if c.as_u64() == Some(p as u64) {
+                        return c;
+                    }
+                    small_factor = true;
+                    break;
+                }
+            }
+            if !small_factor && c.is_prime_bpsw() {
                 return c;
             }
             c = c.add(&two);
+            for (i, &p) in SMALL_PRIMES.iter().enumerate() {
+                let pl = p as Limb;
+                let mut r = residues[i] + 2;
+                if r >= pl {
+                    r -= pl;
+                }
+                residues[i] = r;
+            }
         }
     }
 
@@ -2985,14 +3094,39 @@ impl Nat {
         if c.is_even() {
             c = c.checked_sub(&Nat::one()).unwrap();
         }
+        // Incremental small-prime residue sieve, advanced by −2 per step (see
+        // `next_prime`). Survivors are gated on the unchanged `is_prime_bpsw`.
+        let mut residues: Vec<Limb> = SMALL_PRIMES
+            .iter()
+            .map(|&p| c.rem_small(p as Limb))
+            .collect();
         loop {
             if c.cmp_ref(&two) == Ordering::Less {
                 return Some(two);
             }
-            if c.is_prime_bpsw() {
+            let mut small_factor = false;
+            for (i, &p) in SMALL_PRIMES.iter().enumerate() {
+                if residues[i] == 0 {
+                    if c.as_u64() == Some(p as u64) {
+                        return Some(c);
+                    }
+                    small_factor = true;
+                    break;
+                }
+            }
+            if !small_factor && c.is_prime_bpsw() {
                 return Some(c);
             }
             c = c.checked_sub(&two).unwrap_or_else(Nat::zero);
+            for (i, &p) in SMALL_PRIMES.iter().enumerate() {
+                let pl = p as Limb;
+                // Advance residue by −2 modulo p: add p−2 then reduce.
+                let mut r = residues[i] + pl - 2;
+                if r >= pl {
+                    r -= pl;
+                }
+                residues[i] = r;
+            }
         }
     }
 
@@ -3010,6 +3144,13 @@ impl Nat {
         }
         if self.is_even() {
             return false;
+        }
+        // Small-prime trial division rejects the vast majority of composites
+        // with a few single-limb remainders, before the costly isqrt guard and
+        // Miller–Rabin + strong-Lucas test. It only ever *rejects* (or confirms
+        // `n` is itself a small prime); survivors fall through to the full test.
+        if let Some(verdict) = small_prime_verdict(self) {
+            return verdict;
         }
         // A perfect square is composite and would break the Lucas D search.
         let r = self.isqrt();
@@ -3916,6 +4057,173 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "measurement only: cargo test --release --all-features -- --ignored --nocapture measure_prime_prefilter"]
+    fn measure_prime_prefilter() {
+        use std::time::Instant;
+
+        // OLD is_prime_bpsw (no small-prime prefilter), to A/B against.
+        fn bpsw_no_prefilter(x: &Nat) -> bool {
+            let two = Nat::from_u64(2);
+            let three = Nat::from_u64(3);
+            if x.cmp_ref(&two) == Ordering::Less {
+                return false;
+            }
+            if x.cmp_ref(&three) != Ordering::Greater {
+                return true;
+            }
+            if x.is_even() {
+                return false;
+            }
+            let r = x.isqrt();
+            if r.square() == *x {
+                return false;
+            }
+            miller_rabin_witness(&two, x) && lucas_strong(x)
+        }
+
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mkodd = |bits: u64, f: &mut dyn FnMut() -> u64| -> Nat {
+            let limbs = bits.div_ceil(64) as usize;
+            let mut v: Vec<Limb> = (0..limbs).map(|_| f()).collect();
+            let top = ((bits - 1) % 64) as u32;
+            let last = v.len() - 1;
+            v[last] &= (1u64 << top) | ((1u64 << top) - 1); // keep within `bits`
+            v[last] |= 1u64 << top; // set the high bit
+            v[0] |= 1; // odd
+            let mut n = Nat { limbs: v };
+            n.normalize();
+            n
+        };
+
+        std::println!("--- is_prime_bpsw on random odd composites (500 samples) ---");
+        for &bits in &[64u64, 256, 1024, 4096] {
+            let samples: Vec<Nat> = (0..500).map(|_| mkodd(bits, &mut next)).collect();
+            let bench = |f: &dyn Fn(&Nat) -> bool| {
+                let mut best = core::time::Duration::MAX;
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    let mut acc = 0usize;
+                    for s in &samples {
+                        acc += f(s) as usize;
+                    }
+                    std::hint::black_box(acc);
+                    best = best.min(t.elapsed());
+                }
+                best
+            };
+            let old = bench(&bpsw_no_prefilter);
+            let new = bench(&|s| s.is_prime_bpsw());
+            let caught = samples
+                .iter()
+                .filter(|s| small_prime_verdict(s) == Some(false))
+                .count();
+            std::println!(
+                "bits={bits:<5} old={old:>12?} new={new:>12?} speedup={:.2}x  prefilter-caught={}/500",
+                old.as_secs_f64() / new.as_secs_f64(),
+                caught
+            );
+        }
+
+        std::println!("--- next_prime (old scan vs new sieve), 20 seeds each ---");
+        // OLD next_prime: odd scan gated on old bpsw (no prefilter, no sieve).
+        fn old_next_prime(x: &Nat) -> Nat {
+            let two = Nat::from_u64(2);
+            if x.cmp_ref(&two) == Ordering::Less {
+                return two;
+            }
+            let mut c = x.add(&Nat::one());
+            if c.is_even() {
+                c = c.add(&Nat::one());
+            }
+            loop {
+                // inline old bpsw
+                let three = Nat::from_u64(3);
+                let is_p = if c.cmp_ref(&two) == Ordering::Less {
+                    false
+                } else if c.cmp_ref(&three) != Ordering::Greater {
+                    true
+                } else if c.is_even() {
+                    false
+                } else {
+                    let r = c.isqrt();
+                    r.square() != c && miller_rabin_witness(&two, &c) && lucas_strong(&c)
+                };
+                if is_p {
+                    return c;
+                }
+                c = c.add(&two);
+            }
+        }
+        for &bits in &[64u64, 256, 1024] {
+            let seeds: Vec<Nat> = (0..20).map(|_| mkodd(bits, &mut next)).collect();
+            let bench = |f: &dyn Fn(&Nat) -> Nat| {
+                let mut best = core::time::Duration::MAX;
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    for s in &seeds {
+                        std::hint::black_box(f(s));
+                    }
+                    best = best.min(t.elapsed());
+                }
+                best
+            };
+            let old = bench(&old_next_prime);
+            let new = bench(&|s| s.next_prime());
+            std::println!(
+                "bits={bits:<5} old={old:>12?} new={new:>12?} speedup={:.2}x",
+                old.as_secs_f64() / new.as_secs_f64()
+            );
+        }
+
+        std::println!("--- prefilter rejection rate vs prime-count bound ---");
+        {
+            let samples: Vec<Nat> = (0..20_000).map(|_| mkodd(256, &mut next)).collect();
+            for &k in &[10usize, 25, 54, 100, 167] {
+                // Rejection rate using only the first k small primes.
+                let mut caught = 0usize;
+                for s in &samples {
+                    let mut hit = false;
+                    let mut i = 0;
+                    while i < k {
+                        let start = i;
+                        let mut m: Limb = 1;
+                        while i < k {
+                            match m.checked_mul(SMALL_PRIMES[i] as Limb) {
+                                Some(v) => {
+                                    m = v;
+                                    i += 1;
+                                }
+                                None => break,
+                            }
+                        }
+                        let r = s.rem_small(m);
+                        for &p in &SMALL_PRIMES[start..i] {
+                            if r.is_multiple_of(p as Limb) {
+                                hit = true;
+                            }
+                        }
+                        if hit {
+                            break;
+                        }
+                    }
+                    caught += hit as usize;
+                }
+                std::println!(
+                    "primes<={:<4} caught={:.1}%",
+                    SMALL_PRIMES[k - 1],
+                    100.0 * caught as f64 / samples.len() as f64
+                );
+            }
+        }
+    }
+
+    #[test]
     fn toom_direct_matches_schoolbook() {
         // Exercise the Toom-3 and Toom-4 code paths directly (independent of the
         // dispatch thresholds), differentially against schoolbook.
@@ -3965,6 +4273,121 @@ mod tests {
         assert!(!n("1000000005").is_prime_bpsw());
         for c in ["561", "1105", "1729", "2465", "2821", "6601", "62745"] {
             assert!(!n(c).is_prime_bpsw(), "carmichael {c}");
+        }
+    }
+
+    #[test]
+    fn prefilter_differential_exhaustive() {
+        // The small-prime trial-division prefilter must not change any verdict:
+        // over a large exhaustive range, `is_prime_bpsw` still agrees with pure
+        // trial division for every n (covers all small-prime residues, prime
+        // powers, and numbers equal to a small prime — the `n == p` edge).
+        fn trial(n: u64) -> bool {
+            if n < 2 {
+                return false;
+            }
+            let mut i = 2u64;
+            while i * i <= n {
+                if n.is_multiple_of(i) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        for m in 0u64..200_000 {
+            assert_eq!(
+                Nat::from_u64(m).is_prime_bpsw(),
+                trial(m),
+                "bpsw prefilter {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefilter_large_constructed() {
+        // Known verdicts on large numbers of each shape the prefilter must route
+        // correctly: primes (no small factor → full test), semiprimes and prime
+        // powers of large primes (no small factor → isqrt/MR/Lucas rejects),
+        // composites with a small factor (prefilter rejects), and Carmichaels.
+        let large_primes = [
+            "1000000007",
+            "170141183460469231731687303715884105727", // 2^127 − 1
+            "2305843009213693951",                     // 2^61 − 1
+            "618970019642690137449562111",             // 2^89 − 1
+        ];
+        for p in large_primes {
+            assert!(n(p).is_prime_bpsw(), "prime {p}");
+        }
+        // Semiprimes of two large primes (no small factor).
+        let a = n("1000000007");
+        let b = n("2305843009213693951");
+        assert!(!a.mul(&b).is_prime_bpsw(), "large semiprime");
+        // Prime power of a large prime (no small factor, not a perfect square
+        // for odd exponent; the cube here still fails MR/Lucas).
+        assert!(!a.mul(&a).mul(&a).is_prime_bpsw(), "large prime cube");
+        // Perfect square of a large prime (exercises the isqrt guard).
+        assert!(!a.mul(&a).is_prime_bpsw(), "large prime square");
+        // Large composite with a small factor 3·(2^127−1).
+        let m127 = n("170141183460469231731687303715884105727");
+        assert!(!Nat::from_u64(3).mul(&m127).is_prime_bpsw(), "3·(2^127−1)");
+        // Big Carmichael numbers.
+        for c in ["162401", "410041", "1024651", "9746347772161"] {
+            assert!(!n(c).is_prime_bpsw(), "carmichael {c}");
+        }
+    }
+
+    #[test]
+    fn next_prev_prime_match_scan() {
+        // The incremental residue sieve in next_prime/prev_prime must return
+        // exactly what a naive candidate scan gated on the (authoritative,
+        // unchanged) is_prime_bpsw would — for a dense small range and for a few
+        // large seeds where a skipped prime would be visible.
+        fn scan_next(x: &Nat) -> Nat {
+            let two = Nat::from_u64(2);
+            if x.cmp_ref(&two) == Ordering::Less {
+                return two;
+            }
+            let mut c = x.add(&Nat::one());
+            if c.is_even() {
+                c = c.add(&Nat::one());
+            }
+            while !c.is_prime_bpsw() {
+                c = c.add(&two);
+            }
+            c
+        }
+        fn scan_prev(x: &Nat) -> Option<Nat> {
+            let two = Nat::from_u64(2);
+            if x.cmp_ref(&two) != Ordering::Greater {
+                return None;
+            }
+            let mut c = x.checked_sub(&Nat::one()).unwrap();
+            loop {
+                if c.cmp_ref(&two) == Ordering::Less {
+                    return Some(two);
+                }
+                if c.is_prime_bpsw() {
+                    return Some(c);
+                }
+                c = c.checked_sub(&Nat::one()).unwrap_or_else(Nat::zero);
+            }
+        }
+        for m in 0u64..5_000 {
+            let x = Nat::from_u64(m);
+            assert_eq!(x.next_prime(), scan_next(&x), "next_prime {m}");
+            assert_eq!(x.prev_prime(), scan_prev(&x), "prev_prime {m}");
+        }
+        // Large seeds across bit sizes.
+        for s in [
+            "1000000000000",
+            "18446744073709551616",                    // 2^64
+            "340282366920938463463374607431768211456", // 2^128
+            "123456789012345678901234567890",
+        ] {
+            let x = n(s);
+            assert_eq!(x.next_prime(), scan_next(&x), "next_prime large {s}");
+            assert_eq!(x.prev_prime(), scan_prev(&x), "prev_prime large {s}");
         }
     }
 

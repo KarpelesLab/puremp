@@ -136,6 +136,14 @@ name = "galois_bench"
 required-features=["std","poly","galois"]
 
 [[example]]
+name = "rational_xreduce_bench"
+required-features=["std","rational"]
+
+[[example]]
+name = "rational_e2e_bench"
+required-features=["std","rational","matrix"]
+
+[[example]]
 name = "bench"
 required-features = ["std", "float"]
 

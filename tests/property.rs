@@ -86,6 +86,112 @@ fn dyadic_exact_ring_and_homomorphism() {
 }
 
 #[test]
+fn rational_cross_reduction_differential() {
+    // Differential check of the cross-reduced `add`/`sub`/`mul`/`div`/`addmul`
+    // against the naive "full product then a single gcd" reference, which is
+    // exactly what `Rational::new` does. Canonical form is unique, so a correct
+    // faster path must return the *identical* (num, den) for every input.
+    let mut rng = Rng::new(0x4A11);
+
+    // Reference (naive) operations built straight from the public `Int` API.
+    let ref_add = |a: &Rational, b: &Rational| {
+        Rational::new(
+            a.numerator()
+                .mul(b.denominator())
+                .add(&b.numerator().mul(a.denominator())),
+            a.denominator().mul(b.denominator()),
+        )
+    };
+    let ref_sub = |a: &Rational, b: &Rational| {
+        Rational::new(
+            a.numerator()
+                .mul(b.denominator())
+                .sub(&b.numerator().mul(a.denominator())),
+            a.denominator().mul(b.denominator()),
+        )
+    };
+    let ref_mul = |a: &Rational, b: &Rational| {
+        Rational::new(
+            a.numerator().mul(b.numerator()),
+            a.denominator().mul(b.denominator()),
+        )
+    };
+    let ref_div = |a: &Rational, b: &Rational| {
+        Rational::new(
+            a.numerator().mul(b.denominator()),
+            a.denominator().mul(b.numerator()),
+        )
+    };
+
+    // Build an Int of roughly `words * 64` bits with a random sign.
+    let big_int = |rng: &mut Rng, words: usize| {
+        let mut v = Int::ZERO;
+        let shift = Int::ONE.mul_2k(64);
+        for _ in 0..words.max(1) {
+            v = v.mul(&shift).add(&Int::from_u64(rng.next()));
+        }
+        if rng.next() & 1 == 0 { v.neg() } else { v }
+    };
+
+    // A grab-bag of generators: tiny, large, unit denominators, shared factors,
+    // and zeros — across all sign combinations (the sign comes from the ints).
+    let make = |rng: &mut Rng, kind: u64| -> Rational {
+        match kind % 6 {
+            0 => Rational::ZERO,
+            1 => rng.rational(50),                       // tiny fraction
+            2 => Rational::from_integer(rng.int(1_000)), // unit denominator
+            3 => {
+                let w = (rng.next() % 20) as usize + 1;
+                let n = big_int(rng, w);
+                let d = big_int(rng, w).abs().add(&Int::ONE);
+                Rational::new(n, d)
+            }
+            4 => {
+                // Shared factor between numerator and denominator (canonicalised
+                // away by `new`, but exercises cross-cancellation).
+                let (wg, wn, wd) = (
+                    (rng.next() % 8) as usize + 1,
+                    (rng.next() % 8) as usize + 1,
+                    (rng.next() % 8) as usize + 1,
+                );
+                let g = big_int(rng, wg).abs().add(&Int::ONE);
+                let n = big_int(rng, wn).mul(&g);
+                let d = big_int(rng, wd).abs().add(&Int::ONE).mul(&g);
+                Rational::new(n, d)
+            }
+            _ => {
+                // Numerator and denominator of very different sizes.
+                Rational::new(big_int(rng, 12), big_int(rng, 1).abs().add(&Int::ONE))
+            }
+        }
+    };
+
+    for i in 0..4000u64 {
+        let a = make(&mut rng, i);
+        let b = make(&mut rng, i / 6 + 1);
+
+        assert_eq!(a.add(&b), ref_add(&a, &b), "add mismatch: {a} + {b}");
+        assert_eq!(a.sub(&b), ref_sub(&a, &b), "sub mismatch: {a} - {b}");
+        assert_eq!(a.mul(&b), ref_mul(&a, &b), "mul mismatch: {a} * {b}");
+        if !b.is_zero() {
+            assert_eq!(a.div(&b), ref_div(&a, &b), "div mismatch: {a} / {b}");
+        }
+        // addmul / submul are `self ± a·b`; check against the reference chain.
+        let mut fma = a.clone();
+        fma.addmul(&a, &b);
+        assert_eq!(fma, ref_add(&a, &ref_mul(&a, &b)));
+        let mut fms = a.clone();
+        fms.submul(&a, &b);
+        assert_eq!(fms, ref_sub(&a, &ref_mul(&a, &b)));
+
+        // Exact byte-for-byte numerator/denominator identity (not just value).
+        let s = a.add(&b);
+        let r = ref_add(&a, &b);
+        assert!(s.numerator() == r.numerator() && s.denominator() == r.denominator());
+    }
+}
+
+#[test]
 fn mod_int_differential_vs_int() {
     use puremp::ModInt;
     let mut rng = Rng::new(0x110D);

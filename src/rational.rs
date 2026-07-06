@@ -185,27 +185,121 @@ impl Rational {
         Rational::normalize(self.den.clone(), self.num.clone())
     }
 
+    /// Divides `x` by `g` exactly, but skips the division when `g == 1` (the
+    /// common outcome of the cross-reduction gcds — dividing by a unit is pure
+    /// overhead). `g` must be a positive divisor of `x`.
+    #[inline]
+    fn div_by_gcd(x: &Int, g: &Int) -> Int {
+        if g.is_one() {
+            x.clone()
+        } else {
+            x.div_exact(g)
+        }
+    }
+
+    /// Returns `true` when both numerator and denominator are small enough that
+    /// the extra cross-reduction gcds cost more than the single gcd over the full
+    /// product would. Used to gate the `mul`/`div` cross-cancellation, whose win
+    /// only materialises once the operands are sizeable (`add`/`sub` cross-reduce
+    /// unconditionally, as they win even for tiny fractions).
+    #[inline]
+    fn is_small(&self) -> bool {
+        const SMALL_BITS: u32 = 128;
+        self.num.bit_len() <= SMALL_BITS && self.den.bit_len() <= SMALL_BITS
+    }
+
     /// Returns `self + rhs`.
+    #[inline]
     pub fn add(&self, rhs: &Rational) -> Rational {
-        let num = self.num.mul(&rhs.den).add(&rhs.num.mul(&self.den));
-        let den = self.den.mul(&rhs.den);
-        Rational::normalize(num, den)
+        self.add_sub(rhs, false)
     }
 
     /// Returns `self - rhs`.
+    #[inline]
     pub fn sub(&self, rhs: &Rational) -> Rational {
-        self.add(&rhs.neg())
+        self.add_sub(rhs, true)
+    }
+
+    /// Shared core of `add`/`sub` using Henrici's gcd-of-denominators reduction:
+    /// with `a/b ± c/d` (`b, d > 0`), let `g1 = gcd(b, d)` and
+    /// `t = a·(d/g1) ± c·(b/g1)`; then the reduced result is `(t/g2) / (den/g2)`
+    /// where `den = b·(d/g1) = lcm(b, d)` and `g2 = gcd(|t|, g1)`. This keeps the
+    /// shared denominator factor out of the big cross product and shrinks both
+    /// gcds versus reducing `(a·d ± c·b)/(b·d)` as a whole. The canonical result
+    /// is identical to that of the naive path (canonical form is unique).
+    fn add_sub(&self, rhs: &Rational, subtract: bool) -> Rational {
+        if self.num.is_zero() {
+            return if subtract { rhs.neg() } else { rhs.clone() };
+        }
+        if rhs.num.is_zero() {
+            return self.clone();
+        }
+        let g1 = self.den.gcd(&rhs.den); // gcd(b, d) > 0
+        let d_over = Self::div_by_gcd(&rhs.den, &g1); // d / g1
+        let b_over = Self::div_by_gcd(&self.den, &g1); // b / g1
+        let ad = self.num.mul(&d_over);
+        let cb = rhs.num.mul(&b_over);
+        let t = if subtract { ad.sub(&cb) } else { ad.add(&cb) };
+        if t.is_zero() {
+            return Rational::ZERO;
+        }
+        let den = self.den.mul(&d_over); // b · (d/g1) = lcm(b, d) > 0
+        if g1.is_one() {
+            // Coprime denominators ⇒ `t` is already coprime with `den`.
+            return Rational { num: t, den };
+        }
+        let g2 = t.gcd(&g1); // the only remaining common factor divides g1
+        if g2.is_one() {
+            return Rational { num: t, den };
+        }
+        Rational {
+            num: t.div_exact(&g2),
+            den: den.div_exact(&g2),
+        }
     }
 
     /// Returns `self · rhs`.
     pub fn mul(&self, rhs: &Rational) -> Rational {
-        Rational::normalize(self.num.mul(&rhs.num), self.den.mul(&rhs.den))
+        if self.num.is_zero() || rhs.num.is_zero() {
+            return Rational::ZERO;
+        }
+        if self.is_small() && rhs.is_small() {
+            return Rational::normalize(self.num.mul(&rhs.num), self.den.mul(&rhs.den));
+        }
+        // Cross-cancel before multiplying: with `a/b · c/d`, cancel `gcd(|a|, d)`
+        // and `gcd(|c|, b)` so both products are formed from already-coprime
+        // factors — no final gcd over the full product is needed.
+        let g1 = self.num.gcd(&rhs.den);
+        let g2 = rhs.num.gcd(&self.den);
+        let num = Self::div_by_gcd(&self.num, &g1).mul(&Self::div_by_gcd(&rhs.num, &g2));
+        let den = Self::div_by_gcd(&self.den, &g2).mul(&Self::div_by_gcd(&rhs.den, &g1));
+        Rational { num, den } // den > 0; already in lowest terms
     }
 
     /// Returns `self / rhs`. Panics if `rhs` is zero.
     pub fn div(&self, rhs: &Rational) -> Rational {
         assert!(!rhs.is_zero(), "Rational::div: division by zero");
-        Rational::normalize(self.num.mul(&rhs.den), self.den.mul(&rhs.num))
+        if self.num.is_zero() {
+            return Rational::ZERO;
+        }
+        if self.is_small() && rhs.is_small() {
+            return Rational::normalize(self.num.mul(&rhs.den), self.den.mul(&rhs.num));
+        }
+        // `self / rhs = (a·d)/(b·c)`; cross-cancel `gcd(|a|, |c|)` and
+        // `gcd(d, b)` (`b, d > 0`) before multiplying. `c` may be negative, so
+        // the denominator sign is fixed up to keep `den > 0`.
+        let g1 = self.num.gcd(&rhs.num);
+        let g2 = rhs.den.gcd(&self.den);
+        let num = Self::div_by_gcd(&self.num, &g1).mul(&Self::div_by_gcd(&rhs.den, &g2));
+        let den = Self::div_by_gcd(&self.den, &g2).mul(&Self::div_by_gcd(&rhs.num, &g1));
+        if den.is_negative() {
+            Rational {
+                num: num.neg(),
+                den: den.neg(),
+            }
+        } else {
+            Rational { num, den }
+        }
     }
 
     /// Returns the remainder `self − rhs·trunc(self/rhs)` (the truncated-division

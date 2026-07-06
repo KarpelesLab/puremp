@@ -2335,11 +2335,29 @@ fn sin_cos_at(x: &Float, w: u64) -> (Float, Float) {
     }
 }
 
+/// Working precisions at or above this use the rectangular (baby-step/giant-step)
+/// series [`sin_cos_series_rect`]; below it the term-by-term [`sin_cos_series_simple`]
+/// wins (its per-term bookkeeping is cheaper than the rectangular block setup).
+/// Chosen from the crossover measured by the `bench_sin_cos_rect` harness
+/// (≈1.0× at 1024 bits, growing to ~9× at 64k).
+const SIN_COS_RECT_THRESHOLD: u64 = 1024;
+
+/// `(sin r, cos r)` for `|r| ≤ π/4` at precision `w`. Dispatches to the O(√T)
+/// rectangular series at high precision and the O(T) term-by-term series below
+/// the crossover; both are correctly-rounded through the same Ziv wrapper.
+fn sin_cos_series(r: &Float, w: u64) -> (Float, Float) {
+    if w >= SIN_COS_RECT_THRESHOLD {
+        sin_cos_series_rect(r, w)
+    } else {
+        sin_cos_series_simple(r, w)
+    }
+}
+
 /// `(sin r, cos r)` by Taylor series for small `|r| ≤ π/4`, at precision `w`,
 /// in scaled integer arithmetic (see [`atanh_series`]). Handles the sign of
 /// `r` explicitly: both sums run on `z = r² ≥ 0`, whose alternating partial
 /// sums stay non-negative.
-fn sin_cos_series(r: &Float, w: u64) -> (Float, Float) {
+fn sin_cos_series_simple(r: &Float, w: u64) -> (Float, Float) {
     if r.is_zero() {
         // Exact: sin(±0) = ±0, cos(0) = 1.
         return (r.round(w, NEAR), iflt(1, w));
@@ -2405,6 +2423,138 @@ fn sin_cos_series(r: &Float, w: u64) -> (Float, Float) {
         r.mul(&bracket_f, w, NEAR),
         Float::round_raw(false, cos, -(n as i64), w, NEAR).0,
     )
+}
+
+/// `(sin r, cos r)` for `|r| ≤ π/4` via **rectangular series splitting**
+/// (Brent & Zimmermann, *MCA* §4.4.3 / Paterson–Stockmeyer).
+///
+/// Both `cos = Σ (−1)^m z^m/(2m)!` and `sin/r = Σ (−1)^k z^k/(2k+1)!` (with
+/// `z = r²`) have the shape `S = Σ_{m≥0} (−1)^m z^m / ∏_{j=1}^m d(j)` for a
+/// small `d(·)`. Splitting the `T`-term sum into `⌈T/C⌉` blocks of width
+/// `C ≈ √(2T)` evaluates it with `O(√T)` full-width `z`-multiplies (the `C`
+/// baby-step powers `z^j` plus two per block) instead of one per term; the
+/// remaining work is small `Nat` products/divides by the block coefficients.
+/// Same working scale `2^-n` (`n = w + 32`) and Ziv wrapper as
+/// [`sin_cos_series_simple`], so the correctly-rounded result is identical.
+fn sin_cos_series_rect(r: &Float, w: u64) -> (Float, Float) {
+    if r.is_zero() {
+        return (r.round(w, NEAR), iflt(1, w));
+    }
+    let n = w + 32;
+    let z = scaled_int(r, n as i64).magnitude().square().shr(n);
+    if z.is_zero() {
+        // r so tiny that z underflows the scale: cos = 1, sin = r exactly.
+        return (r.round(w, NEAR), iflt(1, w));
+    }
+    // Block width C ≈ √(2·#terms), shared by both series (same powers of z).
+    let t_est = sin_cos_term_count(&z, n);
+    let two_t = 2 * t_est;
+    let mut c = two_t.isqrt();
+    if c * c < two_t {
+        c += 1;
+    }
+    let c = (c as usize).max(2);
+    // Baby steps: powers[j] ≈ z^j · 2^n for j = 0..=C (C full-width multiplies).
+    let mut powers = alloc::vec::Vec::with_capacity(c + 1);
+    powers.push(Nat::one().shl(n)); // z^0 = 1
+    powers.push(z.clone()); // z^1
+    for j in 2..=c {
+        powers.push(powers[j - 1].mul(&z).shr(n));
+    }
+    // cos: d(m) = (2m−1)(2m); sin bracket: d(k) = (2k)(2k+1).
+    let cos = alt_series_rect(n, c, &powers, |m| (2 * m - 1) * (2 * m));
+    let bracket = alt_series_rect(n, c, &powers, |k| (2 * k) * (2 * k + 1));
+    let bracket_f = Float::round_raw(false, bracket, -(n as i64), w, NEAR).0;
+    (
+        r.mul(&bracket_f, w, NEAR),
+        Float::round_raw(false, cos, -(n as i64), w, NEAR).0,
+    )
+}
+
+/// Number of terms until `z^m/(2m)! < 2^-n`, i.e. the series has converged to
+/// the working scale. A cheap integer magnitude recurrence (log₂ tracked in
+/// half-bit units) — only used to size the block width; the block loop itself
+/// terminates exactly when its leading term underflows, so an inexact estimate
+/// costs at most a few baby-step multiplies. No-`std`-safe (no `f64` intrinsics).
+fn sin_cos_term_count(z: &Nat, n: u64) -> u64 {
+    // 2·log₂(z/2^n) ≈ 2·bit_len(z) − 1 − 2n  (negative, since z < 2^n).
+    let log2z_x2 = 2 * z.bit_len() as i64 - 1 - 2 * n as i64;
+    let mut lg2 = 0i64; // running 2·log₂|term|
+    let mut m = 0u64;
+    loop {
+        m += 1;
+        let dm = (2 * m - 1) * (2 * m);
+        // 2·log₂(dm) ≈ 2·bit_len(dm) − 1.
+        let log2dm_x2 = 2 * (64 - dm.leading_zeros() as i64) - 1;
+        lg2 += log2z_x2 - log2dm_x2;
+        if lg2 < -2 * n as i64 || m >= n {
+            return m;
+        }
+    }
+}
+
+/// Evaluates `S = Σ_{m≥0} (−1)^m z^m / ∏_{j=1}^m d(j)` at scale `2^-n` by
+/// rectangular splitting, returning the non-negative scaled sum. `powers[j]`
+/// must hold `z^j · 2^n` for `j = 0..=c`, and `z < 1` (`d` grows so the sum
+/// converges). The running block-leading term `b = t_{iC}·2^n` is advanced by a
+/// single full multiply by `z^C` per block; each block sum is one full multiply
+/// `b·W` plus small products/divides by the block's integer coefficients.
+fn alt_series_rect(n: u64, c: usize, powers: &[Nat], d: impl Fn(u64) -> u64) -> Nat {
+    let y = &powers[c]; // z^C · 2^n
+    let mut acc = Int::ZERO; // Σ block sums, scale 2^n
+    let mut b_mag = powers[0].clone(); // |t_{iC}|·2^n, starts at t_0 = 1 → 2^n
+    let mut b_neg = false;
+    let mut base = 0u64; // iC, first term index of the current block
+    let cap = 2 * (base_cap(c) + c as u64);
+    while !b_mag.is_zero() && base <= cap {
+        // Block covers m = base .. base+C−1. Build, from the top down,
+        //   W    = Σ_{j=0}^{C−1} (−1)^j · num_j · powers[j]   (signed)
+        //   num_j = ∏_{l=base+j+1}^{base+C−1} d(l),   num_{C−1} = 1,  num_0 = Den
+        // so that the block sum = b · W / (2^n · Den).
+        let mut w_acc = Int::ZERO;
+        let mut num = Nat::one();
+        for j in (0..c).rev() {
+            let contrib = Int::from(num.mul(&powers[j]));
+            w_acc = if j % 2 == 0 {
+                w_acc.add(&contrib)
+            } else {
+                w_acc.sub(&contrib)
+            };
+            if j > 0 {
+                num = num.mul(&Nat::from_u64(d(base + j as u64)));
+            }
+        }
+        let den = num; // = ∏_{l=base+1}^{base+C−1} d(l)
+        // Block sum magnitude = (|b|·|W| ≫ n) / Den, sign = b_neg ⊕ (W<0).
+        let block_mag = b_mag
+            .mul(&w_acc.magnitude())
+            .shr(n)
+            .div_rem(&den)
+            .expect("den > 0")
+            .0;
+        let block_neg = b_neg ^ w_acc.is_negative();
+        let block = Int::from(block_mag);
+        acc = if block_neg {
+            acc.sub(&block)
+        } else {
+            acc.add(&block)
+        };
+        // Advance b to t_{(i+1)C}·2^n = b·(−1)^C·z^C / (Den·d(base+C)).
+        let den_adv = den.mul(&Nat::from_u64(d(base + c as u64)));
+        b_mag = b_mag.mul(y).shr(n).div_rem(&den_adv).expect("> 0").0;
+        if c % 2 == 1 {
+            b_neg = !b_neg;
+        }
+        base += c as u64;
+    }
+    debug_assert!(!acc.is_negative(), "series partial sum stays non-negative");
+    acc.magnitude()
+}
+
+/// A generous hard cap on how many terms the block loop may span, in case the
+/// leading-term underflow that normally halts it is delayed by rounding.
+fn base_cap(c: usize) -> u64 {
+    4 * c as u64 * c as u64 + 64
 }
 
 /// `atan(x)` for finite non-zero `x` at precision `w`.
@@ -3427,6 +3577,200 @@ mod agm_tests {
             let ts = t(|| ln_series_at(&xw, w));
             let ta = t(|| ln_agm_at(&xw, w));
             println!("{w:>10}  {ts:>12.2}  {ta:>12.2}  {:>7.2}x", ts / ta);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sin_cos_rect_tests {
+    extern crate std;
+    use std::println;
+
+    use super::*;
+    use crate::RoundingMode::{AwayFromZero, Nearest, TowardNegative, TowardPositive, TowardZero};
+
+    const MODES: [RoundingMode; 5] = [
+        Nearest,
+        TowardZero,
+        TowardPositive,
+        TowardNegative,
+        AwayFromZero,
+    ];
+
+    /// `sin_cos_at` with a forced choice of series, so the two implementations
+    /// can be compared through the identical quadrant reduction + Ziv wrapper.
+    fn sin_cos_full(x: &Float, prec: u64, mode: RoundingMode, rect: bool) -> (Float, Float) {
+        let series = move |r: &Float, w: u64| {
+            if rect {
+                sin_cos_series_rect(r, w)
+            } else {
+                sin_cos_series_simple(r, w)
+            }
+        };
+        let at = move |x: &Float, w: u64| -> (Float, Float) {
+            let pi = pi_at(w);
+            let half_pi = pi.scale_pow2(-1);
+            let q = x.div(&half_pi, w, NEAR).round_half_up_to_int();
+            let r = x.sub(
+                &Float::from_int(&q, w, NEAR).mul(&half_pi, w, NEAR),
+                w,
+                NEAR,
+            );
+            let (sr, cr) = series(&r, w);
+            let quad = q.rem_euclid(&Int::from_i64(4)).to_i64().unwrap_or(0);
+            match quad {
+                0 => (sr, cr),
+                1 => (cr, sr.neg()),
+                2 => (sr.neg(), cr.neg()),
+                _ => (cr.neg(), sr),
+            }
+        };
+        let xs = x.clone();
+        let at2 = at;
+        let s = Float::ziv(prec, mode, move |w| at2(&xs.round(w, NEAR), w).0);
+        let xc = x.clone();
+        let c = Float::ziv(prec, mode, move |w| at(&xc.round(w, NEAR), w).1);
+        (s, c)
+    }
+
+    fn bit_identical(a: &Float, b: &Float) -> bool {
+        a.repr == b.repr && a.precision == b.precision
+    }
+
+    /// A crude xorshift so tests stay dependency-free and deterministic.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        /// A random finite float at precision `p`, magnitude scaled by `scale`.
+        fn float(&mut self, p: u64, scale: i64) -> Float {
+            let mant = Int::from_i64((self.next() >> 1) as i64);
+            let f = Float::from_int(&mant, p, NEAR);
+            let e = (self.next() % 30) as i64 - 15 + scale;
+            let f = f.scale_pow2(e);
+            if self.next() & 1 == 0 { f.neg() } else { f }
+        }
+    }
+
+    fn differential(precisions: &[u64], per_prec: usize) {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        for &p in precisions {
+            for _ in 0..per_prec {
+                // Mix tiny, ~1, and large (big quadrant reduction) magnitudes.
+                for &scale in &[-20i64, 0, 30] {
+                    let x = rng.float(p, scale);
+                    for &mode in &MODES {
+                        let (ss, sc) = sin_cos_full(&x, p, mode, false);
+                        let (rs, rc) = sin_cos_full(&x, p, mode, true);
+                        assert!(
+                            bit_identical(&ss, &rs),
+                            "sin mismatch p={p} mode={mode:?} x={x:?}"
+                        );
+                        assert!(
+                            bit_identical(&sc, &rc),
+                            "cos mismatch p={p} mode={mode:?} x={x:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rect_matches_simple_fast() {
+        // Small-w edge cases (few blocks) plus a straddle of the 1024 crossover.
+        differential(&[300, 900, 1024, 1536, 2048], 5);
+    }
+
+    #[test]
+    fn rect_known_values() {
+        let p = 2048;
+        let n = Nearest;
+        // sin 0 = 0, cos 0 = 1.
+        let (s0, c0) = sin_cos_series_rect(&Float::zero(p + 32), p);
+        assert!(s0.is_zero());
+        assert!(c0.sub(&iflt(1, p), p, n).is_zero());
+        // sin²+cos² = 1 at a generic argument.
+        let x = Float::from_int(&Int::from_i64(7), p, n).div(
+            &Float::from_int(&Int::from_i64(10), p, n),
+            p,
+            n,
+        );
+        let s = x.sin(p, n);
+        let c = x.cos(p, n);
+        let one = s.mul(&s, p, n).add(&c.mul(&c, p, n), p, n);
+        assert!(one.sub(&iflt(1, p), p, n).abs() < rflt(1, 1i64 << 60, p));
+        // sin(π/6) ≈ 1/2.
+        let pi6 = Float::pi(p, n).div(&Float::from_int(&Int::from_i64(6), p, n), p, n);
+        let half = pi6.sin(p, n);
+        assert!(half.sub(&rflt(1, 2, p), p, n).abs() < rflt(1, 1i64 << 60, p));
+    }
+
+    #[test]
+    #[ignore = "heavy: run with --release --ignored"]
+    fn rect_matches_simple_heavy() {
+        differential(&[3000, 4096, 8192, 16384], 4);
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored bench_sin_cos_rect --nocapture"]
+    fn bench_sin_cos_rect() {
+        use std::time::Instant;
+        let n = Nearest;
+        fn t(iters: u32, mut f: impl FnMut()) -> f64 {
+            f();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let s = Instant::now();
+                for _ in 0..iters {
+                    f();
+                }
+                best = best.min(s.elapsed().as_secs_f64() / iters as f64);
+            }
+            best
+        }
+        println!("\n  w        simple(ms)   rect(ms)   speedup   Cblock");
+        for &w in &[
+            256u64, 512, 1024, 1500, 2048, 4096, 8192, 16384, 32768, 65536,
+        ] {
+            let x = Float::from_int(&Int::from_i64(12345), w + 64, n).div(
+                &Float::from_int(&Int::from_i64(10000), w + 64, n),
+                w + 64,
+                n,
+            );
+            let iters: u32 = if w <= 1024 {
+                200
+            } else if w <= 4096 {
+                40
+            } else if w <= 16384 {
+                8
+            } else {
+                2
+            };
+            // Reduce once to r ∈ [−π/4, π/4] to time the series itself.
+            let z = scaled_int(&x, (w + 32) as i64)
+                .magnitude()
+                .square()
+                .shr(w + 32);
+            let c = ((2 * sin_cos_term_count(&z, w + 32)) as f64).sqrt().ceil() as u64;
+            let ts = t(iters, || {
+                std::hint::black_box(sin_cos_series_simple(&x, w));
+            });
+            let tr = t(iters, || {
+                std::hint::black_box(sin_cos_series_rect(&x, w));
+            });
+            println!(
+                "{w:>6}   {:>10.4} {:>10.4}   {:>6.2}x   {c:>5}",
+                ts * 1e3,
+                tr * 1e3,
+                ts / tr
+            );
         }
     }
 }

@@ -144,6 +144,10 @@ name = "rational_e2e_bench"
 required-features=["std","rational","matrix"]
 
 [[example]]
+name = "trig_bench"
+required-features=["std","float"]
+
+[[example]]
 name = "bench"
 required-features = ["std", "float"]
 

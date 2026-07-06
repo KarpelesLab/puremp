@@ -308,6 +308,16 @@ impl<T: Ring> Ring for crate::poly::Poly<T> {
 /// caller's responsibility that the ring is actually a field (a prime modulus,
 /// numerically well-conditioned data, …).
 pub trait Field: Ring + core::ops::Div<Output = Self> {
+    /// Whether inversion in this field is *cheap* relative to multiplication.
+    ///
+    /// For `Rational` a reciprocal is a near-free numerator/denominator swap, so
+    /// algorithms that trade inversions for extra multiplications (e.g. Jacobian
+    /// projective elliptic-curve arithmetic) do NOT pay off — the extra work on
+    /// larger coordinates loses. For fields where inversion is a full algorithm
+    /// (modular inverse in `ModInt`/`GfElement`, `Float` division) the default
+    /// `false` is correct and such trades win. Only `Rational` overrides this.
+    const CHEAP_INV: bool = false;
+
     /// The multiplicative inverse of `self`, or `None` when `self` is zero.
     fn inv(&self) -> Option<Self> {
         if self.is_zero() {
@@ -319,7 +329,10 @@ pub trait Field: Ring + core::ops::Div<Output = Self> {
 }
 
 #[cfg(feature = "rational")]
-impl Field for crate::rational::Rational {}
+impl Field for crate::rational::Rational {
+    // A rational reciprocal is just a num/den swap — cheaper than a multiply.
+    const CHEAP_INV: bool = true;
+}
 
 #[cfg(feature = "float")]
 impl Field for crate::float::Float {}

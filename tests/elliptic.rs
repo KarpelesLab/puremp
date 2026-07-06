@@ -263,6 +263,145 @@ fn rational_curve_doublings() {
     assert_eq!(p.scalar_mul(&Int::from(-2)), -&p2);
 }
 
+// --- Differential: Jacobian ladder vs. the affine double-and-add reference ---
+
+/// Reference `k·P` using only the public affine [`Point::double`]/[`Point::add`]
+/// (the same left-to-right binary ladder the old `scalar_mul` used), against
+/// which the new inversion-free Jacobian `scalar_mul` must be bit-identical.
+fn affine_scalar_mul<F: puremp::ring::Field>(p: &Point<F>, k: &Int) -> Point<F> {
+    if k.is_zero() || p.is_infinity() {
+        return p.curve().identity();
+    }
+    let mag = k.abs();
+    let mut result = p.curve().identity();
+    let mut i = mag.bit_len();
+    while i > 0 {
+        i -= 1;
+        result = result.double();
+        if mag.bit(i) {
+            result = result.add(p);
+        }
+    }
+    if k.is_negative() { -&result } else { result }
+}
+
+#[test]
+fn jacobian_matches_affine_gf_p() {
+    // A handful of small primes, each with a couple of curves and base points.
+    for &pv in &[17i64, 23, 101, 1009, 7919] {
+        let p = Int::from(pv);
+        let mk = |v: i64| ModInt::new(Int::from(v), p.clone());
+        for &(av, bv) in &[(2i64, 2i64), (0, 7), (3, 5), (1, 1), (5, 0)] {
+            let curve = match EllipticCurve::new(mk(av), mk(bv)) {
+                Some(c) => c,
+                None => continue, // singular pair, skip
+            };
+            // Collect a few base points by scanning x-coordinates.
+            let mut bases = vec![curve.identity()];
+            for x in 0..pv.min(60) {
+                if let Some(pt) = curve.point_from_x(&mk(x)) {
+                    bases.push(pt);
+                }
+                if bases.len() >= 5 {
+                    break;
+                }
+            }
+            let order = curve.curve_order();
+            for base in &bases {
+                // Deterministic pseudo-random scalars plus structural values.
+                let mut ks = vec![
+                    Int::ZERO,
+                    Int::ONE,
+                    Int::from(2),
+                    order.clone(),     // hits infinity for base
+                    &order + Int::ONE, // ≡ base
+                    -&order,           // hits infinity
+                    Int::from(-1),
+                    Int::from(-7),
+                ];
+                let mut s: u64 = 0x1234_5678 ^ (pv as u64) ^ ((av as u64) << 8);
+                for _ in 0..12 {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    let mut k = Int::from((s % 100_000) as i64);
+                    if s & 1 == 0 {
+                        k = -k;
+                    }
+                    ks.push(k);
+                }
+                for k in &ks {
+                    let jac = base.scalar_mul(k);
+                    let aff = affine_scalar_mul(base, k);
+                    assert_eq!(
+                        jac, aff,
+                        "GF({pv}) a={av} b={bv} base={base} k={k}: Jacobian != affine"
+                    );
+                    assert!(jac.is_on_curve());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn jacobian_matches_affine_two_torsion() {
+    // y² = x³ - x over GF(101) has full 2-torsion: x ∈ {0, 1, 100} give y = 0.
+    let p = Int::from(101);
+    let mk = |v: i64| ModInt::new(Int::from(v), p.clone());
+    let curve = EllipticCurve::new(mk(-1), mk(0)).expect("non-singular");
+    for &x0 in &[0i64, 1, 100] {
+        let t = curve.point(mk(x0), mk(0)).expect("2-torsion point");
+        assert!(t.double().is_infinity(), "2-torsion should double to O");
+        for k in -6..=6i64 {
+            let ki = Int::from(k);
+            assert_eq!(
+                t.scalar_mul(&ki),
+                affine_scalar_mul(&t, &ki),
+                "2-torsion x={x0} k={k}"
+            );
+        }
+    }
+}
+
+#[test]
+fn jacobian_matches_affine_rationals() {
+    // y² = x³ - 2 with rational point (3, 5).
+    let curve = EllipticCurve::new(q(0), q(-2)).expect("non-singular over ℚ");
+    let base = curve.point(q(3), q(5)).expect("(3,5) on curve");
+    for k in -12..=12i64 {
+        let ki = Int::from(k);
+        let jac = base.scalar_mul(&ki);
+        let aff = affine_scalar_mul(&base, &ki);
+        assert_eq!(jac, aff, "ℚ curve k={k}: Jacobian != affine");
+        assert!(jac.is_on_curve());
+    }
+    // A second curve: y² = x³ + x + 1 with (0, 1).
+    let curve2 = EllipticCurve::new(q(1), q(1)).expect("non-singular over ℚ");
+    let base2 = curve2.point(q(0), q(1)).expect("(0,1) on curve");
+    for k in -8..=8i64 {
+        let ki = Int::from(k);
+        assert_eq!(
+            base2.scalar_mul(&ki),
+            affine_scalar_mul(&base2, &ki),
+            "ℚ curve2 k={k}"
+        );
+    }
+}
+
+#[test]
+fn order_of_point_unchanged_by_jacobian() {
+    // order_of_point drives its checks through scalar_mul; confirm it still
+    // agrees with the group order 19 on the standard GF(17) curve.
+    let curve = curve_gf17();
+    for base in all_points(&curve) {
+        let n = curve.order_of_point(&base);
+        assert!(base.scalar_mul(&n).is_infinity(), "n·P must vanish");
+        // Divisor of 19: either 1 (identity) or 19.
+        assert!(n == Int::from(1) || n == Int::from(19));
+    }
+}
+
 /// Timing benchmark: `EllipticCurve::<ModInt>::scalar_mul` over prime fields of
 /// several sizes. With `ModInt` Montgomery-resident for odd moduli this is the
 /// end-to-end effect on the group law; compare against a Barrett-only build by
@@ -290,7 +429,11 @@ fn scalar_mul_bench() {
         }
         n.next_prime()
     };
-    println!("{:>6} {:>10} {:>14}", "bits", "scalars", "scalar_mul(ms)");
+    println!("== GF(p) scalar_mul: affine vs Jacobian ==");
+    println!(
+        "{:>6} {:>8} {:>12} {:>12} {:>8}",
+        "bits", "reps", "affine(ms)", "jacob(ms)", "speedup"
+    );
     for &bits in &[64u32, 256, 1024] {
         let p = prime(bits, 0xDEAD_BEEF ^ bits as u64);
         let mk = |v: i64| ModInt::new(Int::from(v), p.clone());
@@ -313,13 +456,80 @@ fn scalar_mul_bench() {
         } else {
             20
         };
-        // Warm / correctness sanity: result must be on the curve.
-        assert!(point.scalar_mul(&k).is_on_curve() || point.scalar_mul(&k).is_infinity());
+        // Correctness sanity + differential: both paths agree, on the curve.
+        assert_eq!(point.scalar_mul(&k), affine_scalar_mul(&point, &k));
         let t0 = Instant::now();
+        for _ in 0..reps {
+            black_box(affine_scalar_mul(&point, &k));
+        }
+        let aff_ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        let t1 = Instant::now();
         for _ in 0..reps {
             black_box(point.scalar_mul(&k));
         }
-        let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
-        println!("{bits:>6} {reps:>10} {ms:>14.4}");
+        let jac_ms = t1.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        println!(
+            "{bits:>6} {reps:>8} {aff_ms:>12.4} {jac_ms:>12.4} {:>7.2}x",
+            aff_ms / jac_ms
+        );
+    }
+
+    // Over ℚ the height of k·P grows ~ k²·h(P) (numerators/denominators roughly
+    // double in bit-length per doubling), so scalars must stay small to finish;
+    // even k ≈ 200 pushes the coordinates to tens of thousands of bits.
+    println!("== ℚ scalar_mul: affine vs Jacobian (y² = x³ - 2, base (3,5)) ==");
+    println!(
+        "{:>6} {:>8} {:>12} {:>12} {:>8}",
+        "k", "reps", "affine(ms)", "jacob(ms)", "speedup"
+    );
+    {
+        let curve = EllipticCurve::new(Rational::from(0), Rational::from(-2)).expect("ok");
+        let base = curve
+            .point(Rational::from(3), Rational::from(5))
+            .expect("(3,5)");
+        for &kv in &[50i64, 100, 200] {
+            let k = Int::from(kv);
+            let reps: usize = if kv <= 50 { 40 } else { 15 };
+            assert_eq!(base.scalar_mul(&k), affine_scalar_mul(&base, &k));
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                black_box(affine_scalar_mul(&base, &k));
+            }
+            let aff_ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let t1 = Instant::now();
+            for _ in 0..reps {
+                black_box(base.scalar_mul(&k));
+            }
+            let jac_ms = t1.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            println!(
+                "{kv:>6} {reps:>8} {aff_ms:>12.4} {jac_ms:>12.4} {:>7.2}x",
+                aff_ms / jac_ms
+            );
+        }
+    }
+
+    println!("== end-to-end curve_order over GF(p) (drives order_of_point) ==");
+    {
+        // order_of_point runs a scalar_mul per prime factor of the group order,
+        // so its inner loop now uses the Jacobian ladder. Its cost is still
+        // dominated by curve_order's naive O(p) Legendre scan (unchanged here),
+        // so use a genuinely small prime so the scan finishes; the Jacobian win
+        // shows in the GF(p) scalar_mul table above. (The `prime` helper above
+        // rounds up to a 64-bit word, so it cannot make a small modulus.)
+        let p = Int::from(500_009).next_prime(); // ~19-bit prime
+        let mk = |v: i64| ModInt::new(Int::from(v), p.clone());
+        let curve = EllipticCurve::new(mk(2), mk(3)).expect("non-singular");
+        let mut point = None;
+        for x in 1i64..1000 {
+            if let Some(pt) = curve.point_from_x(&mk(x)) {
+                point = Some(pt);
+                break;
+            }
+        }
+        let point = point.expect("base point");
+        let t0 = Instant::now();
+        let ord = black_box(curve.order_of_point(&point));
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        println!("order_of_point(p≈{p}) = {ord} in {ms:.2} ms");
     }
 }

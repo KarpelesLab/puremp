@@ -72,6 +72,42 @@ fn field_mul_small<F: Field>(x: &F, mut n: u64) -> F {
     acc
 }
 
+/// Internal Jacobian projective point `(X : Y : Z)` whose affine image is
+/// `x = X / Z²`, `y = Y / Z³`, with `Z = 0` the point at infinity.
+///
+/// Jacobian coordinates let [`Point::scalar_mul`] run its double-and-add ladder
+/// with **no per-step field inversion** — the group law becomes a fixed handful
+/// of field multiplications, and a single inversion at the very end recovers the
+/// affine `(x, y)`. This is the dominant cost saving over `GF(p)` (where an
+/// inversion is a modular inverse) and over `ℚ` (a gcd). See Cohen, *A Course in
+/// Computational Algebraic Number Theory* §7.2 and Hankerson–Menezes–Vanstone,
+/// *Guide to Elliptic Curve Cryptography* §3.2 for the standard formulas.
+#[derive(Clone)]
+struct Jac<F: Field> {
+    x: F,
+    y: F,
+    z: F,
+}
+
+impl<F: Field> Jac<F> {
+    /// The point at infinity `(1 : 1 : 0)`, its identities drawn from `sample`'s
+    /// ring (so `ModInt` gets the right modulus).
+    #[inline]
+    fn infinity(sample: &F) -> Jac<F> {
+        Jac {
+            x: sample.one(),
+            y: sample.one(),
+            z: sample.zero(),
+        }
+    }
+
+    /// Whether this is the point at infinity (`Z = 0`).
+    #[inline]
+    fn is_infinity(&self) -> bool {
+        self.z.is_zero()
+    }
+}
+
 /// An elliptic curve `y² = x³ + a·x + b` over a field `F`.
 ///
 /// Construct one with [`EllipticCurve::new`], which validates non-singularity.
@@ -150,6 +186,110 @@ impl<F: Field> EllipticCurve<F> {
             coords: Some((x, y)),
         };
         if p.is_on_curve() { Some(p) } else { None }
+    }
+
+    // --- Jacobian group law (inversion-free, used by the scalar ladder) ---
+
+    /// Jacobian point doubling `2·P` for `y² = x³ + a·x + b`:
+    ///
+    /// ```text
+    /// S  = 4·X·Y²
+    /// M  = 3·X² + a·Z⁴
+    /// X₃ = M² − 2·S
+    /// Y₃ = M·(S − X₃) − 8·Y⁴
+    /// Z₃ = 2·Y·Z
+    /// ```
+    ///
+    /// The point at infinity (`Z = 0`) and any 2-torsion point (`Y = 0`, whose
+    /// tangent is vertical) both double to infinity — returned explicitly, which
+    /// also matches `Z₃ = 2·Y·Z = 0` in those cases.
+    fn jac_double(&self, p: &Jac<F>) -> Jac<F> {
+        if p.z.is_zero() || p.y.is_zero() {
+            return Jac::infinity(&self.a);
+        }
+        let xx = p.x.clone() * p.x.clone();
+        let yy = p.y.clone() * p.y.clone();
+        let yyyy = yy.clone() * yy.clone();
+        let zz = p.z.clone() * p.z.clone();
+        let z4 = zz.clone() * zz;
+        // S = 4·X·Y², M = 3·X² + a·Z⁴.
+        let s = field_mul_small(&(p.x.clone() * yy), 4);
+        let m = field_mul_small(&xx, 3) + self.a.clone() * z4;
+        let two_s = s.clone() + s.clone();
+        let x3 = m.clone() * m.clone() - two_s;
+        let y3 = m * (s - x3.clone()) - field_mul_small(&yyyy, 8);
+        let z3 = field_mul_small(&(p.y.clone() * p.z.clone()), 2);
+        Jac {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// General Jacobian point addition `P₁ + P₂`:
+    ///
+    /// ```text
+    /// U₁ = X₁·Z₂²   U₂ = X₂·Z₁²
+    /// S₁ = Y₁·Z₂³   S₂ = Y₂·Z₁³
+    /// H  = U₂ − U₁  r  = S₂ − S₁
+    /// X₃ = r² − H³ − 2·U₁·H²
+    /// Y₃ = r·(U₁·H² − X₃) − S₁·H³
+    /// Z₃ = Z₁·Z₂·H
+    /// ```
+    ///
+    /// Edge cases: if either input is infinity the other is returned. When the
+    /// affine `x`-coordinates coincide (`H = 0`) the chord degenerates: `r = 0`
+    /// means `P₁ = P₂`, deferred to [`jac_double`](Self::jac_double); `r ≠ 0`
+    /// means `P₁ = −P₂`, giving infinity.
+    fn jac_add(&self, p1: &Jac<F>, p2: &Jac<F>) -> Jac<F> {
+        if p1.is_infinity() {
+            return p2.clone();
+        }
+        if p2.is_infinity() {
+            return p1.clone();
+        }
+        let z1z1 = p1.z.clone() * p1.z.clone();
+        let z2z2 = p2.z.clone() * p2.z.clone();
+        let u1 = p1.x.clone() * z2z2.clone();
+        let u2 = p2.x.clone() * z1z1.clone();
+        let s1 = p1.y.clone() * z2z2 * p2.z.clone();
+        let s2 = p2.y.clone() * z1z1 * p1.z.clone();
+        let h = u2 - u1.clone();
+        let r = s2 - s1.clone();
+        if h.is_zero() {
+            if r.is_zero() {
+                return self.jac_double(p1);
+            }
+            return Jac::infinity(&self.a);
+        }
+        let h2 = h.clone() * h.clone();
+        let h3 = h2.clone() * h.clone();
+        let u1h2 = u1 * h2;
+        let two_u1h2 = u1h2.clone() + u1h2.clone();
+        let x3 = r.clone() * r.clone() - h3.clone() - two_u1h2;
+        let y3 = r * (u1h2 - x3.clone()) - s1 * h3;
+        let z3 = p1.z.clone() * p2.z.clone() * h;
+        Jac {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// Converts a Jacobian point back to an affine [`Point`] with the ladder's
+    /// **single** field inversion: `x = X·Z⁻²`, `y = Y·Z⁻³` (infinity if
+    /// `Z = 0`).
+    fn jac_to_affine(&self, p: Jac<F>) -> Point<F> {
+        if p.is_infinity() {
+            return self.identity();
+        }
+        let z_inv = self.a.one() / p.z;
+        let z_inv2 = z_inv.clone() * z_inv.clone();
+        let z_inv3 = z_inv2.clone() * z_inv;
+        Point {
+            curve: self.clone(),
+            coords: Some((p.x * z_inv2, p.y * z_inv3)),
+        }
     }
 }
 
@@ -303,22 +443,61 @@ impl<F: Field> Point<F> {
 
     /// Returns the scalar multiple `k·P` by double-and-add. Negative `k` uses
     /// `(−k)·P = −(k·P)`; `k = 0` gives `O`.
+    ///
+    /// The ladder runs in inversion-free **Jacobian coordinates** (`x = X/Z²`,
+    /// `y = Y/Z³`): the affine base point enters as `(x : y : 1)`, each
+    /// double/add is a fixed set of field multiplications with no division, and
+    /// exactly one field inversion at the end recovers the affine result. Because
+    /// the base fields are exact with a canonical representation, this is
+    /// bit-identical to the affine double-and-add it replaces — the affine
+    /// [`double`](Self::double)/[`add`](Self::add) remain the public single-step
+    /// operators and the differential reference.
     pub fn scalar_mul(&self, k: &Int) -> Point<F> {
-        if k.is_zero() || self.is_infinity() {
-            return self.curve.identity();
-        }
+        let (x, y) = match &self.coords {
+            _ if k.is_zero() => return self.curve.identity(),
+            None => return self.curve.identity(),
+            Some(p) => p,
+        };
         let mag = k.abs();
-        let mut result = self.curve.identity();
-        let base = self.clone();
-        // Left-to-right binary ladder over the bits of |k|.
-        let mut i = mag.bit_len();
-        while i > 0 {
-            i -= 1;
-            result = result.double();
-            if mag.bit(i) {
-                result = result.add(&base);
+
+        // Jacobian coordinates trade the per-step field inversion for extra
+        // multiplies on larger coordinates — a huge win when inversion is a full
+        // algorithm (GF(p) modular inverse), but a *loss* when it is nearly free
+        // (a `Rational` reciprocal is a num/den swap). Dispatch on the field.
+        let result = if F::CHEAP_INV {
+            // Affine ladder: cheap inversion, and affine coordinates stay small.
+            let base = Point {
+                curve: self.curve.clone(),
+                coords: Some((x.clone(), y.clone())),
+            };
+            let mut acc = self.curve.identity();
+            let mut i = mag.bit_len();
+            while i > 0 {
+                i -= 1;
+                acc = acc.double();
+                if mag.bit(i) {
+                    acc = acc.add(&base);
+                }
             }
-        }
+            acc
+        } else {
+            // Jacobian ladder: one inversion at the very end.
+            let base = Jac {
+                x: x.clone(),
+                y: y.clone(),
+                z: x.one(),
+            };
+            let mut acc = Jac::infinity(&self.curve.a);
+            let mut i = mag.bit_len();
+            while i > 0 {
+                i -= 1;
+                acc = self.curve.jac_double(&acc);
+                if mag.bit(i) {
+                    acc = self.curve.jac_add(&acc, &base);
+                }
+            }
+            self.curve.jac_to_affine(acc)
+        };
         if k.is_negative() {
             result.neg()
         } else {

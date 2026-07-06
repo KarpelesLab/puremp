@@ -365,3 +365,119 @@ fn mismatched_fields_panic() {
     let f2 = GaloisField::create(i(3), 2).unwrap();
     let _ = f1.one().add(&f2.one());
 }
+
+// ---------------------------------------------------------------------------
+// Differential: the optimized `mul` (fused schoolbook + precomputed x^k…x^{2k-2}
+// reduction table) must be bit-identical to reducing the raw schoolbook product
+// through the untouched `GaloisField::element` path (schoolbook `poly_mul` +
+// general `poly_rem`). Also confirms `pow`, `inv`, `div` (built on `mul`) stay
+// consistent with the field axioms over many random elements.
+// ---------------------------------------------------------------------------
+
+struct Lcg(u64);
+impl Lcg {
+    fn new(seed: u64) -> Lcg {
+        Lcg(seed ^ 0x9e37_79b9_7f4a_7c15)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+}
+
+/// A random coefficient in `[0, p)` for a possibly-large prime `p`.
+fn rand_coeff(p: &Int, rng: &mut Lcg) -> Int {
+    // Assemble up to three 64-bit words, then reduce mod p.
+    let mut v = Int::from_u64(rng.next_u64());
+    for _ in 0..2 {
+        v = v
+            .mul(&Int::from_u64(u64::MAX))
+            .add(&Int::from_u64(rng.next_u64()));
+    }
+    v.rem_euclid(p)
+}
+
+fn rand_elem_diff(field: &GaloisField, p: &Int, rng: &mut Lcg) -> GfElement {
+    let coeffs: Vec<Int> = (0..field.degree()).map(|_| rand_coeff(p, rng)).collect();
+    field.element(&coeffs)
+}
+
+/// Reference product: schoolbook multiply of the two coefficient vectors over
+/// `ℤ` (no reduction), then reduce through `GaloisField::element`, which runs
+/// the original, unmodified `poly_mul`/`poly_rem` reduction.
+fn reference_mul(field: &GaloisField, a: &GfElement, b: &GfElement) -> GfElement {
+    let ac = a.to_coefficients();
+    let bc = b.to_coefficients();
+    let mut prod = vec![Int::ZERO; ac.len() + bc.len() - 1];
+    for (i, ai) in ac.iter().enumerate() {
+        for (j, bj) in bc.iter().enumerate() {
+            prod[i + j] = prod[i + j].add(&ai.mul(bj));
+        }
+    }
+    field.element(&prod)
+}
+
+#[test]
+fn mul_matches_reference_reduction() {
+    // Small word-size primes with k = 2…8, plus a couple of larger primes.
+    let cases: &[(Int, usize)] = &[
+        (i(2), 2),
+        (i(2), 5),
+        (i(2), 8),
+        (i(3), 3),
+        (i(3), 6),
+        (i(5), 4),
+        (i(7), 7),
+        (i(101), 4),
+        (i(65537), 3),
+        (i(2_147_483_647), 2),
+    ];
+    for (p, k) in cases {
+        let field = GaloisField::create(p.clone(), *k).unwrap();
+        let mut rng = Lcg::new(p.to_u64().unwrap_or(0) ^ (*k as u64 * 0x1000));
+        for _ in 0..400 {
+            let a = rand_elem_diff(&field, p, &mut rng);
+            let b = rand_elem_diff(&field, p, &mut rng);
+            let got = a.mul(&b);
+            let want = reference_mul(&field, &a, &b);
+            assert_eq!(
+                got.to_coefficients(),
+                want.to_coefficients(),
+                "mul mismatch in GF({p}^{k}) for {a:?} · {b:?}"
+            );
+            // pow / inv / div consistency (all built on the optimized mul).
+            assert_eq!(a.mul(&b), b.mul(&a));
+            if !a.is_zero() {
+                assert!(a.mul(&a.inv().unwrap()).is_one());
+                assert_eq!(b.div(&a).mul(&a), b);
+            }
+        }
+        // A high exponent stresses the square-and-multiply chain.
+        let g = field.generator();
+        assert_eq!(g.pow(&field.order()), g); // g^(p^k) = g
+    }
+}
+
+/// A large multi-limb prime characteristic (~130 bits) with k = 2, 3, 4.
+#[test]
+fn mul_matches_reference_large_prime() {
+    let p = Int::from_str_radix("170141183460469231731687303715884105727", 10)
+        .unwrap()
+        .next_prime();
+    for k in [2usize, 3, 4] {
+        let field = GaloisField::create(p.clone(), k).unwrap();
+        let mut rng = Lcg::new(0xdead_beef ^ (k as u64));
+        for _ in 0..60 {
+            let a = rand_elem_diff(&field, &p, &mut rng);
+            let b = rand_elem_diff(&field, &p, &mut rng);
+            assert_eq!(
+                a.mul(&b).to_coefficients(),
+                reference_mul(&field, &a, &b).to_coefficients(),
+                "large-prime mul mismatch in GF(p^{k})"
+            );
+        }
+    }
+}

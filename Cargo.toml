@@ -132,6 +132,10 @@ name = "poly_bench"
 required-features=["std","poly","galois"]
 
 [[example]]
+name = "galois_bench"
+required-features=["std","poly","galois"]
+
+[[example]]
 name = "bench"
 required-features = ["std", "float"]
 

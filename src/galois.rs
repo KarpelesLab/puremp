@@ -269,6 +269,89 @@ struct FieldData {
     k: usize,
     /// The modulus `f`, low-to-high, length `k+1`, monic, each entry in `[0, p)`.
     modulus: Vec<Int>,
+    /// Precomputed reduction table `red[j] = x^{k+j} mod f` for `j = 0 … k−2`
+    /// (i.e. `x^k … x^{2k−2}`), each a length-`k` coefficient vector in `[0, p)`.
+    /// Empty for `k == 1` (products never reach degree `k`). Turns the post-
+    /// multiply reduction into a fixed set of multiply-accumulates.
+    red: Vec<Vec<Int>>,
+}
+
+impl FieldData {
+    /// Assembles the shared field context, precomputing the `x^k … x^{2k-2} mod f`
+    /// reduction table. `modulus` is monic of degree `k`, low-to-high, each entry
+    /// already in `[0, p)`.
+    fn build(p: Int, k: usize, modulus: Vec<Int>) -> FieldData {
+        // red[j] = x^{k+j} mod f. Start at x^k mod f, then multiply by x (a shift)
+        // and reduce the single degree-k overflow term with red[0], iterating.
+        let mut red: Vec<Vec<Int>> = Vec::new();
+        if k >= 2 {
+            let mut xk = alloc::vec![Int::ZERO; k + 1];
+            xk[k] = Int::ONE;
+            let r0 = pad_to(poly_rem(&xk, &modulus, &p), k);
+            red.push(r0.clone());
+            let mut cur = r0;
+            for _ in 1..(k - 1) {
+                // Multiply `cur` (degree < k) by x: shift up by one. The new
+                // coefficient at index k is `cur[k-1]`; fold it back via red[0].
+                let top = cur[k - 1].clone();
+                let mut next = alloc::vec![Int::ZERO; k];
+                for i in (1..k).rev() {
+                    next[i] = cur[i - 1].clone();
+                }
+                if !top.is_zero() {
+                    for i in 0..k {
+                        next[i].addmul(&top, &red[0][i]);
+                    }
+                }
+                for c in next.iter_mut() {
+                    *c = c.rem_euclid(&p);
+                }
+                red.push(next.clone());
+                cur = next;
+            }
+        }
+        FieldData { p, k, modulus, red }
+    }
+
+    /// Product of two canonical coefficient vectors (each length `k`, entries in
+    /// `[0, p)`), reduced modulo the field modulus `f`. Returns the canonical
+    /// residue as a length-`k` vector in `[0, p)` — bit-identical to
+    /// `poly_rem(poly_mul(a, b, p), modulus, p)`.
+    fn mul_coeffs(&self, a: &[Int], b: &[Int]) -> Vec<Int> {
+        let k = self.k;
+        let p = &self.p;
+        if k == 1 {
+            return alloc::vec![a[0].mul(&b[0]).rem_euclid(p)];
+        }
+        // Raw schoolbook product (no per-coefficient reduction): degree ≤ 2k−2.
+        // Every term is non-negative, so the accumulators stay non-negative and
+        // ride Int's inline i128 fast path for word-size primes.
+        let mut prod = alloc::vec![Int::ZERO; 2 * k - 1];
+        for (i, ai) in a.iter().enumerate() {
+            if ai.is_zero() {
+                continue;
+            }
+            for (j, bj) in b.iter().enumerate() {
+                prod[i + j].addmul(ai, bj);
+            }
+        }
+        // Fold the high coefficients x^k … x^{2k−2} down through the reduction
+        // table, accumulating into the low part.
+        let mut acc: Vec<Int> = prod[..k].to_vec();
+        for (j, red_j) in self.red.iter().enumerate() {
+            let hi = prod[k + j].rem_euclid(p);
+            if hi.is_zero() {
+                continue;
+            }
+            for (ai, rj) in acc.iter_mut().zip(red_j.iter()) {
+                ai.addmul(&hi, rj);
+            }
+        }
+        for c in acc.iter_mut() {
+            *c = c.rem_euclid(p);
+        }
+        acc
+    }
 }
 
 /// A finite field `GF(pᵏ) = GF(p)[x] / (f)` for a monic irreducible `f`.
@@ -313,11 +396,7 @@ impl GaloisField {
             return None;
         }
         Some(GaloisField {
-            data: Rc::new(FieldData {
-                p,
-                k,
-                modulus: reduced,
-            }),
+            data: Rc::new(FieldData::build(p, k, reduced)),
         })
     }
 
@@ -338,7 +417,7 @@ impl GaloisField {
             modulus.push(Int::ONE); // monic degree-k candidate
             if is_irreducible(&modulus, &p) {
                 return Some(GaloisField {
-                    data: Rc::new(FieldData { p, k, modulus }),
+                    data: Rc::new(FieldData::build(p, k, modulus)),
                 });
             }
             if !incr_base_p(&mut low, &p) {
@@ -528,10 +607,8 @@ impl GfElement {
     /// Returns `self · rhs`.
     pub fn mul(&self, rhs: &GfElement) -> GfElement {
         self.same_field(rhs);
-        let p = &self.field.p;
-        let prod = poly_mul(&self.coeffs, &rhs.coeffs, p);
-        let residue = poly_rem(&prod, &self.field.modulus, p);
-        self.wrap(pad_to(residue, self.field.k))
+        let coeffs = self.field.mul_coeffs(&self.coeffs, &rhs.coeffs);
+        self.wrap(coeffs)
     }
 
     /// Returns the multiplicative inverse `self⁻¹`, or `None` if `self` is zero.

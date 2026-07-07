@@ -335,6 +335,26 @@ impl FieldData {
                 prod[i + j].addmul(ai, bj);
             }
         }
+        self.reduce_raw(&prod)
+    }
+
+    /// Reduces a raw (unreduced) product polynomial `prod` — coefficients
+    /// low-to-high, length `2k−1`, each a *non-negative* integer that may exceed
+    /// `p` — modulo the field modulus `f` and modulo `p`, returning the canonical
+    /// length-`k` residue in `[0, p)`.
+    ///
+    /// Bit-identical to reducing `prod` coefficient-wise mod `p` and then
+    /// `poly_rem`-ing by `f`: it folds the high terms `x^k … x^{2k−2}` down
+    /// through the precomputed reduction table, accumulating into the low part,
+    /// then reduces every coefficient mod `p`. Because reduction mod `(p, f)` is a
+    /// ring homomorphism, summing raw products and reducing once yields the same
+    /// canonical residue as reducing each product and summing.
+    fn reduce_raw(&self, prod: &[Int]) -> Vec<Int> {
+        let k = self.k;
+        let p = &self.p;
+        if k == 1 {
+            return alloc::vec![prod[0].rem_euclid(p)];
+        }
         // Fold the high coefficients x^k … x^{2k−2} down through the reduction
         // table, accumulating into the low part.
         let mut acc: Vec<Int> = prod[..k].to_vec();
@@ -770,4 +790,113 @@ impl core::ops::Neg for &GfElement {
     fn neg(self) -> GfElement {
         GfElement::neg(self)
     }
+}
+
+// ===========================================================================
+// Nested (2-D) Kronecker-substitution multiplication for `Poly<GfElement>`.
+//
+// A `Poly<GfElement>` is an *outer* polynomial `A(y) = Σ aᵢ yⁱ` whose
+// coefficients `aᵢ ∈ GF(pᵏ)` are themselves *inner* polynomials `aᵢ(t) =
+// Σ_{s<k} aᵢ,ₛ tˢ` over `GF(p)` (residues in `[0, p)`). Treating both operands as
+// bivariate integer polynomials `A(y, t)`, `B(y, t)` (coefficients in `[0, p)`),
+// their product `P(y, t) = A·B` has
+//
+//     P_{l,s} = Σ_{i+j=l, s'+s''=s} aᵢ,ₛ' · bⱼ,ₛ''      (an integer),
+//
+// and the field product is `cₗ = (Σ P_{l,·}) reduced mod (f, p)`. We recover the
+// integer `P_{l,s}` with a single big-integer multiply by a two-level Kronecker
+// substitution `t = 2^{k_in}`, `y = 2^{k_out}`, then reduce each outer
+// coefficient back into `GF(pᵏ)`.
+//
+// No-overlap (exactness) — the subtle part, proven at BOTH levels:
+//
+//   Inner slot `k_in`. A single output coefficient `P_{l,s}` is a sum of at most
+//   `C = min(nₐ, n_b)·k` products of two residues `< p` (≤ `min(nₐ,n_b)` pairs
+//   `i+j=l`, ≤ `k` pairs `s'+s''=s`), so `P_{l,s} ≤ C·(p−1)²`. With `bp =
+//   bit_len(p)` we have `(p−1)² < 2^{2bp}`, and `clog_in = bit_len(C)` gives
+//   `C < 2^{clog_in}`, hence `P_{l,s} < 2^{2bp+clog_in} = 2^{k_in}`. So every
+//   inner slot holds its coefficient with no carry into its neighbour — and,
+//   crucially, `k_in` already accounts for the *outer* accumulation (the `min`
+//   factor), because the single big multiply sums all `i+j=l` inner blocks into
+//   one outer slot.
+//
+//   Outer slot `k_out`. The packed inner block of the l-th outer coefficient is
+//   `P̂ₗ = Σ_{s=0}^{2k-2} P_{l,s} 2^{s·k_in} ≤ 2^{(2k-1)·k_in} − 1 <
+//   2^{(2k-1)·k_in}`. Choosing `k_out = 2k·k_in + clog_out ≥ (2k-1)·k_in` (with
+//   `clog_out = bit_len(min(nₐ,n_b))` a harmless margin) keeps `P̂ₗ < 2^{k_out}`,
+//   so the outer slots never overlap either.
+//
+// Reduction mod `(f, p)` is a ring homomorphism `GF(p)[t] → GF(pᵏ)`, so reducing
+// the summed raw products once (`reduce_raw`) yields the same *canonical* residue
+// as the Karatsuba path (reduce each product, then sum). The recovered
+// `Vec<GfElement>` is therefore bit-identical.
+// ===========================================================================
+
+/// Smaller-operand coefficient count at or above which `Poly<GfElement>::mul`
+/// routes through nested Kronecker substitution. Below it the generic Karatsuba
+/// path wins (and stays the differential reference). Chosen from benchmarking
+/// (see `examples/gf_kronecker_bench.rs`).
+#[cfg(feature = "poly")]
+const GF_KRONECKER_THRESHOLD: usize = 24;
+
+/// Nested-Kronecker multiply hook for `Poly<GfElement>` (see
+/// [`Ring::poly_mul`](crate::ring::Ring::poly_mul)). Returns `None` below the
+/// degree threshold (and `Some(empty)` for an empty operand) so small products
+/// stay on the Karatsuba path.
+#[cfg(feature = "poly")]
+pub(crate) fn gf_kronecker_mul(a: &[GfElement], b: &[GfElement]) -> Option<Vec<GfElement>> {
+    if a.is_empty() || b.is_empty() {
+        return Some(Vec::new());
+    }
+    if a.len().min(b.len()) < GF_KRONECKER_THRESHOLD {
+        return None;
+    }
+    Some(gf_kronecker_convolve(a, b))
+}
+
+/// Core nested-Kronecker product of two nonempty `GfElement` coefficient slices
+/// over one field `GF(pᵏ)`. Returns the product coefficients (length
+/// `nₐ + n_b − 1`), each a canonical field residue — exactly the Karatsuba
+/// convolution. See the module-level no-overlap argument above.
+#[cfg(feature = "poly")]
+pub(crate) fn gf_kronecker_convolve(a: &[GfElement], b: &[GfElement]) -> Vec<GfElement> {
+    use crate::poly::{kronecker_pack, kronecker_unpack};
+
+    let field = a[0].field.clone();
+    let k = field.k;
+    let bp = field.p.bit_len();
+    let na = a.len();
+    let nb = b.len();
+    let min_len = na.min(nb);
+    let num_outer = na + nb - 1;
+
+    // Inner slot: 2·bit_len(p) plus room for the ≤ min_len·k accumulated terms.
+    let inner_count = (min_len as u64) * (k as u64);
+    let clog_in = 64 - inner_count.leading_zeros(); // = bit_len(inner_count) ≥ 1
+    let k_in = 2 * bp + clog_in;
+
+    // Outer slot: holds the (2k−1)-slot inner block of each outer coefficient.
+    let clog_out = 64 - (min_len as u64).leading_zeros(); // = bit_len(min_len)
+    let k_out_u64 = 2u64 * (k as u64) * u64::from(k_in) + u64::from(clog_out);
+    let k_out =
+        u32::try_from(k_out_u64).expect("gf_kronecker_convolve: outer slot exceeds 2³² bits");
+
+    // Pack each element into a k·k_in-bit inner block, then pack the outer
+    // polynomial at stride k_out; one big multiply carries out both convolutions.
+    let blocks_a: Vec<Int> = a.iter().map(|e| kronecker_pack(&e.coeffs, k_in)).collect();
+    let blocks_b: Vec<Int> = b.iter().map(|e| kronecker_pack(&e.coeffs, k_in)).collect();
+    let prod = kronecker_pack(&blocks_a, k_out).mul(&kronecker_pack(&blocks_b, k_out));
+
+    // Unpack outer slots, then the 2k−1 inner slots of each, and reduce mod (f,p).
+    let inner_slots = 2 * k - 1;
+    kronecker_unpack(&prod, k_out, num_outer)
+        .into_iter()
+        .map(|block| {
+            let raw = kronecker_unpack(&block, k_in, inner_slots);
+            GfElement {
+                field: field.clone(),
+                coeffs: field.reduce_raw(&raw),
+            }
+        })
+        .collect()
 }

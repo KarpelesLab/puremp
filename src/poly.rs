@@ -183,20 +183,31 @@ impl<T: Ring> Poly<T> {
         if let Some(prod) = T::poly_mul(&self.coeffs, &rhs.coeffs) {
             return Poly::new(prod);
         }
-        // Karatsuba above a threshold; schoolbook below. Karatsuba trades one
-        // coefficient multiplication per split for a few additions, which is a
-        // win whenever a coefficient product costs more than an add (e.g. exact
-        // `Rational`/`Int` coefficients).
+        self.mul_no_hook(rhs)
+    }
+
+    /// The generic (hook-free) multiply: Karatsuba above a threshold, schoolbook
+    /// below. Karatsuba trades one coefficient multiplication per split for a few
+    /// additions, a win whenever a coefficient product costs more than an add
+    /// (e.g. exact `Rational`/`Int` coefficients). This is the differential
+    /// reference and benchmarking baseline for the coefficient-specialized
+    /// [`Ring::poly_mul`](crate::ring::Ring::poly_mul) fast paths; `mul` calls it
+    /// after the hook declines.
+    #[doc(hidden)]
+    pub fn mul_no_hook(&self, rhs: &Poly<T>) -> Poly<T> {
+        if self.is_zero() || rhs.is_zero() {
+            return Poly::zero();
+        }
         if self.coeffs.len().min(rhs.coeffs.len()) < POLY_KARATSUBA_THRESHOLD {
             return self.mul_schoolbook(rhs);
         }
         let m = self.coeffs.len().max(rhs.coeffs.len()) / 2;
         let (a0, a1) = self.split_at(m);
         let (b0, b1) = rhs.split_at(m);
-        let z0 = Poly::mul(&a0, &b0);
-        let z2 = Poly::mul(&a1, &b1);
+        let z0 = a0.mul_no_hook(&b0);
+        let z2 = a1.mul_no_hook(&b1);
         // z1 = (a0 + a1)(b0 + b1) − z0 − z2
-        let mid = Poly::mul(&Poly::add(&a0, &a1), &Poly::add(&b0, &b1));
+        let mid = Poly::add(&a0, &a1).mul_no_hook(&Poly::add(&b0, &b1));
         let z1 = Poly::sub(&Poly::sub(&mid, &z0), &z2);
         // z0 + z1·x^m + z2·x^(2m)
         let r = Poly::add(&z0, &z1.shift_up(m));
@@ -675,7 +686,7 @@ use crate::int::Int;
 /// `sum_i coeffs[i]·2^{k·i}` as a single (signed) big integer, built by a
 /// balanced divide-and-conquer of shifts and adds so packing stays near-linear.
 #[cfg(feature = "int")]
-fn kronecker_pack(coeffs: &[Int], k: u32) -> Int {
+pub(crate) fn kronecker_pack(coeffs: &[Int], k: u32) -> Int {
     match coeffs.len() {
         0 => Int::ZERO,
         1 => coeffs[0].clone(),
@@ -695,7 +706,7 @@ fn kronecker_pack(coeffs: &[Int], k: u32) -> Int {
 /// Inverse of [`kronecker_pack`] for a non-negative integer: extracts `num`
 /// base-`2ᵏ` digits (each in `[0, 2ᵏ)`), low-to-high, by divide-and-conquer.
 #[cfg(feature = "int")]
-fn kronecker_unpack(n: &Int, k: u32, num: usize) -> Vec<Int> {
+pub(crate) fn kronecker_unpack(n: &Int, k: u32, num: usize) -> Vec<Int> {
     if num == 1 {
         return alloc::vec![n.clone()];
     }
@@ -852,6 +863,28 @@ impl Poly<crate::mod_int::ModInt> {
             return Poly::zero();
         }
         Poly::new(kronecker_convolve_modint(self.coeffs(), rhs.coeffs()))
+    }
+}
+
+#[cfg(feature = "galois")]
+impl Poly<crate::galois::GfElement> {
+    /// Multiplies `self · rhs` over `GF(pᵏ)` by **nested (2-D) Kronecker
+    /// substitution**: pack each element's inner `GF(p)` coefficients into an
+    /// integer block, pack the outer polynomial of blocks, one big `Int` multiply,
+    /// then unpack both levels and reduce mod `(f, p)`. Bit-identical to
+    /// [`Poly::mul`](Poly::mul) for every input, which itself dispatches here once
+    /// both operands reach the internal degree threshold.
+    pub fn mul_nested_kronecker(
+        &self,
+        rhs: &Poly<crate::galois::GfElement>,
+    ) -> Poly<crate::galois::GfElement> {
+        if self.is_zero() || rhs.is_zero() {
+            return Poly::zero();
+        }
+        Poly::new(crate::galois::gf_kronecker_convolve(
+            self.coeffs(),
+            rhs.coeffs(),
+        ))
     }
 }
 
@@ -1664,5 +1697,72 @@ mod fast_tests {
         // zero operands short-circuit
         assert!(Poly::<ModInt>::zero().mul_kronecker(&long).is_zero());
         assert!(long.mul_kronecker(&Poly::<ModInt>::zero()).is_zero());
+    }
+
+    #[cfg(feature = "galois")]
+    fn rand_poly_gf(
+        rng: &mut Lcg,
+        field: &crate::galois::GaloisField,
+        deg: usize,
+    ) -> Poly<crate::galois::GfElement> {
+        let k = field.degree();
+        let p = field.characteristic();
+        let pu = p.to_u64().unwrap_or(1_000_000);
+        let elem = |rng: &mut Lcg| {
+            let coeffs: Vec<Int> = (0..k).map(|_| Int::from_u64(rng.next() % pu)).collect();
+            field.element(&coeffs)
+        };
+        let mut v: Vec<crate::galois::GfElement> = (0..deg).map(|_| elem(rng)).collect();
+        loop {
+            let lead = elem(rng);
+            if !lead.is_zero() {
+                v.push(lead);
+                break;
+            }
+        }
+        Poly::new(v)
+    }
+
+    /// `Poly<GfElement>::mul` (routed through the nested-Kronecker hook) is
+    /// bit-identical to the Karatsuba (`mul_no_hook`) product across many random
+    /// pairs, over several `(p, k)`, at degrees straddling the threshold.
+    #[cfg(feature = "galois")]
+    #[test]
+    fn nested_kronecker_matches_karatsuba_gf() {
+        for &(p, k) in &[(2u64, 4usize), (3, 3), (5, 6), (7, 3), (101, 4), (65537, 2)] {
+            let field = crate::galois::GaloisField::create(Int::from_u64(p), k).expect("field");
+            let mut rng = Lcg::new(0xa11ce ^ p ^ (k as u64));
+            for _ in 0..40 {
+                let na = 1 + rng.range(80) as usize;
+                let nb = 1 + rng.range(80) as usize;
+                let a = rand_poly_gf(&mut rng, &field, na);
+                let b = rand_poly_gf(&mut rng, &field, nb);
+                let reference = a.mul_no_hook(&b);
+                assert_eq!(reference, a.mul(&b), "p={p} k={k} na={na} nb={nb}");
+                assert_eq!(reference, a.mul_nested_kronecker(&b), "p={p} k={k}");
+            }
+        }
+    }
+
+    /// Edge cases: degree-0, sparse/interior-zero, and zero operands, all against
+    /// a long operand that straddles the nested-Kronecker threshold.
+    #[cfg(feature = "galois")]
+    #[test]
+    fn nested_kronecker_gf_edge_cases() {
+        let field = crate::galois::GaloisField::create(Int::from(7), 3).expect("field");
+        let e = |lo: i64| field.element(&[Int::from(lo), Int::from(1), Int::from(2)]);
+        let long = rand_poly_gf(&mut Lcg::new(9), &field, 60);
+        for a in [
+            Poly::new(vec![e(5)]),
+            Poly::new(vec![field.zero(), field.zero(), e(3)]),
+            Poly::new(vec![e(7), field.zero(), field.zero(), field.zero(), e(1)]),
+        ] {
+            assert_eq!(a.mul_no_hook(&long), a.mul(&long));
+            assert_eq!(a.mul_no_hook(&long), a.mul_nested_kronecker(&long));
+        }
+        // zero operands short-circuit
+        let z = Poly::<crate::galois::GfElement>::zero();
+        assert!(z.mul_nested_kronecker(&long).is_zero());
+        assert!(long.mul_nested_kronecker(&z).is_zero());
     }
 }

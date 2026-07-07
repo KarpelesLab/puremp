@@ -240,6 +240,10 @@ impl Ring for crate::mod_int::ModInt {
 impl Ring for crate::galois::GfElement {
     // Finite-field arithmetic is exact.
     const EXACT: bool = true;
+    #[cfg(feature = "poly")]
+    fn poly_mul(a: &[Self], b: &[Self]) -> Option<alloc::vec::Vec<Self>> {
+        crate::galois::gf_kronecker_mul(a, b)
+    }
     /// Zero in the same field `GF(pᵏ)` as `self`.
     #[inline]
     fn zero(&self) -> Self {

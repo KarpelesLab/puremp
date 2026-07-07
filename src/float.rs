@@ -2613,6 +2613,29 @@ fn power_series_rect(
     p: impl Fn(u64) -> u64,
     q: impl Fn(u64) -> u64,
 ) -> Nat {
+    let acc = power_series_rect_signed(n, c, powers, alternating, has_numer, p, q);
+    debug_assert!(!acc.is_negative(), "series partial sum stays non-negative");
+    acc.magnitude()
+}
+
+/// Signed core of [`power_series_rect`]: returns the scaled sum `S·2^n` as a
+/// signed [`Int`] instead of a magnitude, so it also serves series whose partial
+/// **and** final sums oscillate in sign — the ascending Bessel `Jₙ` series, where
+/// the running total dips negative before the block-leading term passes its
+/// `m ≈ x/2` peak, and the final `0F1` bracket itself may be negative. The block
+/// machinery already carries each block's sign (`w_acc`/`block_neg`) into a signed
+/// `acc`; this variant simply publishes that signed accumulator rather than
+/// asserting it stayed non-negative, which [`power_series_rect`] does for its
+/// non-negative callers (`exp`/`atanh`/`atan`/`erf`/`sin`/`cos`).
+fn power_series_rect_signed(
+    n: u64,
+    c: usize,
+    powers: &[Nat],
+    alternating: bool,
+    has_numer: bool,
+    p: impl Fn(u64) -> u64,
+    q: impl Fn(u64) -> u64,
+) -> Int {
     let y = &powers[c]; // z^C · 2^n
     let mut acc = Int::ZERO; // Σ block sums, scale 2^n
     let mut b_mag = powers[0].clone(); // |t_{iC}|·2^n, starts at t_0 = 1 → 2^n
@@ -2682,8 +2705,7 @@ fn power_series_rect(
         }
         base += c as u64;
     }
-    debug_assert!(!acc.is_negative(), "series partial sum stays non-negative");
-    acc.magnitude()
+    acc
 }
 
 /// A generous hard cap on how many terms the block loop may span, in case the
@@ -3125,6 +3147,15 @@ fn gamma_fn_at(x: &Float, w: u64) -> Float {
 /// non-zero `x` and order `n ≥ 0`. The common factor `(x/2)ⁿ/n!` is pulled out
 /// so the accumulated sum stays anchored near its leading term `1`; the sum runs
 /// in scaled-integer arithmetic like [`exp_at`].
+/// Working precisions at or above this evaluate the ascending Bessel bracket
+/// `U = Σ (∓1)ᵐ z^m/∏_{j≤m} j(j+n)` (`z = (x/2)²`) by **signed** rectangular
+/// splitting ([`bessel_bracket_rect`]); below it the term-by-term recurrence
+/// ([`bessel_bracket_simple`]) wins (its per-term bookkeeping is cheaper than the
+/// block setup). From `bench_bessel_rect`: ~break-even at 256, ~1.1–1.4× at 512,
+/// ~2.8× at 4k, ~5.5× at 16k, up to ~9× at 64k (across `J`/`I`, small/large `x`,
+/// orders 0–2).
+const BESSEL_RECT_THRESHOLD: u64 = 512;
+
 fn bessel_series_at(n: u64, x: &Float, w: u64, alternating: bool) -> Float {
     // Cancellation guard for the alternating (J) case: partial sums reach
     // ≈ e^{|x|}, i.e. ~1.4427·|x| bits (log₂e ≈ 185/128); harmless for I.
@@ -3135,7 +3166,25 @@ fn bessel_series_at(n: u64, x: &Float, w: u64, alternating: bool) -> Float {
     let half = x.scale_pow2(-1);
     let hs = scaled_int(&half, ns as i64);
     let h2 = hs.square().div_2k_trunc(ns as u32); // (x/2)² · 2^{ns}
-    // U = Σ_{m≥0} (∓1)ᵐ cₘ, c₀ = 1, cₘ = cₘ₋₁ · (x/2)² / (m(m+n)), scaled by 2^{ns}.
+    // U = Σ_{m≥0} (∓1)ᵐ cₘ, c₀ = 1, cₘ = cₘ₋₁·(x/2)²/(m(m+n)), scaled by 2^{ns}.
+    // High precision evaluates the bracket by O(√T) rectangular splitting; the
+    // cheap term-by-term recurrence wins below the crossover.
+    let sum = if w >= BESSEL_RECT_THRESHOLD {
+        bessel_bracket_rect(n, &h2, ns, alternating)
+    } else {
+        bessel_bracket_simple(n, &h2, ns, alternating)
+    };
+    let uf = Float::round_raw(sum.is_negative(), sum.magnitude(), -(ns as i64), ns, NEAR).0;
+    // prefactor = (x/2)ⁿ / n!.
+    let pref = float_powi(&half, n, ns).div(&factorial_float(n, ns), ns, NEAR);
+    uf.mul(&pref, ns, NEAR).round(w, NEAR)
+}
+
+/// The ascending Bessel bracket `U = Σ_{m≥0} (∓1)ᵐ cₘ · 2^{ns}`, term by term:
+/// `c₀ = 1`, `cₘ = cₘ₋₁·(x/2)²/(m(m+n))`, with `h2 = (x/2)²·2^{ns}`. The sign is
+/// carried in the signed [`Int`] accumulator (`sub` on odd `m` for the `J` case),
+/// so the partial sums may go negative — hence [`Int`], not [`Nat`].
+fn bessel_bracket_simple(n: u64, h2: &Int, ns: u64, alternating: bool) -> Int {
     let scale = Int::ONE.mul_2k(ns as u32);
     let mut c = scale.clone();
     let mut sum = scale.clone();
@@ -3143,7 +3192,7 @@ fn bessel_series_at(n: u64, x: &Float, w: u64, alternating: bool) -> Float {
     loop {
         // divisor = m·(m+n).
         let divisor = Int::from_u128(m as u128 * (m as u128 + n as u128));
-        c = c.mul(&h2).div_2k_trunc(ns as u32).div_trunc(&divisor);
+        c = c.mul(h2).div_2k_trunc(ns as u32).div_trunc(&divisor);
         if c.is_zero() {
             break;
         }
@@ -3154,10 +3203,31 @@ fn bessel_series_at(n: u64, x: &Float, w: u64, alternating: bool) -> Float {
         }
         m += 1;
     }
-    let uf = Float::round_raw(sum.is_negative(), sum.magnitude(), -(ns as i64), ns, NEAR).0;
-    // prefactor = (x/2)ⁿ / n!.
-    let pref = float_powi(&half, n, ns).div(&factorial_float(n, ns), ns, NEAR);
-    uf.mul(&pref, ns, NEAR).round(w, NEAR)
+    sum
+}
+
+/// The ascending Bessel bracket by **signed** rectangular splitting: the same
+/// `U = Σ (∓1)ᵐ z^m/∏_{j=1}^m q(j)` with `z = (x/2)²` and `q(j) = j(j+n)` (a
+/// power series with a rational term ratio, `p ≡ 1`), evaluated through
+/// [`power_series_rect_signed`]. Unlike the non-negative callers, `z = (x/2)²`
+/// may exceed 1, so the leading term grows through its `m ≈ x/2` peak before the
+/// quadratic denominator forces convergence; the block-count estimate
+/// ([`series_term_count`]) already tracks that growth phase, and the signed
+/// accumulator absorbs the sign oscillation of the `Jₙ` partial sums.
+fn bessel_bracket_rect(n: u64, h2: &Int, ns: u64, alternating: bool) -> Int {
+    let z = h2.magnitude();
+    if z.is_zero() {
+        // (x/2)² underflowed the working scale: U collapses to its first term, 1.
+        return Int::ONE.mul_2k(ns as u32);
+    }
+    // q(j) = j(j+n), computed in u128 and saturated so an astronomically large
+    // (never-reached) index cannot overflow; the term is long dead by then.
+    let q =
+        |k: u64| -> u64 { ((k as u128) * (k as u128 + n as u128)).min(u64::MAX as u128) as u64 };
+    let t = series_term_count(&z, ns, |_| 1, q);
+    let c = rect_block_width(t);
+    let powers = scaled_powers(&z, ns, c);
+    power_series_rect_signed(ns, c, &powers, alternating, false, |_| 1, q)
 }
 
 /// `base^e` (integer exponent) at working precision `w`, by binary exponentiation.
@@ -4049,6 +4119,72 @@ mod transc_rect_tests {
         })
     }
 
+    /// The raw ascending Bessel series through the Ziv wrapper, forcing the
+    /// rectangular or term-by-term bracket path (bypassing the dispatch
+    /// threshold) so both can be compared at the same precision. Mirrors
+    /// [`bessel_series_at`] exactly apart from that forced choice.
+    fn bessel_forced(
+        order: u64,
+        x: &Float,
+        prec: u64,
+        mode: RoundingMode,
+        alternating: bool,
+        rect: bool,
+    ) -> Float {
+        crr(prec, mode, |w| {
+            let ax_floor = x.abs().floor().and_then(|i| i.to_i64()).unwrap_or(i64::MAX);
+            let x_guard = (((ax_floor as u128 + 1) * 185 / 128).min(u64::MAX as u128)) as u64;
+            let ns = w + x_guard + 64;
+            let half = x.scale_pow2(-1);
+            let hs = scaled_int(&half, ns as i64);
+            let h2 = hs.square().div_2k_trunc(ns as u32);
+            let sum = if rect {
+                bessel_bracket_rect(order, &h2, ns, alternating)
+            } else {
+                bessel_bracket_simple(order, &h2, ns, alternating)
+            };
+            let uf = Float::round_raw(sum.is_negative(), sum.magnitude(), -(ns as i64), ns, NEAR).0;
+            let pref = float_powi(&half, order, ns).div(&factorial_float(order, ns), ns, NEAR);
+            uf.mul(&pref, ns, NEAR).round(w, NEAR)
+        })
+    }
+
+    /// Differential check: forced-rect vs forced-simple Bessel bracket are
+    /// bit-identical after correct rounding, across random `x`/order and modes.
+    fn bessel_differential(precisions: &[u64], per_prec: usize, modes: &[RoundingMode]) {
+        let mut rng = Rng(0x0be5_5e1c_0de0_1234);
+        let orders = [0u64, 1, 2, 5];
+        for &p in precisions {
+            for _ in 0..per_prec {
+                for &mode in modes {
+                    // Small argument x ∈ (0, 2) and a larger x ∈ (0, 12) that
+                    // drives the alternating J series well past its peak.
+                    let xs = rng.frac(p + 96, 6).mul(
+                        &Float::from_int(&Int::from_i64(12), p + 96, NEAR),
+                        p + 96,
+                        NEAR,
+                    );
+                    let xl = rng.frac(p + 96, 3).mul(
+                        &Float::from_int(&Int::from_i64(36), p + 96, NEAR),
+                        p + 96,
+                        NEAR,
+                    );
+                    let order = orders[(rng.next() as usize) % orders.len()];
+                    for x in [&xs, &xl] {
+                        for alternating in [true, false] {
+                            let s = bessel_forced(order, x, p, mode, alternating, false);
+                            let r = bessel_forced(order, x, p, mode, alternating, true);
+                            assert!(
+                                bit_identical(&s, &r),
+                                "bessel alt={alternating} n={order} p={p} mode={mode:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn differential(precisions: &[u64], per_prec: usize) {
         differential_modes(precisions, per_prec, &MODES);
     }
@@ -4106,6 +4242,20 @@ mod transc_rect_tests {
     }
 
     #[test]
+    fn bessel_rect_matches_simple_fast() {
+        // Compared path-vs-path (not via the dispatch threshold), so modest
+        // precisions already exercise the signed rect blocks (C ≥ 2).
+        bessel_differential(&[256, 640, 1200], 2, &MODES);
+    }
+
+    #[test]
+    #[ignore = "heavy: run with --release --ignored"]
+    fn bessel_rect_matches_simple_heavy() {
+        // All five modes, straddling the 1024 crossover and well beyond.
+        bessel_differential(&[1024, 1536, 3072, 8192, 32000], 3, &MODES);
+    }
+
+    #[test]
     fn known_values() {
         let p = 4096; // above every crossover → exercises the rect paths
         let n = Nearest;
@@ -4123,6 +4273,25 @@ mod transc_rect_tests {
         assert!(Float::zero(p).erf(p, n).is_zero());
         let erf1 = iflt(1, p).erf(p, n);
         assert!(erf1 > rflt(842, 1000, p) && erf1 < rflt(843, 1000, p));
+        // Bessel (rect path at p = 4096): J₀(0) = I₀(0) = 1, Jₙ(0) = Iₙ(0) = 0.
+        assert!(bit_identical(
+            &Float::zero(p).bessel_j(0, p, n),
+            &iflt(1, p)
+        ));
+        assert!(bit_identical(
+            &Float::zero(p).bessel_i(0, p, n),
+            &iflt(1, p)
+        ));
+        assert!(Float::zero(p).bessel_j(3, p, n).is_zero());
+        assert!(Float::zero(p).bessel_i(2, p, n).is_zero());
+        // J₀(1) ≈ 0.7651976865579665…, I₀(1) ≈ 1.2660658777520083…
+        let j0 = iflt(1, p).bessel_j(0, p, n);
+        assert!(j0 > rflt(76519, 100000, p) && j0 < rflt(76520, 100000, p));
+        let i0 = iflt(1, p).bessel_i(0, p, n);
+        assert!(i0 > rflt(126606, 100000, p) && i0 < rflt(126607, 100000, p));
+        // J₁(5) ≈ −0.32757913759146522… (sign oscillation past the peak).
+        let j1_5 = iflt(5, p).bessel_j(1, p, n);
+        assert!(j1_5 < rflt(-32757, 100000, p) && j1_5 > rflt(-32758, 100000, p));
     }
 
     #[test]
@@ -4210,6 +4379,66 @@ mod transc_rect_tests {
                 ),
             ];
             for (name, ts, tr) in rows {
+                println!(
+                    "{name}  w={w:>6}   simple {:>9.4}ms   rect {:>9.4}ms   {:>5.2}x",
+                    ts * 1e3,
+                    tr * 1e3,
+                    ts / tr
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored bench_bessel_rect --nocapture"]
+    fn bench_bessel_rect() {
+        use std::time::Instant;
+        fn t(iters: u32, mut f: impl FnMut()) -> f64 {
+            f();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let s = Instant::now();
+                for _ in 0..iters {
+                    f();
+                }
+                best = best.min(s.elapsed().as_secs_f64() / iters as f64);
+            }
+            best
+        }
+        let widths = [256u64, 512, 768, 1024, 1536, 2048, 4096, 8192, 16384, 65536];
+        // (label, argument x, order n, alternating). Small and large arguments,
+        // orders 0/2, both J (alternating) and I (positive).
+        let cases: [(&str, i64, u64, bool); 4] = [
+            ("J0 x=2 ", 2, 0, true),
+            ("J2 x=15", 15, 2, true),
+            ("I0 x=2 ", 2, 0, false),
+            ("I0 x=15", 15, 0, false),
+        ];
+        for &w in &widths {
+            let iters: u32 = if w <= 1024 {
+                100
+            } else if w <= 4096 {
+                30
+            } else if w <= 16384 {
+                6
+            } else {
+                2
+            };
+            for (name, xi, order, alternating) in cases {
+                // Build h2 = (x/2)²·2^{ns} at the working scale the series uses.
+                let ax = (xi as u128 * 185 / 128 + 1) as u64;
+                let ns = w + ax + 64;
+                let x = iflt(xi, ns);
+                let half = x.scale_pow2(-1);
+                let h2 = scaled_int(&half, ns as i64)
+                    .square()
+                    .div_2k_trunc(ns as u32);
+                let ts = t(iters, || {
+                    std::hint::black_box(bessel_bracket_simple(order, &h2, ns, alternating));
+                });
+                let tr = t(iters, || {
+                    std::hint::black_box(bessel_bracket_rect(order, &h2, ns, alternating));
+                });
                 println!(
                     "{name}  w={w:>6}   simple {:>9.4}ms   rect {:>9.4}ms   {:>5.2}x",
                     ts * 1e3,

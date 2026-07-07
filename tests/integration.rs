@@ -54,6 +54,84 @@ fn factorial_20_and_50() {
     );
 }
 
+// Independent naive reference implementations: the sequential accumulator loops
+// the product-tree `Int::factorial`/`Int::binomial` replaced. Every fast result
+// must equal these bit-for-bit.
+fn naive_factorial(n: u64) -> Int {
+    (2..=n).fold(Int::one(), |a, k| a.mul(&Int::from_i64(k as i64)))
+}
+
+fn naive_binomial(n: u64, k: u64) -> Int {
+    if k > n {
+        return Int::from_i64(0);
+    }
+    let k = k.min(n - k);
+    let mut result = Int::one();
+    for i in 1..=k {
+        result = result
+            .mul(&Int::from_i64((n - k + i) as i64))
+            .div_exact(&Int::from_i64(i as i64));
+    }
+    result
+}
+
+#[test]
+fn factorial_matches_naive_dense() {
+    // Dense small range: every value identical to the naive loop.
+    for n in 0..1000u64 {
+        assert_eq!(Int::factorial(n), naive_factorial(n), "factorial({n})");
+    }
+    // Spot large values.
+    for &n in &[5000u64, 20000] {
+        assert_eq!(Int::factorial(n), naive_factorial(n), "factorial({n})");
+    }
+}
+
+#[test]
+fn factorial_recurrence() {
+    // factorial(n) == n * factorial(n-1).
+    for n in 1..500u64 {
+        assert_eq!(
+            Int::factorial(n),
+            Int::factorial(n - 1).mul(&Int::from_i64(n as i64)),
+            "n!={n}"
+        );
+    }
+}
+
+#[test]
+fn binomial_matches_naive_dense() {
+    for n in 0..200u64 {
+        for k in 0..=n + 2 {
+            assert_eq!(
+                Int::binomial(n, k),
+                naive_binomial(n, k),
+                "binomial({n}, {k})"
+            );
+        }
+    }
+}
+
+#[test]
+fn binomial_spot_large_and_symmetry() {
+    // Large n with k = 0, 1, n/2, n-1, n and a few in between.
+    for &n in &[1000u64, 5000, 20000] {
+        for &k in &[0u64, 1, 2, n / 4, n / 2, n - 1, n] {
+            assert_eq!(
+                Int::binomial(n, k),
+                naive_binomial(n, k),
+                "binomial({n}, {k})"
+            );
+            // Symmetry identity: C(n, k) == C(n, n-k).
+            assert_eq!(
+                Int::binomial(n, k),
+                Int::binomial(n, n - k),
+                "sym binomial({n}, {k})"
+            );
+        }
+    }
+}
+
 #[test]
 fn power_of_two() {
     assert_eq!(

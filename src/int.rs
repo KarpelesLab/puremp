@@ -1161,28 +1161,56 @@ fn fib_pair(n: u64) -> (Int, Int) {
     }
 }
 
+/// Product of the consecutive integers `lo·(lo+1)·…·hi`, evaluated as a balanced
+/// binary product tree (`lo <= hi`, `lo >= 1`).
+///
+/// Splitting the range in half keeps every multiply between two operands of
+/// similar magnitude, which the sub-quadratic multiply stack (Karatsuba/Toom/
+/// NTT) exploits — versus the naive `acc·k` loop whose huge×tiny products are
+/// each linear in the accumulator, giving quadratic total work. Benchmarks show
+/// this wins over the sequential loop across the whole range (even for tiny `n`),
+/// so the tree is used unconditionally; the leaves (single value / adjacent
+/// pair) are the base case.
+fn product_range(lo: u64, hi: u64) -> Int {
+    match hi - lo {
+        0 => Int::from_u64(lo),
+        1 => Int::from_u64(lo).mul(&Int::from_u64(hi)),
+        _ => {
+            let mid = lo + (hi - lo) / 2;
+            product_range(lo, mid).mul(&product_range(mid + 1, hi))
+        }
+    }
+}
+
 impl Int {
     /// Returns `n!` (`0! == 1! == 1`).
+    ///
+    /// Evaluated as a balanced product tree over `2·3·…·n` so the multiplies
+    /// feed the fast multiply stack, rather than a sequential huge×tiny loop.
     pub fn factorial(n: u64) -> Int {
-        let mut acc = Int::ONE;
-        for k in 2..=n {
-            acc = acc.mul(&Int::from(k));
+        if n < 2 {
+            return Int::ONE;
         }
-        acc
+        product_range(2, n)
     }
 
     /// Returns the binomial coefficient `C(n, k)` (`0` if `k > n`).
+    ///
+    /// Computes the `k`-term falling product `(n-k+1)·…·n` and `k!` each as a
+    /// balanced product tree, then a single exact division — avoiding the
+    /// per-step `div_exact` of the sequential accumulator loop.
     pub fn binomial(n: u64, k: u64) -> Int {
         if k > n {
             return Int::ZERO;
         }
         let k = k.min(n - k);
-        let mut result = Int::ONE;
-        for i in 1..=k {
-            // Each intermediate C(n-k+i, i) is an integer, so the division exact.
-            result = result.mul(&Int::from(n - k + i)).div_exact(&Int::from(i));
+        if k == 0 {
+            return Int::ONE;
         }
-        result
+        // num / den = C(n, k) is an integer, so the division is exact.
+        let num = product_range(n - k + 1, n);
+        let den = product_range(1, k);
+        num.div_exact(&den)
     }
 
     /// Returns the multinomial coefficient `(Σkᵢ)! / ∏(kᵢ!)`.

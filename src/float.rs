@@ -3179,24 +3179,12 @@ fn float_powi(base: &Float, e: u64, w: u64) -> Float {
 
 /// `n!` as a [`Float`] at working precision `w`.
 fn factorial_float(n: u64, w: u64) -> Float {
-    let mut f = Int::ONE;
-    let mut k = 2u64;
-    while k <= n {
-        f = f.mul(&Int::from_u64(k));
-        k += 1;
-    }
-    Float::from_int(&f, w, NEAR)
+    Float::from_int(&Int::factorial(n), w, NEAR)
 }
 
 /// `n!` as an exact [`Int`].
 fn factorial_int(n: u64) -> Int {
-    let mut f = Int::ONE;
-    let mut k = 2u64;
-    while k <= n {
-        f = f.mul(&Int::from_u64(k));
-        k += 1;
-    }
-    f
+    Int::factorial(n)
 }
 
 /// The `n`-th harmonic number `Hₙ = Σ_{j=1}^{n} 1/j` as a [`Float`] at precision

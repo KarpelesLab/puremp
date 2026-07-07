@@ -148,6 +148,10 @@ name = "trig_bench"
 required-features=["std","float"]
 
 [[example]]
+name = "factorial_bench"
+required-features=["std","int"]
+
+[[example]]
 name = "bench"
 required-features = ["std", "float"]
 

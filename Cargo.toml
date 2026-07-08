@@ -62,9 +62,11 @@ identify = ["lattice", "float"]
 # Discrete logarithms modulo n (baby-step giant-step + Pollard's rho). Built on
 # `Int`/`ModInt`.
 dlog = ["int"]
-# Certificate-based primality *proving* (Pocklington–Lehmer and the BLS n^{1/3}
-# refinement) producing an auditable `PrimalityCertificate`. Built on `Int`.
-primality = ["int"]
+# Certificate-based primality *proving*: Pocklington–Lehmer and the BLS n^{1/3}
+# `n∓1` refinement, plus Atkin–Morain **ECPP** (elliptic-curve primality proving)
+# for inputs where `n∓1` cannot be factored, producing an auditable
+# `PrimalityCertificate`. ECPP needs modular polynomial root-finding (`poly`).
+primality = ["int", "poly"]
 # Optional arbitrary-precision binary floats (`Float`) with directed rounding,
 # aiming at MPFR-class correct rounding. Built on `Int`/`Rational` (decimal I/O
 # reuses exact rationals), but NOT part of the integer/rational core contract.

@@ -160,6 +160,9 @@ pub mod dlog;
 #[cfg(feature = "primality")]
 pub mod primality;
 
+#[cfg(feature = "primality")]
+mod ecpp;
+
 #[cfg(feature = "algebraic")]
 pub mod quadratic;
 

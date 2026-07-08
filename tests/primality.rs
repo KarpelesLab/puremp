@@ -1,5 +1,6 @@
 //! Tests for certificate-based primality **proving** (`primality` feature):
-//! Pocklington–Lehmer and the BLS `n^{1/3}` refinement.
+//! Pocklington–Lehmer, the BLS `n^{1/3}` refinement, and Atkin–Morain ECPP for
+//! `n∓1`-hard inputs.
 //!
 //! These check three things: that [`prove_prime`] agrees with the reference
 //! Baillie–PSW test on known primes and composites (including Carmichael numbers
@@ -139,11 +140,12 @@ fn certificate_bound_to_wrong_number_fails() {
 }
 
 #[test]
-fn unprovable_when_n_minus_1_is_hard() {
+fn ecpp_proves_when_n_minus_1_is_hard() {
     // Build a probable prime n whose n − 1 = 112·p·q with p, q two ~40-digit
-    // primes: the smooth part (112) is far below n^{1/3}, and p·q is a large
-    // hard composite the bounded factoring refuses to split — so no n − 1 proof
-    // exists and prove_prime reports Unproven (ECPP/APR-CL territory).
+    // primes: the smooth part (112) is far below n^{1/3}, and p·q is a large hard
+    // composite the bounded factoring refuses to split — so no n − 1 proof exists.
+    // Atkin–Morain ECPP takes over and produces a verifiable certificate whose
+    // recorded bound is `None` (it is not an n − 1 proof).
     let p = Int::from(10).pow(40).next_prime();
     let q = Int::from(3).mul(&Int::from(10).pow(40)).next_prime();
     let n = Int::from(112).mul(&p).mul(&q).add(&Int::ONE);
@@ -151,10 +153,19 @@ fn unprovable_when_n_minus_1_is_hard() {
         n.is_prime_bpsw(),
         "constructed n must be a (probable) prime"
     );
-    assert!(
-        matches!(prove_prime(&n), Primality::Unproven),
-        "n − 1 cannot be factored past n^{{1/3}}, so the proof is Unproven"
-    );
+    match prove_prime(&n) {
+        Primality::Prime(cert) => {
+            assert_eq!(
+                cert.bound(),
+                None,
+                "n − 1 is hard, so this must be an ECPP proof"
+            );
+            assert!(cert.verify(&n), "the ECPP certificate must verify");
+            // Wrong target must be rejected.
+            assert!(!cert.verify(&n.add(&Int::from(2))));
+        }
+        other => panic!("ECPP should prove this n − 1-hard prime, got {other:?}"),
+    }
 }
 
 #[test]

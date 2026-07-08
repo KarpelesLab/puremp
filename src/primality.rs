@@ -23,16 +23,26 @@
 //!   not divide `n`), no such factorization exists and `n` is prime. This lets a
 //!   proof succeed with only a third of `n−1` factored.
 //!
-//! Both share one witness format, so a single [`PrimalityCertificate`] covers
-//! them; the recorded [`Bound`] (√ or ∛) says which applied. Certificates are
-//! **recursive**: each prime `q | F` that is itself larger than `2^64` carries
-//! its own nested certificate, so [`PrimalityCertificate::verify`] can re-derive
-//! the whole proof from the ground up, bottoming out at values below `2^64`
-//! where Baillie–PSW is deterministic.
+//! - **Atkin–Morain [ECPP].** When `n∓1` cannot be factored far enough, the
+//!   elliptic-curve method takes over: it builds a CM elliptic curve
+//!   `E/(ℤ/nℤ)` whose order has a large prime factor `q`, reducing the primality
+//!   of `n` to that of the smaller `q` (proved recursively). This depends only on
+//!   `n` being represented by a small imaginary-quadratic discriminant, not on
+//!   any factorisation of `n∓1`. The
+//!   Goldwasser–Kilian/Atkin–Morain theorem and construction are documented in
+//!   the (private) `ecpp` module.
 //!
-//! Full [ECPP] and APR-CL — the general-purpose proofs that do not depend on
-//! `n∓1` factoring nicely — are out of scope; when the `n−1` factoring cannot
-//! reach the `n^{1/3}` bound, [`prove_prime`] reports [`Primality::Unproven`].
+//! All three share one recursive [`PrimalityCertificate`]: each `n − 1` proof
+//! records the [`Bound`] (√ or ∛) it relied on, and every large prime it defers
+//! to (a factor `q | F`, or the ECPP prime `q`) carries its own nested
+//! certificate, so [`PrimalityCertificate::verify`] re-derives the whole proof
+//! from the ground up, bottoming out at values below `2^64` where Baillie–PSW is
+//! deterministic.
+//!
+//! APR-CL — the other general-purpose proof — is out of scope; ECPP is only
+//! attempted when the `n−1` factoring cannot reach the `n^{1/3}` bound, and if
+//! ECPP also finds no usable discriminant [`prove_prime`] reports
+//! [`Primality::Unproven`].
 //!
 //! [ECPP]: https://en.wikipedia.org/wiki/Elliptic_curve_primality
 //!
@@ -79,9 +89,10 @@ pub enum Primality {
     /// `n` is *certainly* composite (a factor, a Fermat witness, or a
     /// deterministic Baillie–PSW rejection was found).
     Composite,
-    /// `n` is a probable prime, but `n∓1` could not be factored far enough to
-    /// build a certificate. A general-purpose proof (ECPP / APR-CL) would be
-    /// needed; those are out of scope here.
+    /// `n` is a probable prime, but neither the `n∓1` methods nor ECPP (over the
+    /// built-in discriminant table) could build a certificate. A different
+    /// general-purpose proof (APR-CL), or a larger discriminant table, would be
+    /// needed.
     Unproven,
 }
 
@@ -102,6 +113,32 @@ enum PrimeProof {
     Small,
     /// `q ≥ 2^64`, proved recursively by its own certificate.
     Recursive(Box<PrimalityCertificate>),
+}
+
+/// One Atkin–Morain **ECPP** downrun step: an elliptic curve
+/// `E: y² = x³ + a·x + b` over `ℤ/nℤ`, a witness point `P = (px, py)`, the target
+/// order `m = k·q` with `q` a large prime, and a recursive proof that `q` is
+/// prime. The Goldwasser–Kilian theorem this witnesses is documented in the
+/// (private) `ecpp` module. All ring elements
+/// are stored as canonical residues in `[0, n)`.
+#[derive(Clone, Debug)]
+pub(crate) struct EcppCert {
+    /// Curve coefficient `a`.
+    pub(crate) a: Int,
+    /// Curve coefficient `b`.
+    pub(crate) b: Int,
+    /// The curve order used, `m = k·q`.
+    pub(crate) m: Int,
+    /// The large prime factor `q` of `m`, with `q > (n^{1/4}+1)²`.
+    pub(crate) q: Int,
+    /// The smooth cofactor `k = m/q`.
+    pub(crate) k: Int,
+    /// `x`-coordinate of the witness point `P`.
+    pub(crate) px: Int,
+    /// `y`-coordinate of the witness point `P`.
+    pub(crate) py: Int,
+    /// Recursive proof that `q` is prime.
+    pub(crate) q_proof: Box<PrimalityCertificate>,
 }
 
 /// One prime power `q^e ‖ F`, its Pocklington witness, and the proof that `q`
@@ -132,6 +169,10 @@ enum Kind {
         /// Which size bound on `F` the proof relied on.
         bound: Bound,
     },
+    /// An Atkin–Morain ECPP proof: primality of `n` reduced to that of a smaller
+    /// prime `q` via an elliptic curve. Boxed (the arm is much larger than the
+    /// others). See [`EcppCert`].
+    Ecpp(Box<EcppCert>),
 }
 
 /// A checkable proof that a specific number is prime.
@@ -159,7 +200,7 @@ impl PrimalityCertificate {
     /// for a small (`< 2^64`, Baillie–PSW) certificate.
     pub fn bound(&self) -> Option<Bound> {
         match &self.kind {
-            Kind::SmallBpsw => None,
+            Kind::SmallBpsw | Kind::Ecpp(_) => None,
             Kind::NMinusOne { bound, .. } => Some(*bound),
         }
     }
@@ -189,8 +230,8 @@ impl PrimalityCertificate {
 ///   deterministic Baillie–PSW);
 /// - [`Primality::Composite`] — with certainty — for composites (including
 ///   Carmichael numbers and products of large primes);
-/// - [`Primality::Unproven`] when `n` is a probable prime but `n − 1` could not
-///   be factored past the `n^{1/3}` bound.
+/// - [`Primality::Unproven`] when `n` is a probable prime that neither the `n−1`
+///   proof nor ECPP could settle.
 pub fn prove_prime(n: &Int) -> Primality {
     // Units and negatives are not prime; report them as (not-prime) composite.
     if n < &Int::from(2) {
@@ -211,11 +252,18 @@ pub fn prove_prime(n: &Int) -> Primality {
     if !n.is_prime_bpsw() {
         return Primality::Composite;
     }
-    // n is a probable prime; try to build an n − 1 proof.
+    // n is a probable prime; try to build an n − 1 proof first (cheap when it
+    // works), then fall back to Atkin–Morain ECPP.
     match prove_n_minus_1(n) {
         Attempt::Proved(cert) => Primality::Prime(cert),
         Attempt::Composite => Primality::Composite,
-        Attempt::Insufficient => Primality::Unproven,
+        Attempt::Insufficient => match crate::ecpp::prove_ecpp(n) {
+            Some(cert) => Primality::Prime(PrimalityCertificate {
+                n: n.clone(),
+                kind: Kind::Ecpp(Box::new(cert)),
+            }),
+            None => Primality::Unproven,
+        },
     }
 }
 
@@ -468,6 +516,7 @@ fn verify_cert(cert: &PrimalityCertificate) -> bool {
             cofactor,
             bound,
         } => verify_n_minus_1(n, factors, cofactor, *bound),
+        Kind::Ecpp(ecpp) => crate::ecpp::verify_ecpp(n, ecpp),
     }
 }
 

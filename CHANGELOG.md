@@ -7,6 +7,31 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/KarpelesLab/puremp/compare/v0.2.3...v0.2.4) - 2026-07-08
+
+### Other
+
+- run BSGS + Pollard-rho discrete-log loops in the Montgomery domain
+- integral (de Weger / Cohen §2.6.3) LLL — bounded-integer Gram–Schmidt, 5–21x faster
+- nested Kronecker multiply for Poly<GF(pᵏ)> — 4-30x over Karatsuba
+- signed rectangular-splitting for the ascending Bessel series
+- product-tree factorial/binomial (up to ~64x / ~10x faster)
+- rectangular-splitting exp/atanh/atan/erf series — O(√T) multiplies
+- Kronecker Poly<ModInt> multiply over GF(p) (~2-27x vs Karatsuba)
+- *(elliptic)* inversion-free Jacobian scalar_mul, gated to expensive-inversion fields
+- O(√w) rectangular sin/cos series — up to ~9x faster at high precision
+- cross-reduce Rational add/sub/mul/div (Henrici + cross-cancel)
+- Montgomery-resident ModInt for odd moduli
+- *(nat)* small-prime trial-division prefilter for Baillie–PSW
+- *(galois)* fused GF(pᵏ) multiply with precomputed x^k…x^{2k-2} reduction table
+- *(poly)* gate Newton division and Half-GCD dispatch high (base case wins)
+- *(poly)* Newton fast division, Half-GCD gcd, and Kronecker multiplication
+- Strassen–Winograd matrix multiply for exact rings (Int/Rational)
+- subquadratic modular inverse via Half-GCD cofactor driver
+- *(factor)* single large-prime variation for SIQS
+- *(factor)* run Pollard rho and ECM in the Montgomery domain
+- *(factor)* lower the SIQS escalation threshold from 130 to 100 bits
+
 ## [0.2.3](https://github.com/KarpelesLab/puremp/compare/v0.2.2...v0.2.3) - 2026-07-05
 
 ### Added

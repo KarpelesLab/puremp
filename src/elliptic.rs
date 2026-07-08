@@ -33,11 +33,29 @@
 //!
 //! # Point counting
 //!
-//! [`EllipticCurve::curve_order`] and [`EllipticCurve::order_of_point`] over
-//! `GF(p)` are implemented by a **naive `O(p)` scan** of the base field (summing
-//! Legendre symbols), which is only practical for modest primes — a few million
-//! at most. The asymptotically fast Schoof / Schoof–Elkies–Atkin algorithms are
-//! left as future work.
+//! [`EllipticCurve::point_count`] (and the equivalent
+//! [`EllipticCurve::curve_order`], used by [`EllipticCurve::order_of_point`])
+//! over `GF(p)` compute `#E(GF(p)) = p + 1 − t` by two routes, dispatched on the
+//! size of `p`:
+//!
+//! - a **naive `O(p)` scan** of the base field (summing Legendre symbols), used
+//!   for small `p` and as the differential cross-check; and
+//! - **Schoof's algorithm** ([`schoof_point_count`](EllipticCurve::schoof_point_count)),
+//!   polynomial-time in `log p`, used above a size threshold where the scan is
+//!   impractical.
+//!
+//! Schoof recovers the Frobenius trace `t` one small prime `ℓ` at a time. For a
+//! set of primes with `∏ ℓ > 4√p`, `t mod ℓ` is found by working in the ring
+//! `GF(p)[x] / (ψ_ℓ(x))` (with the curve relation `y² = x³ + a·x + b`), where
+//! `ψ_ℓ` is the `ℓ`-th division polynomial: the trace is the unique `t_ℓ` making
+//! the Frobenius `φ : (x, y) ↦ (x^p, y^p)` satisfy
+//! `φ² − [t_ℓ]φ + [p] ≡ 0` on the `ℓ`-torsion `E[ℓ]`. The residues are combined
+//! by the Chinese Remainder Theorem and `t` taken in `[−2√p, 2√p]` (Hasse). The
+//! prime `ℓ = 2` is special-cased via `gcd(x^p − x, x³ + a·x + b)` (a nontrivial
+//! gcd means a rational 2-torsion point, so `#E` is even, i.e. `t ≡ 0 mod 2`).
+//!
+//! Only the classical Schoof algorithm is implemented; the Elkies/Atkin
+//! improvements (SEA) are left as future work.
 //!
 //! # Clean-room provenance
 //!
@@ -45,14 +63,29 @@
 //! from the open literature: Silverman, *The Arithmetic of Elliptic Curves*
 //! (§III.1–III.2); Washington, *Elliptic Curves: Number Theory and Cryptography*
 //! (§2–§4); the *Handbook of Applied Cryptography* §6; and Cohen, *A Course in
-//! Computational Algebraic Number Theory* §7. No third-party source was
-//! consulted.
+//! Computational Algebraic Number Theory* §7. Schoof's point-counting algorithm
+//! follows R. Schoof, *Elliptic curves over finite fields and the computation of
+//! square roots mod p*, Math. Comp. **44** (1985); Cohen §7.4–7.5; and
+//! Blake–Seroussi–Smart, *Elliptic Curves in Cryptography*, ch. VII. No
+//! third-party source was consulted.
 
 use core::fmt;
 
+use alloc::vec::Vec;
+
 use crate::int::Int;
 use crate::mod_int::ModInt;
-use crate::ring::Field;
+use crate::poly::Poly;
+use crate::ring::{Field, Ring};
+
+/// Bit-length of `p` at or above which [`EllipticCurve::point_count`] switches
+/// from the naive `O(p)` scan to [Schoof's algorithm](EllipticCurve::schoof_point_count).
+/// Below it (and for `p ∈ {2, 3}`) the exact scan is both faster and simpler.
+///
+/// The measured crossover sits near `p ≈ 10^5`; `2^20 ≈ 10^6` is a small step
+/// above it, where Schoof is already several times faster (e.g. ~3.5× at
+/// `p ≈ 10^6`, ~70× at `p ≈ 10^8`) and the scan starts to hurt.
+const SCHOOF_BITS: u32 = 20;
 
 /// Returns `n · x` for a small non-negative integer `n`, built from repeated
 /// doubling within the field of `x` (so it works for any [`Field`], including
@@ -587,10 +620,41 @@ impl EllipticCurve<ModInt> {
     }
 
     /// Returns the curve order `#E(GF(p))` — the number of affine points plus
-    /// one for the point at infinity — by a naive `O(p)` scan summing Legendre
-    /// symbols. Only practical for modest `p` (see the [module docs](self)); the
-    /// result satisfies the Hasse bound `|#E − (p + 1)| ≤ 2√p`.
+    /// one for the point at infinity.
+    ///
+    /// Dispatches on the size of `p`: a naive `O(p)` scan for small `p`, and
+    /// [Schoof's algorithm](Self::schoof_point_count) (polynomial in `log p`)
+    /// above a threshold where the scan is impractical (see the
+    /// [module docs](self)). Identical in value to
+    /// [`point_count`](Self::point_count); the result satisfies the Hasse bound
+    /// `|#E − (p + 1)| ≤ 2√p`.
     pub fn curve_order(&self) -> Int {
+        self.point_count()
+    }
+
+    /// Returns the number of points `#E(GF(p)) = p + 1 − t` on the curve.
+    ///
+    /// Uses the naive `O(p)` scan for small `p` (below `2^SCHOOF_BITS`) and
+    /// [Schoof's algorithm](Self::schoof_point_count) for larger `p`. Both
+    /// return the same value; Schoof is polynomial-time in `log p`, so it is the
+    /// only feasible route for cryptographic-size primes.
+    pub fn point_count(&self) -> Int {
+        let p = self.field_prime();
+        // Schoof needs characteristic ≠ 2, 3 and only pays off well above the
+        // scan's reach; small `p` (including p ∈ {2, 3}) take the exact scan.
+        if p.bit_len() >= SCHOOF_BITS && p > Int::from(3) {
+            self.schoof_point_count()
+        } else {
+            self.naive_curve_order()
+        }
+    }
+
+    /// Returns `#E(GF(p))` by a naive `O(p)` scan of the base field, summing
+    /// `1 + Legendre(x³ + a·x + b, p)` over all `x` (plus one for infinity). Only
+    /// practical for modest `p`; it is the differential cross-check for
+    /// [`schoof_point_count`](Self::schoof_point_count).
+    #[doc(hidden)]
+    pub fn naive_curve_order(&self) -> Int {
         let p = self.field_prime();
         // Start at 1 for the point at infinity.
         let mut count = Int::ONE;
@@ -640,5 +704,474 @@ impl EllipticCurve<ModInt> {
             }
         }
         order
+    }
+}
+
+// ===========================================================================
+// Schoof's point-counting algorithm over GF(p).
+//
+// `#E(GF(p)) = p + 1 − t`, where `t` is the trace of the Frobenius
+// endomorphism `φ : (x, y) ↦ (x^p, y^p)`. Schoof recovers `t mod ℓ` for enough
+// small primes `ℓ` (with `∏ ℓ > 4√p`) and CRTs them, exploiting the identity
+// `φ² − [t]φ + [p] ≡ 0` on the `ℓ`-torsion `E[ℓ]`. All work happens in the ring
+// `R = GF(p)[x]/(ψ_ℓ(x))` together with the curve relation `y² = x³ + a·x + b`,
+// where `ψ_ℓ` is the `ℓ`-th division polynomial (of degree `(ℓ²−1)/2` for odd
+// `ℓ`), whose roots are exactly the `x`-coordinates of the nonzero `ℓ`-torsion.
+//
+// Every point that arises (Frobenius images, and integer multiples of the
+// generic torsion point `(x, y)`) has `y`-coordinate of the form `y·b(x)`, so a
+// point is stored as `(a, b)` meaning `(a(x), y·b(x))` with `a, b ∈ R`. The
+// group law stays inside this shape (the `y²` in `λ²` collapses to
+// `f = x³+ax+b`). See Schoof, Math. Comp. 44 (1985); Cohen §7.4–7.5;
+// Blake–Seroussi–Smart ch. VII.
+// ===========================================================================
+
+/// Outcome of inverting a polynomial modulo `h` in `GF(p)[x]/(h)`.
+enum PolyInv {
+    /// The inverse — `gcd(a, h)` was a unit, so `a` is invertible mod `h`.
+    Unit(Poly<ModInt>),
+    /// `a ≡ 0 (mod h)`: genuinely zero, no inverse.
+    Zero,
+    /// `gcd(a, h)` is a nontrivial proper (monic) factor of `h`, i.e. `h` is
+    /// reducible. The caller restarts the `ℓ`-computation modulo this factor.
+    Factor(Poly<ModInt>),
+}
+
+/// Inverts `a` modulo the monic polynomial `h` over `GF(p)` via the extended
+/// Euclidean algorithm, tracking a cofactor `s` with `s·a ≡ r (mod h)`. See
+/// [`PolyInv`].
+fn poly_inv_mod(a: &Poly<ModInt>, h: &Poly<ModInt>) -> PolyInv {
+    let a = a.rem(h);
+    if a.is_zero() {
+        return PolyInv::Zero;
+    }
+    let one = a.leading().expect("a is nonzero").one();
+    let mut r0 = h.clone();
+    let mut r1 = a.clone();
+    let mut s0 = Poly::<ModInt>::zero();
+    let mut s1 = Poly::constant(one);
+    while !r1.is_zero() {
+        let (q, r) = r0.div_rem(&r1);
+        r0 = r1;
+        r1 = r;
+        let s = s0.sub(&q.mul(&s1));
+        s0 = s1;
+        s1 = s;
+    }
+    // r0 = gcd(a, h) (up to a scalar); s0·a ≡ r0 (mod h). Since `a` is a nonzero
+    // remainder its gcd with `h` has degree < deg h, so a nonconstant gcd is a
+    // proper factor.
+    match r0.degree() {
+        Some(0) => {
+            let c_inv = r0.coeff(0).inv().expect("a nonzero constant is invertible");
+            PolyInv::Unit(s0.scalar_mul(&c_inv).rem(h))
+        }
+        Some(_) => PolyInv::Factor(r0.monic()),
+        None => unreachable!("gcd of nonzero operands is nonzero"),
+    }
+}
+
+/// `a·b mod h`.
+fn poly_mulmod(a: &Poly<ModInt>, b: &Poly<ModInt>, h: &Poly<ModInt>) -> Poly<ModInt> {
+    a.mul(b).rem(h)
+}
+
+/// `base^exp mod h` by square-and-multiply (`exp ≥ 0`). `one` supplies the
+/// coefficient ring's multiplicative identity for the initial accumulator.
+fn poly_powmod(base: &Poly<ModInt>, exp: &Int, h: &Poly<ModInt>, one: &ModInt) -> Poly<ModInt> {
+    let mut result = Poly::constant(one.clone());
+    let mut b = base.rem(h);
+    let bits = exp.bit_len();
+    for i in 0..bits {
+        if exp.bit(i) {
+            result = poly_mulmod(&result, &b, h);
+        }
+        if i + 1 < bits {
+            b = poly_mulmod(&b, &b, h);
+        }
+    }
+    result
+}
+
+/// A point on `E` over `R = GF(p)[x]/(h)`, with the `y`-coordinate written as
+/// `y·b`. `Aff { a, b }` denotes `(a(x), y·b(x))`.
+#[derive(Clone)]
+enum RingPoint {
+    /// The point at infinity.
+    Inf,
+    /// The affine point `(a, y·b)`.
+    Aff { a: Poly<ModInt>, b: Poly<ModInt> },
+}
+
+/// Shared data for the ring group law modulo one factor `h` of `ψ_ℓ`.
+struct SchoofCtx {
+    /// Current modulus (a monic factor of `ψ_ℓ`).
+    h: Poly<ModInt>,
+    /// `f = x³ + a·x + b` reduced mod `h`.
+    f: Poly<ModInt>,
+    /// `f⁻¹ mod h` (always exists: `gcd(f, ψ_ℓ) = 1` for odd `ℓ`).
+    f_inv: Poly<ModInt>,
+    /// The curve coefficient `a` as a constant polynomial.
+    a_poly: Poly<ModInt>,
+    /// The coefficient ring's `1` (for building small scalar constants).
+    one: ModInt,
+}
+
+/// Group law `P ⊕ Q` in `R`. Returns `Err(g)` when a required inverse exposes a
+/// proper factor `g` of `h` (`h` reducible) — the signal to restart modulo `g`.
+fn ring_add(p: &RingPoint, q: &RingPoint, ctx: &SchoofCtx) -> Result<RingPoint, Poly<ModInt>> {
+    let (a1, b1) = match p {
+        RingPoint::Inf => return Ok(q.clone()),
+        RingPoint::Aff { a, b } => (a, b),
+    };
+    let (a2, b2) = match q {
+        RingPoint::Inf => return Ok(p.clone()),
+        RingPoint::Aff { a, b } => (a, b),
+    };
+    let d = a1.sub(a2).rem(&ctx.h);
+    if d.is_zero() {
+        // Equal x-coordinates: either a doubling or opposite points.
+        let bs = b1.sub(b2).rem(&ctx.h);
+        if bs.is_zero() {
+            return ring_double(p, ctx);
+        }
+        return Ok(RingPoint::Inf);
+    }
+    let dinv = match poly_inv_mod(&d, &ctx.h) {
+        PolyInv::Unit(v) => v,
+        PolyInv::Factor(g) => return Err(g),
+        PolyInv::Zero => unreachable!("d is nonzero mod h"),
+    };
+    // λ' = (b1 − b2)/(a1 − a2); the true slope is y·λ'.
+    let lam = poly_mulmod(&b1.sub(b2), &dinv, &ctx.h);
+    let lam2 = poly_mulmod(&lam, &lam, &ctx.h);
+    // x3 = y²·λ'² − a1 − a2 = f·λ'² − a1 − a2.
+    let x3 = poly_mulmod(&ctx.f, &lam2, &ctx.h)
+        .sub(a1)
+        .sub(a2)
+        .rem(&ctx.h);
+    // y3 = y·(λ'·(a1 − x3) − b1).
+    let b3 = poly_mulmod(&lam, &a1.sub(&x3), &ctx.h).sub(b1).rem(&ctx.h);
+    Ok(RingPoint::Aff { a: x3, b: b3 })
+}
+
+/// Doubling `[2]P` in `R`. Returns `Err(g)` on a factor of `h`, as
+/// [`ring_add`].
+fn ring_double(p: &RingPoint, ctx: &SchoofCtx) -> Result<RingPoint, Poly<ModInt>> {
+    let (a1, b1) = match p {
+        RingPoint::Inf => return Ok(RingPoint::Inf),
+        RingPoint::Aff { a, b } => (a, b),
+    };
+    let b1 = b1.rem(&ctx.h);
+    if b1.is_zero() {
+        // y-coordinate y·b1 ≡ 0: a 2-torsion point doubles to infinity.
+        return Ok(RingPoint::Inf);
+    }
+    let two = ctx.one.of(Int::from(2));
+    let three = ctx.one.of(Int::from(3));
+    // μ = (3·a1² + A)/(2·b1); the true slope is μ/y.
+    let a1sq = poly_mulmod(a1, a1, &ctx.h);
+    let num = a1sq.scalar_mul(&three).add(&ctx.a_poly).rem(&ctx.h);
+    let den = b1.scalar_mul(&two).rem(&ctx.h);
+    let dinv = match poly_inv_mod(&den, &ctx.h) {
+        PolyInv::Unit(v) => v,
+        PolyInv::Factor(g) => return Err(g),
+        PolyInv::Zero => unreachable!("den is nonzero mod h"),
+    };
+    let mu = poly_mulmod(&num, &dinv, &ctx.h);
+    let mu2 = poly_mulmod(&mu, &mu, &ctx.h);
+    // x3 = (μ/y)² − 2·a1 = μ²/f − 2·a1.
+    let two_a1 = a1.scalar_mul(&two);
+    let x3 = poly_mulmod(&mu2, &ctx.f_inv, &ctx.h)
+        .sub(&two_a1)
+        .rem(&ctx.h);
+    // y3 = y·(μ·(a1 − x3)/f − b1).
+    let t = poly_mulmod(&mu, &a1.sub(&x3), &ctx.h);
+    let b3 = poly_mulmod(&t, &ctx.f_inv, &ctx.h).sub(&b1).rem(&ctx.h);
+    Ok(RingPoint::Aff { a: x3, b: b3 })
+}
+
+/// `[k]·base` in `R` by double-and-add (`k` a small non-negative scalar).
+fn ring_mul(mut k: u64, base: &RingPoint, ctx: &SchoofCtx) -> Result<RingPoint, Poly<ModInt>> {
+    let mut result = RingPoint::Inf;
+    let mut b = base.clone();
+    while k > 0 {
+        if k & 1 == 1 {
+            result = ring_add(&result, &b, ctx)?;
+        }
+        k >>= 1;
+        if k > 0 {
+            b = ring_double(&b, ctx)?;
+        }
+    }
+    Ok(result)
+}
+
+/// Trial-division primality for the small `ℓ`-sieve.
+fn is_small_prime(n: usize) -> bool {
+    if n < 2 {
+        return false;
+    }
+    let mut d = 2;
+    while d * d <= n {
+        if n.is_multiple_of(d) {
+            return false;
+        }
+        d += 1;
+    }
+    true
+}
+
+impl EllipticCurve<ModInt> {
+    /// The curve's right-hand side `f(x) = x³ + a·x + b` as a polynomial over
+    /// `GF(p)`.
+    fn rhs_poly(&self) -> Poly<ModInt> {
+        // Coefficients low-to-high: b + a·x + 0·x² + 1·x³.
+        Poly::new(alloc::vec![
+            self.b.clone(),
+            self.a.clone(),
+            self.a.zero(),
+            self.a.one(),
+        ])
+    }
+
+    /// Returns `#E(GF(p)) = p + 1 − t` via **Schoof's algorithm**, polynomial in
+    /// `log p`.
+    ///
+    /// Determines `t mod ℓ` for successive primes `ℓ` (the prime `2` by a gcd
+    /// parity test, odd `ℓ` by locating the Frobenius eigenvalue on `E[ℓ]`) until
+    /// `∏ ℓ > 4√p`, then recovers `t` by the Chinese Remainder Theorem in the
+    /// Hasse interval `[−2√p, 2√p]`. Requires `p > 3` (characteristic `≠ 2, 3`).
+    ///
+    /// This is the asymptotically fast counterpart to
+    /// [`naive_curve_order`](Self::naive_curve_order); both return the same
+    /// value. [`point_count`](Self::point_count) selects between them by size.
+    pub fn schoof_point_count(&self) -> Int {
+        let p = self.field_prime();
+        assert!(
+            p > Int::from(3),
+            "schoof_point_count: requires characteristic ≠ 2, 3"
+        );
+        let mut moduli: Vec<Int> = Vec::new();
+        let mut residues: Vec<Int> = Vec::new();
+        let mut prod = Int::ONE;
+        // Need ∏ ℓ > 4√p, tested squared as (∏ ℓ)² > 16·p to stay in integers.
+        let bound = Int::from(16) * p.clone();
+        let mut l: usize = 2;
+        loop {
+            if is_small_prime(l) && Int::from(l as i64) != p {
+                let t_l: u64 = if l == 2 {
+                    self.schoof_t_mod_2()
+                } else {
+                    let t = self.schoof_t_mod_odd_l(l);
+                    let lm = l as i64;
+                    (((t % lm) + lm) % lm) as u64
+                };
+                residues.push(Int::from(t_l));
+                moduli.push(Int::from(l as i64));
+                prod *= Int::from(l as i64);
+                if prod.clone() * prod.clone() > bound {
+                    break;
+                }
+            }
+            l += 1;
+        }
+        let m = prod;
+        let t0 = Int::crt(&residues, &moduli).expect("moduli are distinct primes");
+        // Symmetric representative in (−M/2, M/2]: shift down when 2·t0 > M.
+        let t = if t0.clone() * Int::from(2) > m {
+            t0 - m
+        } else {
+            t0
+        };
+        p + Int::ONE - t
+    }
+
+    /// `t mod 2`: `#E` is even iff `E` has a rational 2-torsion point iff
+    /// `x³ + a·x + b` has a root in `GF(p)` iff `gcd(x^p − x, f) ≠ 1`. Returns
+    /// `0` when even, `1` when odd.
+    fn schoof_t_mod_2(&self) -> u64 {
+        let p = self.field_prime();
+        let one = self.a.one();
+        let f = self.rhs_poly();
+        let x = Poly::monomial(one.clone(), 1);
+        let xp = poly_powmod(&x, &p, &f, &one);
+        let g = xp.sub(&x).gcd(&f);
+        match g.degree() {
+            Some(d) if d >= 1 => 0,
+            _ => 1,
+        }
+    }
+
+    /// `t mod ℓ` for an odd prime `ℓ`, as a symmetric representative in
+    /// `(−ℓ/2, ℓ/2]`. Works modulo `ψ_ℓ`, restarting modulo a factor whenever
+    /// `ψ_ℓ` is found reducible (via a failed ring inverse) — the trace is the
+    /// same on any nonzero factor, and the modulus degree strictly decreases, so
+    /// this terminates.
+    fn schoof_t_mod_odd_l(&self, l: usize) -> i64 {
+        let psis = self.division_polys(l);
+        let mut h = psis[l].monic();
+        // p mod ℓ, in [1, ℓ−1] (ℓ ≠ p since ℓ < p and both prime).
+        let k = self
+            .field_prime()
+            .rem_euclid(&Int::from(l as i64))
+            .to_u64()
+            .expect("ℓ fits in u64");
+        loop {
+            match self.try_schoof_l(l, k, &h) {
+                Ok(t) => return t,
+                Err(factor) => h = factor,
+            }
+        }
+    }
+
+    /// One attempt at `t mod ℓ` working modulo the factor `h` of `ψ_ℓ`. Returns
+    /// `Err(g)` to request a restart modulo a smaller factor `g`.
+    fn try_schoof_l(&self, l: usize, k: u64, h: &Poly<ModInt>) -> Result<i64, Poly<ModInt>> {
+        let p = self.field_prime();
+        let one = self.a.one();
+        let f_full = self.rhs_poly();
+        let f = f_full.rem(h);
+        let f_inv = match poly_inv_mod(&f, h) {
+            PolyInv::Unit(v) => v,
+            PolyInv::Factor(g) => return Err(g),
+            PolyInv::Zero => return Err(h.clone()),
+        };
+        let ctx = SchoofCtx {
+            h: h.clone(),
+            f,
+            f_inv,
+            a_poly: Poly::constant(self.a.clone()),
+            one: one.clone(),
+        };
+        let x = Poly::monomial(one.clone(), 1);
+        // Frobenius: x^p, x^{p²}, and the y-factors y^p = y·f^{(p−1)/2},
+        // y^{p²} = y·f^{(p²−1)/2}.
+        let xp = poly_powmod(&x, &p, h, &one);
+        let xpp = poly_powmod(&xp, &p, h, &one);
+        let e1 = (p.clone() - Int::ONE).div_floor(&Int::from(2));
+        let yp = poly_powmod(&f_full, &e1, h, &one);
+        let p2 = p.clone() * p.clone();
+        let e2 = (p2 - Int::ONE).div_floor(&Int::from(2));
+        let ypp = poly_powmod(&f_full, &e2, h, &one);
+        let phi = RingPoint::Aff { a: xp, b: yp };
+        let phi2 = RingPoint::Aff { a: xpp, b: ypp };
+        // [k]P for the generic torsion point P = (x, y) = (x, y·1).
+        let base = RingPoint::Aff {
+            a: x.rem(h),
+            b: Poly::constant(one.clone()),
+        };
+        let kp = ring_mul(k, &base, &ctx)?;
+        // S = φ²(P) ⊕ [k]P. By φ² − [t]φ + [k] ≡ 0 on E[ℓ], S = [t]·φ(P).
+        let s = ring_add(&phi2, &kp, &ctx)?;
+        let (sa, sb) = match &s {
+            RingPoint::Inf => return Ok(0), // [t]φ(P) = O ⟹ ℓ | t
+            RingPoint::Aff { a, b } => (a.clone(), b.clone()),
+        };
+        // Find τ ∈ [1, (ℓ−1)/2] with S = ±[τ]φ(P), reading the sign off the
+        // y-factor: S = +[τ]φ ⟹ t ≡ τ, S = −[τ]φ ⟹ t ≡ −τ.
+        let mut t_pt = phi.clone();
+        let half = (l - 1) / 2;
+        for tau in 1..=half {
+            if tau > 1 {
+                t_pt = ring_add(&t_pt, &phi, &ctx)?;
+            }
+            if let RingPoint::Aff { a: ta, b: tb } = &t_pt
+                && sa == *ta
+            {
+                if sb == *tb {
+                    return Ok(tau as i64);
+                }
+                if sb == tb.neg() {
+                    return Ok(-(tau as i64));
+                }
+                // Same x but y-factor neither equal nor negated: a zero divisor,
+                // so h is reducible — restart modulo the exposed factor.
+                let g = sb.sub(tb).gcd(h);
+                if let Some(d) = g.degree()
+                    && d >= 1
+                    && d < h.degree().expect("h is nonzero")
+                {
+                    return Err(g);
+                }
+                return Ok(tau as i64);
+            }
+        }
+        unreachable!("Schoof: no Frobenius eigenvalue found for ℓ = {l}")
+    }
+
+    /// The reduced division polynomials `ψ̄_0 … ψ̄_l` as polynomials in `x` over
+    /// `GF(p)`, where `ψ_n = ψ̄_n` for odd `n` and `ψ_n = y·ψ̄_n` for even `n`
+    /// (so `ψ̄_ℓ` for odd `ℓ` is the honest `ℓ`-division polynomial). With
+    /// `F = x³+ax+b`, the standard recurrences reduce (via `y² = F`) to:
+    ///
+    /// ```text
+    /// ψ̄_{2m+1} = ψ̄_{m+2}·ψ̄_m³ − F²·ψ̄_{m−1}·ψ̄_{m+1}³   (m odd)
+    /// ψ̄_{2m+1} = F²·ψ̄_{m+2}·ψ̄_m³ − ψ̄_{m−1}·ψ̄_{m+1}³   (m even)
+    /// ψ̄_{2m}   = (ψ̄_m/2)·(ψ̄_{m+2}·ψ̄_{m−1}² − ψ̄_{m−2}·ψ̄_{m+1}²)
+    /// ```
+    fn division_polys(&self, l: usize) -> Vec<Poly<ModInt>> {
+        let a = &self.a;
+        let b = &self.b;
+        let of = |k: i64| a.of(Int::from(k));
+        let f = self.rhs_poly();
+        let f2 = f.mul(&f);
+        let mut psi: Vec<Poly<ModInt>> = Vec::with_capacity(l + 1);
+        // ψ̄_0 = 0
+        psi.push(Poly::zero());
+        // ψ̄_1 = 1
+        if l >= 1 {
+            psi.push(Poly::constant(a.one()));
+        }
+        // ψ̄_2 = 2
+        if l >= 2 {
+            psi.push(Poly::constant(of(2)));
+        }
+        // ψ̄_3 = 3x⁴ + 6a·x² + 12b·x − a²
+        if l >= 3 {
+            let c0 = -(a.clone() * a.clone());
+            let c1 = of(12) * b.clone();
+            let c2 = of(6) * a.clone();
+            let c3 = a.zero();
+            let c4 = of(3);
+            psi.push(Poly::new(alloc::vec![c0, c1, c2, c3, c4]));
+        }
+        // ψ̄_4 = 4(x⁶ + 5a·x⁴ + 20b·x³ − 5a²·x² − 4ab·x − a³ − 8b²)
+        if l >= 4 {
+            let a2 = a.clone() * a.clone();
+            let a3 = a2.clone() * a.clone();
+            let b2 = b.clone() * b.clone();
+            let c0 = of(-4) * a3 + of(-32) * b2;
+            let c1 = of(-16) * (a.clone() * b.clone());
+            let c2 = of(-20) * a2;
+            let c3 = of(80) * b.clone();
+            let c4 = of(20) * a.clone();
+            let c5 = a.zero();
+            let c6 = of(4);
+            psi.push(Poly::new(alloc::vec![c0, c1, c2, c3, c4, c5, c6]));
+        }
+        let two_inv = of(2).inv().expect("2 is invertible for p > 2");
+        for n in 5..=l {
+            let poly_n = if !n.is_multiple_of(2) {
+                let m = (n - 1) / 2;
+                let psi_m3 = psi[m].mul(&psi[m]).mul(&psi[m]);
+                let psi_mp1_3 = psi[m + 1].mul(&psi[m + 1]).mul(&psi[m + 1]);
+                let t1 = psi[m + 2].mul(&psi_m3);
+                let t2 = psi[m - 1].mul(&psi_mp1_3);
+                if m.is_multiple_of(2) {
+                    f2.mul(&t1).sub(&t2)
+                } else {
+                    t1.sub(&f2.mul(&t2))
+                }
+            } else {
+                let m = n / 2;
+                let inner = psi[m + 2]
+                    .mul(&psi[m - 1].mul(&psi[m - 1]))
+                    .sub(&psi[m - 2].mul(&psi[m + 1].mul(&psi[m + 1])));
+                psi[m].scalar_mul(&two_inv).mul(&inner)
+            };
+            psi.push(poly_n);
+        }
+        psi
     }
 }

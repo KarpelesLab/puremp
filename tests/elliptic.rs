@@ -533,3 +533,158 @@ fn scalar_mul_bench() {
         println!("order_of_point(p≈{p}) = {ord} in {ms:.2} ms");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Schoof's algorithm: `schoof_point_count` must exactly match the naive scan
+// wherever the scan is feasible, and satisfy Hasse + `[#E]·P = O` for large p.
+// ---------------------------------------------------------------------------
+
+fn mkp(v: i64, p: &Int) -> ModInt {
+    ModInt::new(Int::from(v), p.clone())
+}
+
+/// `|#E - (p+1)| <= 2√p`, tested squared to stay in integers.
+fn hasse_holds(order: &Int, p: &Int) -> bool {
+    let d = order - &(p + Int::from(1));
+    (&d * &d) <= (Int::from(4) * p)
+}
+
+#[test]
+fn schoof_matches_naive_small_primes() {
+    // Exhaustive over the tiniest primes (every non-singular a, b), where the
+    // odd-ℓ special cases and division polynomials get their sharpest workout:
+    // Schoof must equal the O(p) scan on every curve.
+    for &pv in &[5i64, 7, 11, 13, 17, 19, 23, 29, 31] {
+        let p = Int::from(pv);
+        for av in 0..pv {
+            for bv in 0..pv {
+                let curve = match EllipticCurve::new(mkp(av, &p), mkp(bv, &p)) {
+                    Some(c) => c,
+                    None => continue, // singular (Δ = 0)
+                };
+                let naive = curve.naive_curve_order();
+                let schoof = curve.schoof_point_count();
+                assert_eq!(
+                    naive, schoof,
+                    "GF({pv}) a={av} b={bv}: naive {naive} != schoof {schoof}"
+                );
+                assert!(hasse_holds(&schoof, &p));
+            }
+        }
+    }
+    // A few larger small primes with a curated spread of (a, b) shapes.
+    for &pv in &[37i64, 41, 43, 97, 101, 251] {
+        let p = Int::from(pv);
+        for &(av, bv) in &[(0i64, 1), (1, 0), (1, 1), (2, 2), (3, 5), (5, 7), (7, 11)] {
+            let curve = match EllipticCurve::new(mkp(av, &p), mkp(bv, &p)) {
+                Some(c) => c,
+                None => continue,
+            };
+            assert_eq!(
+                curve.naive_curve_order(),
+                curve.schoof_point_count(),
+                "GF({pv}) a={av} b={bv}"
+            );
+        }
+    }
+}
+
+#[test]
+fn schoof_matches_naive_medium_primes() {
+    // Larger primes (still feasible for the scan), a handful of curves each,
+    // including t = 0 supersingular and t = 1 anomalous shapes.
+    for &pv in &[1009i64, 7919, 10007] {
+        let p = Int::from(pv);
+        let mut checked = 0;
+        for &(av, bv) in &[(2i64, 2), (0, 7), (3, 5), (1, 6), (7, 0), (1, 0), (0, 1)] {
+            let curve = match EllipticCurve::new(mkp(av, &p), mkp(bv, &p)) {
+                Some(c) => c,
+                None => continue,
+            };
+            assert_eq!(
+                curve.naive_curve_order(),
+                curve.schoof_point_count(),
+                "GF({pv}) a={av} b={bv}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no curves checked for p={pv}");
+    }
+}
+
+#[test]
+fn schoof_supersingular_trace_zero() {
+    // For p ≡ 3 (mod 4), y² = x³ + x is supersingular: t = 0, #E = p + 1.
+    for &pv in &[7i64, 11, 19, 23, 31, 43, 100003] {
+        if pv % 4 != 3 {
+            continue;
+        }
+        let p = Int::from(pv);
+        let curve = EllipticCurve::new(mkp(1, &p), mkp(0, &p)).unwrap();
+        assert_eq!(curve.schoof_point_count(), &p + Int::from(1));
+    }
+}
+
+#[test]
+fn schoof_dispatch_through_point_count() {
+    // point_count() dispatches to Schoof above the size threshold; the result
+    // must satisfy Hasse and kill random points.
+    let p = Int::from(6_700_417); // ~23-bit prime (Fermat factor), above 2^22
+    assert!(p.bit_len() >= 22);
+    let curve = EllipticCurve::new(mkp(3, &p), mkp(7, &p)).unwrap();
+    let n = curve.point_count();
+    assert!(hasse_holds(&n, &p));
+    let mut found = 0;
+    let mut xi = 1i64;
+    while found < 3 && xi < 500 {
+        if let Some(pt) = curve.point_from_x(&mkp(xi, &p)) {
+            assert!(pt.scalar_mul(&n).is_infinity(), "[#E]·P != O at x={xi}");
+            found += 1;
+        }
+        xi += 1;
+    }
+    assert!(found > 0);
+}
+
+#[test]
+#[ignore = "slow: naive O(p) scan at p≈10^6; run with --release --ignored"]
+fn schoof_matches_naive_up_to_million() {
+    // Schoof == the O(p) scan at the top of the scan's feasible range.
+    for &pv in &[100_003i64, 999_983, 6_700_417] {
+        let p = Int::from(pv);
+        for &(av, bv) in &[(2i64, 2), (0, 7), (3, 5), (1, 1)] {
+            let curve = match EllipticCurve::new(mkp(av, &p), mkp(bv, &p)) {
+                Some(c) => c,
+                None => continue,
+            };
+            assert_eq!(
+                curve.naive_curve_order(),
+                curve.schoof_point_count(),
+                "GF({pv}) a={av} b={bv}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "slow: large-p Schoof; run with --release --ignored"]
+fn schoof_large_primes_hasse_and_order() {
+    // Cryptographic-ish primes far beyond the O(p) scan: verify the Hasse bound
+    // and that [#E]·P = O for several points — a necessary correctness check.
+    for s in ["1000000007", "1000000000039", "18446744073709551557"] {
+        let p = s.parse::<Int>().unwrap();
+        let curve = EllipticCurve::new(mkp(3, &p), mkp(7, &p)).unwrap();
+        let n = curve.schoof_point_count();
+        assert!(hasse_holds(&n, &p), "Hasse failed for p={s}: #E={n}");
+        let mut found = 0;
+        let mut xi = 1i64;
+        while found < 3 && xi < 500 {
+            if let Some(pt) = curve.point_from_x(&mkp(xi, &p)) {
+                assert!(pt.scalar_mul(&n).is_infinity(), "[#E]·P != O p={s} x={xi}");
+                found += 1;
+            }
+            xi += 1;
+        }
+        assert!(found > 0, "no points found for p={s}");
+    }
+}

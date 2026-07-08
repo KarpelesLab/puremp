@@ -78,8 +78,9 @@ ball = ["interval"]
 # Algebraic numbers: exact ℚ(√d) (`Quadratic`) and general real `Algebraic`.
 algebraic = ["rational", "poly", "matrix", "float"]
 # Elliptic curves `y² = x³ + a·x + b` over `GF(p)` (`ModInt`) or `ℚ` (`Rational`),
-# with the chord-and-tangent group law, point orders and naive point counting.
-elliptic = ["rational"]
+# with the chord-and-tangent group law, point orders and point counting (naive
+# scan plus Schoof's polynomial-time algorithm, which needs `poly`).
+elliptic = ["rational", "poly"]
 
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --lib --features ffi --crate-type staticlib`

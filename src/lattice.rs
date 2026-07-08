@@ -3,15 +3,25 @@
 //! [`lll_reduce`] applies the Lenstra–Lenstra–Lovász algorithm to an integer
 //! lattice basis, returning a reduced basis of short, nearly-orthogonal vectors
 //! spanning the *same* lattice (the change of basis is unimodular). The
-//! Gram–Schmidt bookkeeping is carried in exact [`Rational`] arithmetic, so the
-//! reduction is exact — no floating-point heuristics — matching the rest of the
+//! Gram–Schmidt bookkeeping is carried in **bounded integers** — the integral
+//! (de Weger / Cohen §2.6.3) formulation — rather than exploding rationals, so
+//! the reduction is exact with no coefficient blow-up, matching the rest of the
 //! crate.
+//!
+//! The state is the sequence of integer Gram determinants
+//! `d_i = ∏_{j<i} ‖b*_j‖²` (with `d_0 = 1`, so `‖b*_i‖² = d_{i+1}/d_i`) and the
+//! integers `λ_{i,j} = d_{j+1}·μ_{i,j}` for `j < i`. Bareiss/subresultant-style
+//! exact division keeps every `d_i` and `λ_{i,j}` an integer bounded by a Gram
+//! determinant (Hadamard), so no rational normalization or GCD work is needed.
 //!
 //! LLL underpins integer-relation detection, minimal-polynomial recovery for
 //! algebraic numbers, Diophantine approximation, and polynomial factorization.
 //!
-//! Reference: A. K. Lenstra, H. W. Lenstra, L. Lovász, *Factoring Polynomials
-//! with Rational Coefficients*, Mathematische Annalen 261 (1982).
+//! References: A. K. Lenstra, H. W. Lenstra, L. Lovász, *Factoring Polynomials
+//! with Rational Coefficients*, Mathematische Annalen 261 (1982); H. Cohen,
+//! *A Course in Computational Algebraic Number Theory*, §2.6.3 (Integral LLL);
+//! B. M. M. de Weger, *Solving Exponential Diophantine Equations Using Lattice
+//! Basis Reduction Algorithms*, J. Number Theory 26 (1987).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -37,6 +47,11 @@ pub fn lll_reduce(basis: &[Vec<Int>]) -> Vec<Vec<Int>> {
 /// The returned basis spans the same lattice as the input and is LLL-reduced:
 /// its Gram–Schmidt coefficients satisfy `|μ_{i,j}| ≤ 1/2` and the Lovász
 /// condition `‖b*_k‖² ≥ (δ − μ_{k,k-1}²)‖b*_{k-1}‖²` holds for every `k`.
+///
+/// The reduction is carried out in the integral (Cohen §2.6.3) formulation: the
+/// Gram–Schmidt data lives in the bounded integers `d_i` and `λ_{i,j}` (see the
+/// module docs), so the deterministic reduced basis is produced without any
+/// rational-coefficient explosion.
 pub fn lll_reduce_delta(basis: &[Vec<Int>], delta: &Rational) -> Vec<Vec<Int>> {
     let n = basis.len();
     if n <= 1 {
@@ -49,75 +64,91 @@ pub fn lll_reduce_delta(basis: &[Vec<Int>], delta: &Rational) -> Vec<Vec<Int>> {
     );
 
     let mut b: Vec<Vec<Int>> = basis.to_vec();
-    let (mut mu, mut bstar_norm) = match gram_schmidt(&b) {
-        Some(gs) => gs,
+    // Integral Gram–Schmidt: `d[0..=n]` (`d[0] = 1`) and `λ[i][j]` for `j < i`.
+    let (mut d, mut lam) = match integral_gram_schmidt(&b) {
+        Some(dl) => dl,
         None => return basis.to_vec(), // linearly dependent input
     };
-    let half = Rational::new(Int::ONE, Int::from_i64(2));
+    // δ = num/den with den > 0 (Rational is normalized); the Lovász test is
+    // cross-multiplied into a pure integer comparison.
+    let num = delta.numerator().clone();
+    let den = delta.denominator().clone();
 
     let mut k = 1;
     while k < n {
-        size_reduce(&mut b, &mut mu, k, k - 1, &half);
+        int_size_reduce(&mut b, &mut lam, &d, k, k - 1);
 
-        // Lovász condition: ‖b*_k‖² ≥ (δ − μ_{k,k-1}²)·‖b*_{k-1}‖².
-        let mk = mu[k][k - 1].clone();
-        let bound = Rational::mul(
-            &Rational::sub(delta, &Rational::mul(&mk, &mk)),
-            &bstar_norm[k - 1],
-        );
-        if bstar_norm[k].cmp(&bound) != Ordering::Less {
+        // Lovász condition ‖b*_k‖² ≥ (δ − μ_{k,k-1}²)·‖b*_{k-1}‖², cleared of
+        // denominators: pass when den·(d_{k+1}·d_{k-1} + λ_{k,k-1}²) ≥ num·d_k².
+        let lamkk = lam[k][k - 1].clone();
+        let lhs = den.mul(&d[k + 1].mul(&d[k - 1]).add(&lamkk.mul(&lamkk)));
+        let rhs = num.mul(&d[k].mul(&d[k]));
+        if lhs.cmp(&rhs) != Ordering::Less {
             // Fully size-reduce b_k against the remaining earlier vectors.
             for l in (0..k - 1).rev() {
-                size_reduce(&mut b, &mut mu, k, l, &half);
+                int_size_reduce(&mut b, &mut lam, &d, k, l);
             }
             k += 1;
         } else {
-            swap_step(&mut b, &mut mu, &mut bstar_norm, k, n);
+            int_swap(&mut b, &mut lam, &mut d, k, n);
             k = if k > 1 { k - 1 } else { 1 };
         }
     }
     b
 }
 
-/// Gram–Schmidt orthogonalization in exact rationals. Returns the coefficient
-/// matrix `μ` (only entries `j < i` are meaningful) and the squared norms
-/// `‖b*_i‖²`, or `None` if the basis is linearly dependent.
-fn gram_schmidt(b: &[Vec<Int>]) -> Option<(Vec<Vec<Rational>>, Vec<Rational>)> {
+/// Integral Gram–Schmidt (Bareiss recurrence, Cohen §2.6.3). Returns the Gram
+/// determinants `d[0..=n]` (`d[0] = 1`, `d[i] = ∏_{j<i} ‖b*_j‖²`) and the
+/// integers `λ[i][j] = d[j+1]·μ_{i,j}` (only entries `j < i` are meaningful), or
+/// `None` if the basis is linearly dependent (some `d[i+1]` vanishes).
+///
+/// Every intermediate value is an exact integer: the division by `d[i]` in the
+/// recurrence is exact (subresultant PRS), so no rationals appear.
+fn integral_gram_schmidt(b: &[Vec<Int>]) -> Option<(Vec<Int>, Vec<Vec<Int>>)> {
     let n = b.len();
-    let dim = b[0].len();
-    let mut mu = vec![vec![Rational::ZERO; n]; n];
-    let mut norm = vec![Rational::ZERO; n];
-    let mut bstar: Vec<Vec<Rational>> = Vec::with_capacity(n);
+    let mut d = vec![Int::ONE; n + 1]; // d[0] = 1; d[i+1] filled as row i is processed
+    let mut lam = vec![vec![Int::ZERO; n]; n];
 
-    for i in 0..n {
-        let mut bi: Vec<Rational> = b[i]
-            .iter()
-            .map(|x| Rational::from_integer(x.clone()))
-            .collect();
-        for j in 0..i {
-            // μ_{i,j} = ⟨b_i, b*_j⟩ / ‖b*_j‖².
-            let dot = dot_ir(&b[i], &bstar[j]);
-            mu[i][j] = Rational::div(&dot, &norm[j]);
-            for t in 0..dim {
-                bi[t] = Rational::sub(&bi[t], &Rational::mul(&mu[i][j], &bstar[j][t]));
+    for k in 0..n {
+        for j in 0..=k {
+            // u starts as the integer Gram entry ⟨b_k, b_j⟩ …
+            let mut u = Int::ZERO;
+            for (bk, bj) in b[k].iter().zip(&b[j]) {
+                u.addmul(bk, bj);
+            }
+            // … then u = (d[i+1]·u − λ[k][i]·λ[j][i]) / d[i] for i = 0..j.
+            for i in 0..j {
+                u = d[i + 1]
+                    .mul(&u)
+                    .sub(&lam[k][i].mul(&lam[j][i]))
+                    .div_exact(&d[i]);
+            }
+            if j < k {
+                lam[k][j] = u;
+            } else {
+                if u.is_zero() {
+                    return None; // dependent vector: ‖b*_k‖² = 0
+                }
+                d[k + 1] = u;
             }
         }
-        norm[i] = dot_rr(&bi, &bi);
-        if norm[i].numerator().is_zero() {
-            return None; // dependent vector
-        }
-        bstar.push(bi);
     }
-    Some((mu, norm))
+    Some((d, lam))
 }
 
-/// Size-reduction step: if `|μ_{k,l}| > 1/2`, subtract `round(μ_{k,l})·b_l` from
-/// `b_k` and update the affected `μ` entries.
-fn size_reduce(b: &mut [Vec<Int>], mu: &mut [Vec<Rational>], k: usize, l: usize, half: &Rational) {
-    if mu[k][l].abs().cmp(half) != Ordering::Greater {
+/// Integral size-reduction (`RED`, Cohen §2.6.3): if `|μ_{k,l}| > 1/2` — i.e.
+/// `2·|λ[k][l]| > d[l+1]` — subtract `round(μ_{k,l})·b_l` from `b_k`, updating
+/// `b` and the affected `λ[k][·]` entries integrally. `d` is unchanged.
+fn int_size_reduce(b: &mut [Vec<Int>], lam: &mut [Vec<Int>], d: &[Int], k: usize, l: usize) {
+    let dl1 = &d[l + 1];
+    // μ_{k,l} = λ[k][l]/d[l+1]; skip unless |μ_{k,l}| > 1/2, i.e. 2|λ| > d[l+1].
+    if lam[k][l].abs().mul(&Int::from_i64(2)).cmp(dl1) != Ordering::Greater {
         return;
     }
-    let q = round_to_int(&mu[k][l]);
+    // q = round(λ[k][l]/d[l+1]) with ties toward +∞ = ⌊(2λ + d[l+1]) / (2·d[l+1])⌋
+    // (bit-for-bit the rational `round_to_int`, whose floor is scale-invariant).
+    let two = Int::from_i64(2);
+    let q = lam[k][l].mul(&two).add(dl1).div_floor(&dl1.mul(&two));
     if q.is_zero() {
         return;
     }
@@ -126,74 +157,54 @@ fn size_reduce(b: &mut [Vec<Int>], mu: &mut [Vec<Rational>], k: usize, l: usize,
     for t in 0..dim {
         b[k][t] = b[k][t].sub(&q.mul(&bl[t]));
     }
-    let qr = Rational::from_integer(q);
-    let mul = mu[l].clone();
+    let laml = lam[l].clone();
     for j in 0..l {
-        mu[k][j] = Rational::sub(&mu[k][j], &Rational::mul(&qr, &mul[j]));
+        lam[k][j] = lam[k][j].sub(&q.mul(&laml[j]));
     }
-    mu[k][l] = Rational::sub(&mu[k][l], &qr);
+    lam[k][l] = lam[k][l].sub(&q.mul(dl1));
 }
 
-/// Swaps `b_k` and `b_{k-1}` and updates the Gram–Schmidt data in place, per the
-/// standard LLL swap recurrences.
-#[allow(clippy::needless_range_loop)] // the index drives two distinct μ rows together
-fn swap_step(
-    b: &mut [Vec<Int>],
-    mu: &mut [Vec<Rational>],
-    norm: &mut [Rational],
-    k: usize,
-    n: usize,
-) {
-    let mu_old = mu[k][k - 1].clone();
+/// Integral swap (`SWAP`, Cohen §2.6.3): exchanges `b_k` and `b_{k-1}` and
+/// updates `b`, `λ` and `d` in place. Only `d[k]` changes among the
+/// determinants; the exact divisions by `d[k]`/`d[k+1]` stay integral.
+#[allow(clippy::needless_range_loop)] // the index drives two distinct λ rows together
+fn int_swap(b: &mut [Vec<Int>], lam: &mut [Vec<Int>], d: &mut [Int], k: usize, n: usize) {
+    let lambda = lam[k][k - 1].clone(); // λ_{k,k-1} is invariant under the swap
     b.swap(k, k - 1);
     for j in 0..k - 1 {
-        let tmp = mu[k][j].clone();
-        mu[k][j] = mu[k - 1][j].clone();
-        mu[k - 1][j] = tmp;
+        let tmp = lam[k][j].clone();
+        lam[k][j] = lam[k - 1][j].clone();
+        lam[k - 1][j] = tmp;
     }
-    // New norms: B' = ‖b*_k‖² + μ²·‖b*_{k-1}‖².
-    let bnew = Rational::add(
-        &norm[k],
-        &Rational::mul(&Rational::mul(&mu_old, &mu_old), &norm[k - 1]),
-    );
-    // New μ_{k,k-1} = μ_old·‖b*_{k-1}‖² / B'.
-    mu[k][k - 1] = Rational::div(&Rational::mul(&mu_old, &norm[k - 1]), &bnew);
-    norm[k] = Rational::div(&Rational::mul(&norm[k - 1], &norm[k]), &bnew);
-    norm[k - 1] = bnew;
-
-    let mk = mu[k][k - 1].clone();
+    // New d[k] = B = (d[k-1]·d[k+1] + λ²) / d[k] (uses the old d[k]).
+    let bnew = d[k - 1]
+        .mul(&d[k + 1])
+        .add(&lambda.mul(&lambda))
+        .div_exact(&d[k]);
     for i in k + 1..n {
-        let t = mu[i][k].clone();
-        mu[i][k] = Rational::sub(&mu[i][k - 1], &Rational::mul(&mu_old, &t));
-        mu[i][k - 1] = Rational::add(&t, &Rational::mul(&mk, &mu[i][k]));
+        let t = lam[i][k].clone();
+        // λ[i][k]   = (d[k+1]·λ[i][k-1] − λ·t) / d[k]      (old d[k])
+        lam[i][k] = d[k + 1]
+            .mul(&lam[i][k - 1])
+            .sub(&lambda.mul(&t))
+            .div_exact(&d[k]);
+        // λ[i][k-1] = (B·t + λ·λ[i][k]) / d[k+1]           (new λ[i][k])
+        lam[i][k - 1] = bnew
+            .mul(&t)
+            .add(&lambda.mul(&lam[i][k]))
+            .div_exact(&d[k + 1]);
     }
+    d[k] = bnew;
 }
 
 /// Nearest integer to a rational (ties round up), via `⌊(2p + q) / 2q⌋` with the
 /// denominator `q > 0` (guaranteed by `Rational` normalization).
+#[cfg(any(feature = "float", test))]
 fn round_to_int(r: &Rational) -> Int {
     let two = Int::from_i64(2);
     let num2 = r.numerator().mul(&two);
     let den = r.denominator();
     num2.add(den).div_floor(&den.mul(&two))
-}
-
-/// Dot product of an integer vector with a rational vector.
-fn dot_ir(a: &[Int], b: &[Rational]) -> Rational {
-    let mut acc = Rational::ZERO;
-    for (x, y) in a.iter().zip(b) {
-        acc.addmul(&Rational::from_integer(x.clone()), y);
-    }
-    acc
-}
-
-/// Dot product of two rational vectors.
-fn dot_rr(a: &[Rational], b: &[Rational]) -> Rational {
-    let mut acc = Rational::ZERO;
-    for (x, y) in a.iter().zip(b) {
-        acc.addmul(x, y);
-    }
-    acc
 }
 
 #[cfg(feature = "float")]
@@ -555,5 +566,308 @@ mod relations {
             }
         }
         v
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::needless_range_loop)]
+mod tests {
+    //! Differential reference: the original exact-**rational** Gram–Schmidt LLL,
+    //! kept solely to prove the integral [`lll_reduce_delta`] returns a
+    //! bit-identical basis, and to benchmark the two against each other.
+    use super::{Int, Ordering, Rational, Vec, lll_reduce_delta, round_to_int, vec};
+
+    // ----- rational reference implementation (pre-integral) -----
+
+    fn ref_lll_reduce_delta(basis: &[Vec<Int>], delta: &Rational) -> Vec<Vec<Int>> {
+        let n = basis.len();
+        if n <= 1 {
+            return basis.to_vec();
+        }
+        let mut b: Vec<Vec<Int>> = basis.to_vec();
+        let (mut mu, mut bstar_norm) = match ref_gram_schmidt(&b) {
+            Some(gs) => gs,
+            None => return basis.to_vec(),
+        };
+        let half = Rational::new(Int::ONE, Int::from_i64(2));
+        let mut k = 1;
+        while k < n {
+            ref_size_reduce(&mut b, &mut mu, k, k - 1, &half);
+            let mk = mu[k][k - 1].clone();
+            let bound = Rational::mul(
+                &Rational::sub(delta, &Rational::mul(&mk, &mk)),
+                &bstar_norm[k - 1],
+            );
+            if bstar_norm[k].cmp(&bound) != Ordering::Less {
+                for l in (0..k - 1).rev() {
+                    ref_size_reduce(&mut b, &mut mu, k, l, &half);
+                }
+                k += 1;
+            } else {
+                ref_swap(&mut b, &mut mu, &mut bstar_norm, k, n);
+                k = if k > 1 { k - 1 } else { 1 };
+            }
+        }
+        b
+    }
+
+    fn ref_gram_schmidt(b: &[Vec<Int>]) -> Option<(Vec<Vec<Rational>>, Vec<Rational>)> {
+        let n = b.len();
+        let dim = b[0].len();
+        let mut mu = vec![vec![Rational::ZERO; n]; n];
+        let mut norm = vec![Rational::ZERO; n];
+        let mut bstar: Vec<Vec<Rational>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut bi: Vec<Rational> = b[i]
+                .iter()
+                .map(|x| Rational::from_integer(x.clone()))
+                .collect();
+            for j in 0..i {
+                let mut dot = Rational::ZERO;
+                for (x, y) in b[i].iter().zip(&bstar[j]) {
+                    dot.addmul(&Rational::from_integer(x.clone()), y);
+                }
+                mu[i][j] = Rational::div(&dot, &norm[j]);
+                for t in 0..dim {
+                    bi[t] = Rational::sub(&bi[t], &Rational::mul(&mu[i][j], &bstar[j][t]));
+                }
+            }
+            let mut nn = Rational::ZERO;
+            for x in &bi {
+                nn.addmul(x, x);
+            }
+            norm[i] = nn;
+            if norm[i].numerator().is_zero() {
+                return None;
+            }
+            bstar.push(bi);
+        }
+        Some((mu, norm))
+    }
+
+    fn ref_size_reduce(
+        b: &mut [Vec<Int>],
+        mu: &mut [Vec<Rational>],
+        k: usize,
+        l: usize,
+        half: &Rational,
+    ) {
+        if mu[k][l].abs().cmp(half) != Ordering::Greater {
+            return;
+        }
+        let q = round_to_int(&mu[k][l]);
+        if q.is_zero() {
+            return;
+        }
+        let dim = b[k].len();
+        let bl = b[l].clone();
+        for t in 0..dim {
+            b[k][t] = b[k][t].sub(&q.mul(&bl[t]));
+        }
+        let qr = Rational::from_integer(q);
+        let mul = mu[l].clone();
+        for j in 0..l {
+            mu[k][j] = Rational::sub(&mu[k][j], &Rational::mul(&qr, &mul[j]));
+        }
+        mu[k][l] = Rational::sub(&mu[k][l], &qr);
+    }
+
+    fn ref_swap(
+        b: &mut [Vec<Int>],
+        mu: &mut [Vec<Rational>],
+        norm: &mut [Rational],
+        k: usize,
+        n: usize,
+    ) {
+        let mu_old = mu[k][k - 1].clone();
+        b.swap(k, k - 1);
+        for j in 0..k - 1 {
+            let tmp = mu[k][j].clone();
+            mu[k][j] = mu[k - 1][j].clone();
+            mu[k - 1][j] = tmp;
+        }
+        let bnew = Rational::add(
+            &norm[k],
+            &Rational::mul(&Rational::mul(&mu_old, &mu_old), &norm[k - 1]),
+        );
+        mu[k][k - 1] = Rational::div(&Rational::mul(&mu_old, &norm[k - 1]), &bnew);
+        norm[k] = Rational::div(&Rational::mul(&norm[k - 1], &norm[k]), &bnew);
+        norm[k - 1] = bnew;
+        let mk = mu[k][k - 1].clone();
+        for i in k + 1..n {
+            let t = mu[i][k].clone();
+            mu[i][k] = Rational::sub(&mu[i][k - 1], &Rational::mul(&mu_old, &t));
+            mu[i][k - 1] = Rational::add(&t, &Rational::mul(&mk, &mu[i][k]));
+        }
+    }
+
+    // ----- test helpers -----
+
+    /// Small xorshift PRNG for reproducible pseudo-random bases.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        /// Signed integer in [-range, range].
+        fn signed(&mut self, range: i64) -> i64 {
+            let span = (2 * range + 1) as u64;
+            (self.next() % span) as i64 - range
+        }
+    }
+
+    fn iv(v: &[i64]) -> Vec<Int> {
+        v.iter().map(|&x| Int::from_i64(x)).collect()
+    }
+
+    fn random_basis(rng: &mut Rng, n: usize, dim: usize, range: i64) -> Vec<Vec<Int>> {
+        (0..n)
+            .map(|_| (0..dim).map(|_| Int::from_i64(rng.signed(range))).collect())
+            .collect()
+    }
+
+    /// A "hard" basis whose exact-rational Gram–Schmidt coefficients explode:
+    /// a knapsack-style lattice [ I | w·aᵢ ] with a large multiplier column.
+    fn knapsack_basis(rng: &mut Rng, n: usize, weight_bits: u32) -> Vec<Vec<Int>> {
+        let w = Int::ONE.mul_2k(weight_bits);
+        (0..n)
+            .map(|i| {
+                let mut row = vec![Int::ZERO; n + 1];
+                row[i] = Int::ONE;
+                let a = Int::from_i64(rng.signed(1 << 20));
+                row[n] = w.mul(&a);
+                row
+            })
+            .collect()
+    }
+
+    fn deltas() -> Vec<Rational> {
+        vec![
+            Rational::new(Int::from_i64(3), Int::from_i64(4)),
+            Rational::new(Int::from_i64(51), Int::from_i64(100)), // just above 1/4
+            Rational::new(Int::from_i64(99), Int::from_i64(100)),
+            Rational::ONE,
+        ]
+    }
+
+    // ----- differential correctness -----
+
+    #[test]
+    fn integral_matches_rational_random() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        for &range in &[3i64, 30, 3000, 1_000_000] {
+            for n in 2..=6usize {
+                for dim in n..=n + 2 {
+                    for _ in 0..12 {
+                        let basis = random_basis(&mut rng, n, dim, range);
+                        for delta in &deltas() {
+                            let got = lll_reduce_delta(&basis, delta);
+                            let want = ref_lll_reduce_delta(&basis, delta);
+                            assert_eq!(got, want, "n={n} dim={dim} range={range} delta={delta}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integral_matches_rational_hard() {
+        let mut rng = Rng(0xdead_beef_cafe_0001);
+        for &wb in &[20u32, 60, 200] {
+            for n in 2..=6usize {
+                for _ in 0..8 {
+                    let basis = knapsack_basis(&mut rng, n, wb);
+                    for delta in &deltas() {
+                        let got = lll_reduce_delta(&basis, delta);
+                        let want = ref_lll_reduce_delta(&basis, delta);
+                        assert_eq!(got, want, "knapsack n={n} weight_bits={wb} delta={delta}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integral_matches_rational_structured() {
+        let delta = Rational::new(Int::from_i64(3), Int::from_i64(4));
+        let cases: Vec<Vec<Vec<Int>>> = vec![
+            vec![iv(&[1, 1, 1]), iv(&[-1, 0, 2]), iv(&[3, 5, 6])],
+            vec![iv(&[1, 1_000_000]), iv(&[0, 1])],
+            vec![iv(&[1, 0]), iv(&[0, 1])],
+            // dependent input: both must return it unchanged
+            vec![iv(&[2, 4]), iv(&[1, 2])],
+            vec![iv(&[2, 4, 6]), iv(&[1, 2, 3]), iv(&[0, 1, 1])],
+            // near-dependent
+            vec![iv(&[1, 0, 0]), iv(&[1000, 1, 0]), iv(&[0, 1000, 1])],
+        ];
+        for basis in &cases {
+            let got = lll_reduce_delta(basis, &delta);
+            let want = ref_lll_reduce_delta(basis, &delta);
+            assert_eq!(&got, &want, "structured case {basis:?}");
+        }
+    }
+
+    // ----- benchmark (ignored; run with `cargo test --release -- --ignored`) -----
+
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored"]
+    fn bench_integral_vs_rational() {
+        use std::time::Instant;
+        let delta = Rational::new(Int::from_i64(3), Int::from_i64(4));
+
+        let bench = |label: &str, bases: &[Vec<Vec<Int>>]| {
+            let reps = 3;
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                for b in bases {
+                    core::hint::black_box(lll_reduce_delta(b, &delta));
+                }
+            }
+            let ti = t0.elapsed();
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                for b in bases {
+                    core::hint::black_box(ref_lll_reduce_delta(b, &delta));
+                }
+            }
+            let tr = t0.elapsed();
+            std::println!(
+                "{label:<34} integral {:>10.3}ms   rational {:>10.3}ms   speedup {:>6.2}x",
+                ti.as_secs_f64() * 1e3 / reps as f64,
+                tr.as_secs_f64() * 1e3 / reps as f64,
+                tr.as_secs_f64() / ti.as_secs_f64().max(1e-12),
+            );
+        };
+
+        let mut rng = Rng(0xabcd_0001);
+        std::println!("--- random integer bases ---");
+        for &(n, dim, range) in &[
+            (4usize, 4usize, 100i64),
+            (8, 8, 100),
+            (12, 12, 100),
+            (16, 16, 100),
+            (8, 8, 1_000_000_000),
+            (12, 12, 1_000_000_000),
+        ] {
+            let bases: Vec<_> = (0..10)
+                .map(|_| random_basis(&mut rng, n, dim, range))
+                .collect();
+            bench(
+                &std::format!("random n={n} dim={dim} range={range}"),
+                &bases,
+            );
+        }
+
+        std::println!("--- knapsack / coefficient-explosion bases ---");
+        for &(n, wb) in &[(6usize, 200u32), (10, 400), (14, 600), (18, 800)] {
+            let bases: Vec<_> = (0..10).map(|_| knapsack_basis(&mut rng, n, wb)).collect();
+            bench(&std::format!("knapsack n={n} weight_bits={wb}"), &bases);
+        }
     }
 }

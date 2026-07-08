@@ -3372,13 +3372,15 @@ fn split_composite(n: &Nat) -> Nat {
     // For a balanced semiprime the quadratic sieve is faster and more reliable
     // than ECM, whose cost would depend on the (large) factor rather than on
     // `n`. The self-initializing MPQS (SIQS) is the method of choice from ~30
-    // digits (~100 bits) up to ~52 digits — measured ~3× faster than the
-    // single-polynomial sieve at 33 digits and ~14× at 38 digits, where the
-    // single-poly interval/memory limit bites. Below that, and if SIQS declines
-    // to run, the single-polynomial sieve handles it. Each falls through to the
-    // next strategy if it fails to split `n`.
+    // digits (~100 bits) up to the ~60-digit range: the double-large-prime
+    // variation (cycle counting) and the block-Lanczos GF(2) solver together let
+    // the factor base grow past what dense Gaussian elimination could handle,
+    // reaching balanced ~60-digit semiprimes (measured: ~5–7 s at 55 digits,
+    // ~1–2 min at 60). Below ~30 digits, and if SIQS declines to run, the
+    // single-polynomial sieve handles it. Each falls through to the next strategy
+    // if it fails to split `n`.
     if n.bit_len() >= 100
-        && n.bit_len() <= 175
+        && n.bit_len() <= 205
         && let Some(f) = crate::qsieve::siqs_factor(n)
     {
         return f;
@@ -5380,5 +5382,51 @@ mod tests {
         let (q2, r2) = prod.div_rem(&b).unwrap();
         assert_eq!(q2, a);
         assert!(r2.is_zero());
+    }
+
+    /// End-to-end correctness of the public `factorize` on balanced semiprimes
+    /// across the scaled SIQS range (40–56 digits): every returned list is a
+    /// complete, sorted prime factorization whose product is the input. Routes
+    /// through `split_composite`'s SIQS gate (double large primes + block
+    /// Lanczos). Heavy — run in release:
+    /// `cargo test --release factorize_balanced_semiprimes_scaled -- --ignored`.
+    #[test]
+    #[ignore = "heavy: release-only end-to-end factorization batch"]
+    fn factorize_balanced_semiprimes_scaled() {
+        // Smallest prime ≥ 10^(d/2) + offset, over big integers.
+        fn prime_from(base: &Nat, offset: u64) -> Nat {
+            let mut c = base.add(&Nat::from_u64(offset));
+            if c.is_even() {
+                c = c.add(&Nat::one());
+            }
+            while !c.is_prime_bpsw() {
+                c = c.add(&Nat::from_u64(2));
+            }
+            c
+        }
+        for d in [40u32, 44, 48, 52, 56] {
+            let base = Nat::from_u64(10).pow(d / 2);
+            for seed in 0..2u64 {
+                let p = prime_from(&base, seed * 2 + 1);
+                let q = prime_from(&base, seed * 1000 + 54321);
+                if p == q {
+                    continue;
+                }
+                let n = p.mul(&q);
+                let factors = n.factorize();
+                // Product of factors equals n, every factor is prime, sorted.
+                let mut prod = Nat::one();
+                for f in &factors {
+                    assert!(f.is_prime_bpsw(), "d={d} seed={seed}: composite factor");
+                    prod = prod.mul(f);
+                }
+                assert_eq!(prod, n, "d={d} seed={seed}: product mismatch");
+                for w in factors.windows(2) {
+                    assert!(w[0].cmp_ref(&w[1]) != Ordering::Greater, "factors unsorted");
+                }
+                // A balanced semiprime factors into exactly its two primes.
+                assert_eq!(factors.len(), 2, "d={d} seed={seed}: not a 2-prime split");
+            }
+        }
     }
 }

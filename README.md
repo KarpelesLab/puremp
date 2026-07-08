@@ -105,9 +105,9 @@ int main(void) {
 | `ball` | ✔ | `Ball` — midpoint–radius (mid-rad) rigorous arithmetic, Arb-style (implies `interval`) |
 | `algebraic` | ✔ | `Quadratic` (ℚ(√d)) and general real `Algebraic` numbers |
 | `galois` | ✔ | `GaloisField` / `GfElement` — finite field extensions `GF(pᵏ)` (implies `int`) |
-| `elliptic` | ✔ | `EllipticCurve` / `Point` — elliptic curves over GF(p) and ℚ (implies `rational`) |
+| `elliptic` | ✔ | `EllipticCurve` / `Point` over GF(p) and ℚ — group law, Jacobian scalar mult, Schoof point counting (implies `rational`) |
 | `identify` | ✔ | Inverse symbolic calculator (`identify`, `machin_like`) via PSLQ (implies `lattice` + `float`) |
-| `primality` | ✔ | Primality proving with auditable certificates — Pocklington + BLS `n∓1` (implies `int`) |
+| `primality` | ✔ | Primality proving with auditable certificates — Pocklington + BLS `n∓1`, and Atkin–Morain **ECPP** for the general case (implies `int` + `poly`) |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
 | `dlog` | | Discrete logarithm — BSGS, Pollard rho, Pohlig–Hellman (implies `int`) |
 | `num-traits` | | Implements `num-traits` interfaces for `Int`/`Rational`/`Nat`/`Decimal`/`Complex` |
@@ -183,25 +183,25 @@ available drafts) is the umbrella reference for much of this list.
 
 - **Deeper multi-prime argument reduction** — the current `exp` multi-prime fast
   path finds the reducing prime-log combination with an f64 Babai nearest-plane,
-  which caps its winning range; a higher-precision Babai over more primes (and an
-  extension to `sin`/`cos`) would widen it. Johansson, arXiv:2207.02501.
-- **AGM-based transcendentals** — π and `log`/`exp` via the arithmetic–geometric
-  mean (Brent–Salamin / Gauss–Legendre), `O(M(n)·log n)` in ~2·lg n quadratically
-  converging steps; a large implicit constant means it *complements* binary
-  splitting, winning only at very high precision. Brent (1976); Borwein & Borwein,
-  *Pi and the AGM*; MCA §4.8.
+  which caps its winning range; a higher-precision Babai over more primes would
+  widen it. Johansson, arXiv:2207.02501.
 
 **Candidate new capabilities** (new operations / types):
 
-- **Primality proving for arbitrary inputs** — `n∓1` certificate proofs
-  (Pocklington + BLS `n^{1/3}`) already prove any number with a sufficiently
-  factorable `n∓1`; the general case (a large prime whose `n∓1` is hard) needs
-  **ECPP** (Goldwasser–Kilian → Atkin → Morain; heuristic `Õ((log N)⁴⁻⁵)`) or the
-  deterministic **APR-CL**.
-- **Factorization past ~50 digits** — SIQS handles balanced semiprimes into the
-  ~50-digit range; a large-prime variation, a sparse GF(2) solver (block
-  Lanczos / Wiedemann in place of dense Gaussian elimination), and ultimately the
-  number-field sieve (GNFS) are the path toward ~80–100+ digits.
+- **Factorization past ~60 digits (GNFS)** — SIQS, with the single/double
+  large-prime variations and a block-Lanczos GF(2) solver, factors balanced
+  semiprimes reliably to ~55–58 digits; the general number-field sieve is the path
+  to ~100+ digits. It needs number-field arithmetic, polynomial selection, lattice
+  sieving, and a number-field square root — a substantial subsystem of its own.
+- **SEA point counting** — the Elkies/Atkin improvements to Schoof (using modular
+  polynomials and isogenies) drop the per-prime cost from working modulo the
+  degree-`(ℓ²−1)/2` division polynomial to a small factor, extending exact point
+  counting from the current tens-of-bits `p` to cryptographic sizes. Schoof (1985)
+  → Elkies → Atkin; Blake–Seroussi–Smart ch. VII.
+- **Wider ECPP** — the Atkin–Morain prover uses a fixed small table of
+  class-number ≤ 2 discriminants, leaving a small fraction of primes `Unproven`;
+  computing Hilbert class polynomials at runtime (or APR-CL as a deterministic
+  alternative) would close the gap.
 
 ## License
 

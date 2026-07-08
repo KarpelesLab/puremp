@@ -123,6 +123,35 @@ fn discrete_log_dispatches_to_rho_for_large_order() {
 }
 
 #[test]
+fn pollard_rho_montgomery_path_large_modulus() {
+    // Force the public rho dispatch onto its Montgomery inner loop: the modulus
+    // must exceed 64 bits. Keep the group order small (fast walk) by building an
+    // order-q subgroup with a small prime q inside a >2^64 prime field.
+    let q = Int::from(1u64 << 20).next_prime(); // ~20-bit prime order (fast rho)
+    // p = k·q + 1 prime, p > 2^64 (so the modulus spans more than one limb).
+    let mut k = Int::from(1u64 << 45);
+    let mut p = q.mul(&k).add(&Int::ONE);
+    while !p.is_prime_bpsw() {
+        k = k.add(&Int::ONE);
+        p = q.mul(&k).add(&Int::ONE);
+    }
+    assert!(p.magnitude().bit_len() > 64);
+    // Generator of the order-q subgroup: a^k has order dividing q (prime) ⇒ q.
+    let mut a = i(2);
+    let mut g = a.modpow(&k, &p);
+    while g.is_one() {
+        a = a.add(&Int::ONE);
+        g = a.modpow(&k, &p);
+    }
+    let x = i(700_001).rem_euclid(&q);
+    let h = g.modpow(&x, &p);
+    let found = (0..16)
+        .find_map(|s| pollard_rho(&g, &h, &p, &q, s))
+        .expect("Montgomery rho should converge over the order-q subgroup");
+    assert_eq!(g.modpow(&found, &p), h);
+}
+
+#[test]
 fn modint_method() {
     let g = ModInt::new(i(2), i(101));
     let h = g.pow(&i(73));

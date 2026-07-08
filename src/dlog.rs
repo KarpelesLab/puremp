@@ -45,7 +45,7 @@ use alloc::vec::Vec;
 
 use crate::int::Int;
 use crate::mod_int::ModInt;
-use crate::nat::Nat;
+use crate::nat::{MontCtx, Nat};
 
 /// Orders with a bit length up to this threshold use [`bsgs`] inside
 /// [`discrete_log`]; larger ones use [`pollard_rho`]. A 40-bit order needs a
@@ -55,6 +55,13 @@ const BSGS_MAX_ORDER_BITS: u64 = 40;
 /// Number of independent Pollard-rho walks [`discrete_log`] tries before giving
 /// up on rho and falling back to [`bsgs`].
 const RHO_ATTEMPTS: u64 = 24;
+
+/// Pollard-rho only switches to the Montgomery domain once the modulus spans
+/// more than one 64-bit limb. Each rho step must convert out of Montgomery form
+/// to take the `x mod 3` partition, and that fixed tax only pays off against a
+/// division-based reduction for multi-limb moduli; at or below this width the
+/// plain-residue walk is as fast or faster (measured).
+const RHO_MONT_MIN_MODULUS_BITS: u64 = 64;
 
 /// Reduces `value` into the canonical residue `[0, modulus)`.
 #[inline]
@@ -141,32 +148,103 @@ pub fn bsgs(base: &Int, target: &Int, modulus: &Int, order: &Int) -> Option<Int>
     let m_steps = m_steps.to_u64().expect("bsgs: order is too large");
     let m_step_int = Int::from(m_steps);
 
+    // Odd modulus ⇒ run both O(√order) loops in the Montgomery domain (one
+    // interleaved reduction per product instead of a `rem_euclid` division).
+    // Even/edge moduli keep the plain-residue path.
+    if m.is_even() {
+        bsgs_scalar(&g, &h, &m, order, m_steps, &m_step_int)
+    } else {
+        bsgs_mont(&g, &h, &m, order, m_steps, &m_step_int)
+    }
+}
+
+/// Baby-step giant-step over plain canonical residues (products via `mul_mod`).
+/// Used for even moduli, where Montgomery reduction does not apply. `g`, `h` are
+/// reduced into `[0, m)`; `m_steps = ⌈√order⌉`, `m_step_int = m_steps`.
+fn bsgs_scalar(
+    g: &Int,
+    h: &Int,
+    m: &Int,
+    order: &Int,
+    m_steps: u64,
+    m_step_int: &Int,
+) -> Option<Int> {
     // Baby steps: table maps g^j -> j for j in [0, m_steps). Insert the smallest
     // j per residue so the recovered x is the least in its class.
     let mut table: BTreeMap<Nat, u64> = BTreeMap::new();
     let mut power = Int::ONE; // g^0
     for j in 0..m_steps {
         table.entry(power.magnitude()).or_insert(j);
-        power = mul_mod(&power, &g, &m);
+        power = mul_mod(&power, g, m);
     }
 
     // Giant stride: factor = g^{-m_steps}. Requires g to be a unit mod m.
-    let g_inv = g.modinv(&m)?;
-    let factor = g_inv.modpow(&m_step_int, &m);
+    let g_inv = g.modinv(m)?;
+    let factor = g_inv.modpow(m_step_int, m);
 
     // Giant steps: gamma = h · factor^i = h · g^{-i·m_steps}. A hit gamma = g^j
     // means h = g^{i·m_steps + j}. Scanning i upward yields the least x.
-    let mut gamma = h;
+    let mut gamma = h.clone();
     for i in 0..m_steps {
         if let Some(&j) = table.get(&gamma.magnitude()) {
-            let x = Int::from(i).mul(&m_step_int).add(&Int::from(j));
+            let x = Int::from(i).mul(m_step_int).add(&Int::from(j));
             // x may exceed the searched [0, order) window only if the same
             // residue recurs; guard to honour the documented range.
             if &x < order {
                 return Some(x);
             }
         }
-        gamma = mul_mod(&gamma, &factor, &m);
+        gamma = mul_mod(&gamma, &factor, m);
+    }
+    None
+}
+
+/// Baby-step giant-step in the Montgomery domain (odd modulus). Every product in
+/// the baby- and giant-step loops is a single interleaved Montgomery reduction.
+///
+/// The baby-step table is keyed by the Montgomery *representative* `g^j·R mod m`
+/// rather than the true residue: `x ↦ x·R mod m` is a bijection on residues, so a
+/// giant-step `gamma` collides with a baby-step power in Montgomery form exactly
+/// when their true residues collide. The recovered `(i, j)` — and hence the
+/// returned `x` — are therefore identical to the plain-residue path; no
+/// conversion out of Montgomery form is needed inside either loop.
+fn bsgs_mont(
+    g: &Int,
+    h: &Int,
+    m: &Int,
+    order: &Int,
+    m_steps: u64,
+    m_step_int: &Int,
+) -> Option<Int> {
+    let ctx = MontCtx::new(&m.magnitude());
+    let g_m = ctx.to_mont(&g.magnitude());
+
+    // Baby steps in Montgomery form: keys are g^j·R mod m; power starts at R (the
+    // Montgomery form of 1 = g^0).
+    let mut table: BTreeMap<Nat, u64> = BTreeMap::new();
+    let mut power = ctx.one().clone();
+    for j in 0..m_steps {
+        table.entry(power.clone()).or_insert(j);
+        power = ctx.mul(&power, &g_m);
+    }
+
+    // Giant stride: factor = g^{-m_steps} (true residue, via modinv/modpow), then
+    // mapped into Montgomery form once.
+    let g_inv = g.modinv(m)?;
+    let factor = g_inv.modpow(m_step_int, m);
+    let factor_m = ctx.to_mont(&factor.magnitude());
+
+    // Giant steps: gamma·R = h·R · (factor·R…) stays in Montgomery form; the
+    // lookup keys match the baby-step table's Montgomery keys.
+    let mut gamma = ctx.to_mont(&h.magnitude());
+    for i in 0..m_steps {
+        if let Some(&j) = table.get(&gamma) {
+            let x = Int::from(i).mul(m_step_int).add(&Int::from(j));
+            if &x < order {
+                return Some(x);
+            }
+        }
+        gamma = ctx.mul(&gamma, &factor_m);
     }
     None
 }
@@ -275,12 +353,26 @@ pub fn pollard_rho(base: &Int, target: &Int, modulus: &Int, order: &Int, seed: u
         Err(done) => return done,
     };
 
+    // Odd, multi-limb modulus ⇒ run the walk in the Montgomery domain; even or
+    // small moduli keep the plain-residue walk (see RHO_MONT_MIN_MODULUS_BITS).
+    // Both explore the identical walk (same partition, same collision), so they
+    // return the identical solution.
+    if m.is_even() || m.magnitude().bit_len() <= RHO_MONT_MIN_MODULUS_BITS {
+        pollard_rho_scalar(&g, &h, &m, order, seed)
+    } else {
+        pollard_rho_mont(&g, &h, &m, order, seed)
+    }
+}
+
+/// Pollard-rho walk over plain canonical residues (products via `mul_mod`), for
+/// even moduli where Montgomery does not apply.
+fn pollard_rho_scalar(g: &Int, h: &Int, m: &Int, order: &Int, seed: u64) -> Option<Int> {
     // Start at x = g^a0 · h^b0 for seed-dependent (a0, b0), so different seeds
     // give independent walks. b0 ≥ 1 keeps h present in the relation.
     let a0 = Int::from(seed).rem_euclid(order);
     let b0 = Int::from(seed / 2 + 1).rem_euclid(order);
     let start = Walk {
-        x: mul_mod(&g.modpow(&a0, &m), &h.modpow(&b0, &m), &m),
+        x: mul_mod(&g.modpow(&a0, m), &h.modpow(&b0, m), m),
         a: a0,
         b: b0,
     };
@@ -293,14 +385,97 @@ pub fn pollard_rho(base: &Int, target: &Int, modulus: &Int, order: &Int, seed: u
     let mut tortoise = start.clone();
     let mut hare = start;
     for _ in 0..cap {
-        tortoise = rho_step(&tortoise, &g, &h, &m, order);
-        hare = rho_step(&rho_step(&hare, &g, &h, &m, order), &g, &h, &m, order);
+        tortoise = rho_step(&tortoise, g, h, m, order);
+        hare = rho_step(&rho_step(&hare, g, h, m, order), g, h, m, order);
         if tortoise.x == hare.x {
             // g^{a_t} h^{b_t} = g^{a_h} h^{b_h}  ⇒  g^{a_t-a_h} = h^{b_h-b_t}
             // ⇒  x·(b_h - b_t) ≡ (a_t - a_h)  (mod ord(g)).
             let coeff = hare.b.sub(&tortoise.b);
             let rhs = tortoise.a.sub(&hare.a);
-            return solve_and_verify(&coeff, &rhs, order, &g, &h, &m);
+            return solve_and_verify(&coeff, &rhs, order, g, h, m);
+        }
+    }
+    None
+}
+
+/// One state of a Montgomery-domain rho walk: the group element `x` held as its
+/// Montgomery representative `x·R mod m`, with the exponents `a`, `b` reduced
+/// modulo `order` exactly as in [`Walk`].
+#[derive(Clone)]
+struct WalkMont {
+    x: Nat,
+    a: Int,
+    b: Int,
+}
+
+/// Advances a Montgomery-domain rho walk by one step. The partition is taken on
+/// the *true* residue `x mod 3` (recovered with one convert-out), so the walk is
+/// bit-for-bit the same sequence of sets as the plain-residue walk — only the
+/// group multiply runs as a Montgomery product.
+fn rho_step_mont(w: &WalkMont, g_m: &Nat, h_m: &Nat, ctx: &MontCtx, order: &Int) -> WalkMont {
+    let part = Int::from(ctx.to_residue(&w.x)).rem_euclid(&Int::from(3u64));
+    if part.is_zero() {
+        // Squaring set: x -> x², (a, b) -> (2a, 2b).
+        WalkMont {
+            x: ctx.sqr(&w.x),
+            a: w.a.add(&w.a).rem_euclid(order),
+            b: w.b.add(&w.b).rem_euclid(order),
+        }
+    } else if part.is_one() {
+        // Multiply-by-g set: x -> g·x, a -> a + 1.
+        WalkMont {
+            x: ctx.mul(&w.x, g_m),
+            a: w.a.add(&Int::ONE).rem_euclid(order),
+            b: w.b.clone(),
+        }
+    } else {
+        // Multiply-by-h set: x -> h·x, b -> b + 1.
+        WalkMont {
+            x: ctx.mul(&w.x, h_m),
+            a: w.a.clone(),
+            b: w.b.add(&Int::ONE).rem_euclid(order),
+        }
+    }
+}
+
+/// Pollard-rho walk in the Montgomery domain (odd modulus). The starting element
+/// and every step's group multiply are Montgomery products; collision detection
+/// compares Montgomery representatives (a bijection on residues, so identical to
+/// comparing true residues). The recovered `coeff`/`rhs` — and thus the returned
+/// `x` — match the plain-residue walk exactly.
+fn pollard_rho_mont(g: &Int, h: &Int, m: &Int, order: &Int, seed: u64) -> Option<Int> {
+    let ctx = MontCtx::new(&m.magnitude());
+    let g_m = ctx.to_mont(&g.magnitude());
+    let h_m = ctx.to_mont(&h.magnitude());
+
+    let a0 = Int::from(seed).rem_euclid(order);
+    let b0 = Int::from(seed / 2 + 1).rem_euclid(order);
+    // Same true starting residue as the scalar walk, mapped into Montgomery form.
+    let start_true = mul_mod(&g.modpow(&a0, m), &h.modpow(&b0, m), m);
+    let start = WalkMont {
+        x: ctx.to_mont(&start_true.magnitude()),
+        a: a0,
+        b: b0,
+    };
+
+    let steps = isqrt_ceil(&order.magnitude());
+    let cap = steps.to_u64().unwrap_or(u64::MAX).saturating_mul(8).max(64);
+
+    let mut tortoise = start.clone();
+    let mut hare = start;
+    for _ in 0..cap {
+        tortoise = rho_step_mont(&tortoise, &g_m, &h_m, &ctx, order);
+        hare = rho_step_mont(
+            &rho_step_mont(&hare, &g_m, &h_m, &ctx, order),
+            &g_m,
+            &h_m,
+            &ctx,
+            order,
+        );
+        if tortoise.x == hare.x {
+            let coeff = hare.b.sub(&tortoise.b);
+            let rhs = tortoise.a.sub(&hare.a);
+            return solve_and_verify(&coeff, &rhs, order, g, h, m);
         }
     }
     None
@@ -449,5 +624,214 @@ impl ModInt {
     /// ```
     pub fn discrete_log(&self, target: &ModInt, order: &Int) -> Option<Int> {
         discrete_log(&self.to_int(), &target.to_int(), &self.modulus(), order)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Differential tests: the Montgomery-domain backends must return *exactly*
+    //! what the plain-residue backends do (the pre-change behaviour), and both
+    //! must agree with a brute-force reference.
+    use super::*;
+
+    /// Brute-force least non-negative `x < order` with `g^x ≡ h (mod n)`.
+    fn brute(g: u64, h: u64, n: u64, order: u64) -> Option<u64> {
+        let mut acc = 1u128 % n as u128;
+        let (g, h, m) = (g as u128, h as u128 % n as u128, n as u128);
+        for x in 0..order {
+            if acc == h {
+                return Some(x);
+            }
+            acc = (acc * g) % m;
+        }
+        None
+    }
+
+    /// Small deterministic LCG so the tests stay `no_std`-friendly.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    #[test]
+    fn bsgs_scalar_and_mont_agree_and_match_brute() {
+        // Every modulus here is odd (so bsgs_mont applies) and prime (so every
+        // base in [2, n) is a unit). The two backends must be bit-for-bit equal.
+        let mut state = 0x1234_5678u64;
+        for &n in &[101u64, 251, 1009, 4093] {
+            let order = n - 1;
+            let m_steps = isqrt_ceil(&Int::from(order).magnitude()).to_u64().unwrap();
+            let m_step_int = Int::from(m_steps);
+            for _ in 0..40 {
+                let g = 2 + lcg(&mut state) % (n - 2);
+                let h = lcg(&mut state) % n;
+                let (gi, hi, ni, oi) = (Int::from(g), Int::from(h), Int::from(n), Int::from(order));
+                let scalar = bsgs_scalar(&gi, &hi, &ni, &oi, m_steps, &m_step_int);
+                let mont = bsgs_mont(&gi, &hi, &ni, &oi, m_steps, &m_step_int);
+                assert_eq!(scalar, mont, "n={n} g={g} h={h}");
+                assert_eq!(
+                    scalar.as_ref().and_then(Int::to_u64),
+                    brute(g, h, n, order),
+                    "n={n} g={g} h={h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pollard_rho_scalar_and_mont_agree() {
+        // Same seed ⇒ identical walk ⇒ identical result, whichever backend runs.
+        let mut state = 0x9e37_79b9u64;
+        for &n in &[1019u64, 2003, 4093, 7919] {
+            let order = n - 1;
+            let (ni, oi) = (Int::from(n), Int::from(order));
+            for _ in 0..30 {
+                let g = 2 + lcg(&mut state) % (n - 2);
+                let x = lcg(&mut state) % order;
+                let gi = Int::from(g);
+                let h = gi.modpow(&Int::from(x), &ni);
+                for seed in 0..4 {
+                    let scalar = pollard_rho_scalar(&gi, &h, &ni, &oi, seed);
+                    let mont = pollard_rho_mont(&gi, &h, &ni, &oi, seed);
+                    assert_eq!(scalar, mont, "n={n} g={g} x={x} seed={seed}");
+                    if let Some(sol) = &scalar {
+                        assert_eq!(gi.modpow(sol, &ni), h, "n={n} g={g} x={x}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bsgs_even_modulus_scalar_path_matches_brute() {
+        // Even moduli route to the plain-residue backend; unit bases only.
+        fn gcd(mut a: u64, mut b: u64) -> u64 {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        }
+        let mut state = 0xf00d_babeu64;
+        for &n in &[100u64, 128, 210, 256, 512] {
+            let order = n;
+            let mut done = 0;
+            while done < 24 {
+                let g = 2 + lcg(&mut state) % (n - 2);
+                if gcd(g, n) != 1 {
+                    continue;
+                }
+                let h = lcg(&mut state) % n;
+                let got = bsgs(
+                    &Int::from(g),
+                    &Int::from(h),
+                    &Int::from(n),
+                    &Int::from(order),
+                );
+                assert_eq!(
+                    got.and_then(|v| v.to_u64()),
+                    brute(g, h, n, order),
+                    "n={n} g={g} h={h}"
+                );
+                done += 1;
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod bench {
+    //! Ignored micro-benchmarks: plain-residue vs Montgomery-domain BSGS and rho.
+    //! Run with e.g.
+    //! `cargo test --release --features "dlog std" --lib bench -- --ignored --nocapture`.
+    use super::*;
+    use core::str::FromStr;
+    use std::println;
+
+    fn now() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    // A few primes of assorted bit-lengths, as the (odd) modulus.
+    fn primes() -> [(&'static str, Int); 3] {
+        [
+            ("64-bit", Int::from(18446744073709551557u64)),
+            (
+                "128-bit",
+                Int::from_str("340282366920938463463374607431768211297").unwrap(),
+            ),
+            (
+                "256-bit",
+                Int::from_str(
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639747",
+                )
+                .unwrap(),
+            ),
+        ]
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run in --release with --ignored"]
+    fn bench_bsgs_scalar_vs_mont() {
+        let g = Int::from(2u64);
+        for order_bits in [20u32, 30, 40] {
+            let order = Int::from(2u64).pow(order_bits);
+            let m_steps = isqrt_ceil(&order.magnitude()).to_u64().unwrap();
+            let m_step_int = Int::from(m_steps);
+            for (name, p) in primes() {
+                let x = order.sub(&Int::ONE); // found near the end of the giant loop
+                let g_r = reduce(&g, &p);
+                let h = g_r.modpow(&x, &p);
+                let h_r = reduce(&h, &p);
+
+                let t = now();
+                let a = bsgs_scalar(&g_r, &h_r, &p, &order, m_steps, &m_step_int);
+                let scalar = t.elapsed();
+
+                let t = now();
+                let b = bsgs_mont(&g_r, &h_r, &p, &order, m_steps, &m_step_int);
+                let mont = t.elapsed();
+
+                assert_eq!(a, b);
+                println!(
+                    "bsgs  order=2^{order_bits} mod={name:>8}  scalar={:>10.3?}  mont={:>10.3?}  speedup={:.2}x",
+                    scalar,
+                    mont,
+                    scalar.as_secs_f64() / mont.as_secs_f64(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run in --release with --ignored"]
+    fn bench_rho_scalar_vs_mont() {
+        let g = Int::from(2u64);
+        for order_bits in [24u32, 30, 36] {
+            let order = Int::from(2u64).pow(order_bits);
+            for (name, p) in primes() {
+                let x = Int::from(1234567u64).rem_euclid(&order);
+                let g_r = reduce(&g, &p);
+                let h = g_r.modpow(&x, &p);
+                let h_r = reduce(&h, &p);
+
+                let t = now();
+                let a = pollard_rho_scalar(&g_r, &h_r, &p, &order, 3);
+                let scalar = t.elapsed();
+
+                let t = now();
+                let b = pollard_rho_mont(&g_r, &h_r, &p, &order, 3);
+                let mont = t.elapsed();
+
+                assert_eq!(a, b);
+                println!(
+                    "rho   order=2^{order_bits} mod={name:>8}  scalar={:>10.3?}  mont={:>10.3?}  speedup={:.2}x",
+                    scalar,
+                    mont,
+                    scalar.as_secs_f64() / mont.as_secs_f64(),
+                );
+            }
+        }
     }
 }

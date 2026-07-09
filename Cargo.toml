@@ -28,7 +28,7 @@ name = "puremp"
 # `float` is a separable layer (not part of the core contract) but is enabled
 # by default for convenience; disable it with `--no-default-features`
 # (optionally re-enabling `rational`/`cli`).
-default = ["std", "rational", "float", "dyadic", "padic", "decimal", "complex", "poly", "interval", "ball", "matrix", "lattice", "identify", "algebraic", "primality", "galois", "elliptic", "cli"]
+default = ["std", "rational", "float", "dyadic", "padic", "decimal", "complex", "poly", "interval", "ball", "matrix", "lattice", "identify", "algebraic", "primality", "galois", "elliptic", "numberfield", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -77,6 +77,11 @@ interval = ["float"]
 ball = ["interval"]
 # Algebraic numbers: exact ℚ(√d) (`Quadratic`) and general real `Algebraic`.
 algebraic = ["rational", "poly", "matrix", "float"]
+# Algebraic number fields `K = ℚ(θ) = ℚ[x]/(T(x))` (`NumberField`/
+# `NumberFieldElement`): element arithmetic, norm/trace/char-poly/min-poly,
+# discriminant, signature and complex embeddings. Built on `Poly<Rational>`,
+# `Matrix<Rational>` and `Complex<Float>`.
+numberfield = ["rational", "poly", "matrix", "complex", "float"]
 # Elliptic curves `y² = x³ + a·x + b` over `GF(p)` (`ModInt`) or `ℚ` (`Rational`),
 # with the chord-and-tangent group law, point orders and point counting (naive
 # scan plus Schoof's polynomial-time algorithm, which needs `poly`).

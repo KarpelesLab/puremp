@@ -172,6 +172,9 @@ pub mod algebraic;
 #[cfg(feature = "elliptic")]
 pub mod elliptic;
 
+#[cfg(feature = "numberfield")]
+pub mod numberfield;
+
 #[cfg(feature = "float")]
 pub mod float;
 #[cfg(feature = "float")]
@@ -264,6 +267,9 @@ pub use quadratic::Quadratic;
 
 #[cfg(feature = "elliptic")]
 pub use elliptic::{EllipticCurve, Point};
+
+#[cfg(feature = "numberfield")]
+pub use numberfield::{NumberField, NumberFieldElement};
 
 #[cfg(feature = "float")]
 pub use fixed_float::FixedFloat;

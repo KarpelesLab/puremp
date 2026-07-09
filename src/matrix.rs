@@ -486,6 +486,483 @@ impl Matrix<crate::int::Int> {
     }
 }
 
+// ---- exact integer Hermite / Smith normal forms ----
+//
+// Clean-room implementation from the open literature: H. Cohen, *A Course in
+// Computational Algebraic Number Theory*, §2.4.2–2.4.4 (Hermite normal form)
+// and §2.4.4 / algorithm 2.4.14 (Smith normal form). Only the mathematical
+// ideas — unimodular row/column operations, extended-gcd pivoting, reduction of
+// off-pivot entries modulo the pivot, and the alternating row/column clearing
+// with a divisibility repair step for Smith form — are used; no third-party code
+// was consulted.
+
+/// Applies the unimodular 2×2 row operation with coefficient matrix
+/// `[[c0, c1], [c2, c3]]` to rows `ra`, `rb` of a `width`-column row-major matrix:
+/// `row_ra ← c0·row_ra + c1·row_rb`, `row_rb ← c2·row_ra + c3·row_rb`.
+#[cfg(feature = "int")]
+fn mat_row_op(
+    data: &mut [crate::int::Int],
+    width: usize,
+    ra: usize,
+    rb: usize,
+    c: &[crate::int::Int; 4],
+) {
+    for k in 0..width {
+        let ia = ra * width + k;
+        let ib = rb * width + k;
+        let x = data[ia].clone();
+        let y = data[ib].clone();
+        data[ia] = c[0].mul(&x).add(&c[1].mul(&y));
+        data[ib] = c[2].mul(&x).add(&c[3].mul(&y));
+    }
+}
+
+/// The column analogue of [`mat_row_op`] over a matrix with `cols` columns and
+/// `nrows` rows, combining columns `ca`, `cb`.
+#[cfg(feature = "int")]
+fn mat_col_op(
+    data: &mut [crate::int::Int],
+    cols: usize,
+    nrows: usize,
+    ca: usize,
+    cb: usize,
+    c: &[crate::int::Int; 4],
+) {
+    for r in 0..nrows {
+        let ia = r * cols + ca;
+        let ib = r * cols + cb;
+        let x = data[ia].clone();
+        let y = data[ib].clone();
+        data[ia] = c[0].mul(&x).add(&c[1].mul(&y));
+        data[ib] = c[2].mul(&x).add(&c[3].mul(&y));
+    }
+}
+
+/// Swaps rows `ra`, `rb` of a `width`-column row-major matrix (a unimodular
+/// operation of determinant −1).
+#[cfg(feature = "int")]
+fn mat_swap_rows(data: &mut [crate::int::Int], width: usize, ra: usize, rb: usize) {
+    for k in 0..width {
+        data.swap(ra * width + k, rb * width + k);
+    }
+}
+
+/// Swaps columns `ca`, `cb` of a matrix with `cols` columns and `nrows` rows.
+#[cfg(feature = "int")]
+fn mat_swap_cols(data: &mut [crate::int::Int], cols: usize, nrows: usize, ca: usize, cb: usize) {
+    for r in 0..nrows {
+        data.swap(r * cols + ca, r * cols + cb);
+    }
+}
+
+/// Negates row `ra` (a unimodular operation of determinant −1).
+#[cfg(feature = "int")]
+fn mat_negate_row(data: &mut [crate::int::Int], width: usize, ra: usize) {
+    for k in 0..width {
+        let i = ra * width + k;
+        data[i] = data[i].neg();
+    }
+}
+
+/// Coefficients of the unimodular 2×2 operation that clears the pivot-line entry
+/// `b` (in the row/column carrying the Smith pivot `a`, `a ≠ 0`).
+///
+/// The subtlety that makes Smith reduction terminate: when `a | b`, the entry is
+/// removed by a plain *subtraction of a multiple* (`[[1,0],[-b/a,1]]`), which
+/// leaves the **pivot line unchanged** — so it never re-dirties the orthogonal
+/// line already cleared. Only when `a ∤ b` do we take the general extended-gcd
+/// combination `[[x,y],[-b/g,a/g]]` (`g = gcd(a,b)`), which replaces the pivot by
+/// `g < |a|`; because the pivot strictly shrinks on every such step and is a
+/// positive integer, the alternating row/column clearing converges. (A naive
+/// unconditional extended-gcd step can, e.g. for `a = b`, return a Bézout pair
+/// that merely *permutes* the pivot line and loops forever.)
+#[cfg(feature = "int")]
+fn snf_clear_coeffs(a: &crate::int::Int, b: &crate::int::Int) -> [crate::int::Int; 4] {
+    use crate::int::Int;
+    let (q, r) = b.div_rem_trunc(a);
+    if r.is_zero() {
+        // b = q·a: row_i ← row_i − q·row_pivot (pivot line untouched).
+        [Int::ONE, Int::ZERO, q.neg(), Int::ONE]
+    } else {
+        let (g, x, y) = a.extended_gcd(b); // g = a·x + b·y, 0 ≤ g < |a|
+        let ag = a.div_exact(&g);
+        let bg = b.div_exact(&g).neg();
+        [x, y, bg, ag]
+    }
+}
+
+#[cfg(feature = "int")]
+impl Matrix<crate::int::Int> {
+    /// Core row-style Hermite-normal-form reduction.
+    ///
+    /// Returns `(H, U?, rank)`, where `H = U · self` is the row HNF and, when
+    /// `want_u`, `U` is the accumulated unimodular transform (row-major `m × m`).
+    /// `rank` is the number of nonzero rows of `H` (the ℚ-rank of `self`).
+    fn hnf_impl(
+        &self,
+        want_u: bool,
+    ) -> (Vec<crate::int::Int>, Option<Vec<crate::int::Int>>, usize) {
+        use crate::int::Int;
+        let m = self.rows;
+        let n = self.cols;
+        let mut h = self.data.clone();
+        let mut u = if want_u {
+            Matrix::<Int>::identity(m).data
+        } else {
+            Vec::new()
+        };
+        let mut row = 0usize;
+        for col in 0..n {
+            if row >= m {
+                break;
+            }
+            // Reduce the sub-column below the pivot to a single gcd entry at
+            // `row` using unimodular row combinations (extended-gcd pivoting).
+            for i in row + 1..m {
+                let b = h[i * n + col].clone();
+                if b.is_zero() {
+                    continue;
+                }
+                let a = h[row * n + col].clone();
+                let (g, x, y) = a.extended_gcd(&b); // g = a·x + b·y ≥ 0
+                let ag = a.div_exact(&g);
+                let bg = b.div_exact(&g).neg();
+                // [[x, y], [-b/g, a/g]] has determinant (a·x + b·y)/g = 1.
+                let coeffs = [x, y, bg, ag];
+                mat_row_op(&mut h, n, row, i, &coeffs);
+                if want_u {
+                    mat_row_op(&mut u, m, row, i, &coeffs);
+                }
+            }
+            if h[row * n + col].is_zero() {
+                continue; // wholly-zero sub-column ⇒ not a pivot column
+            }
+            // Normalize the pivot to be positive.
+            if h[row * n + col].is_negative() {
+                mat_negate_row(&mut h, n, row);
+                if want_u {
+                    mat_negate_row(&mut u, m, row);
+                }
+            }
+            let piv = h[row * n + col].clone();
+            // Reduce every entry *above* the pivot into `[0, piv)`.
+            for i in 0..row {
+                let q = h[i * n + col].div_floor(&piv); // remainder in [0, piv)
+                if q.is_zero() {
+                    continue;
+                }
+                // row_i ← row_i − q·row_{row}.
+                let coeffs = [Int::ONE, q.neg(), Int::ZERO, Int::ONE];
+                mat_row_op(&mut h, n, i, row, &coeffs);
+                if want_u {
+                    mat_row_op(&mut u, m, i, row, &coeffs);
+                }
+            }
+            row += 1;
+        }
+        (h, want_u.then_some(u), row)
+    }
+
+    /// Returns the **row Hermite normal form** `H` of `self`.
+    ///
+    /// `H` is the unique matrix row-equivalent to `self` (i.e. `H = U · self` for
+    /// some unimodular `U`) in *row echelon form* with:
+    ///
+    /// - pivot columns `j₀ < j₁ < … < j_{r−1}` (`r` = rank), row `i` having its
+    ///   leading nonzero (the pivot) at column `jᵢ`;
+    /// - every pivot **positive**;
+    /// - every entry **above** a pivot reduced into `[0, pivot)`;
+    /// - the trailing `m − r` rows zero.
+    ///
+    /// Because it is canonical, two matrices with the same row lattice (the same
+    /// ℤ-span of rows) have the *same* HNF. For a square nonsingular matrix the
+    /// product of the diagonal equals `|det|`.
+    ///
+    /// Off-pivot (above-pivot) entries are reduced modulo the pivot eagerly, which
+    /// keeps `H`'s entries bounded by the pivots; pivots are produced by
+    /// extended-gcd combination (so they are gcds, not growing products).
+    pub fn hermite_normal_form(&self) -> Matrix<crate::int::Int> {
+        let (h, _, _) = self.hnf_impl(false);
+        Matrix::new(self.rows, self.cols, h)
+    }
+
+    /// Returns `(H, U)` where `H` is the [row HNF](Self::hermite_normal_form) and
+    /// `U` is a unimodular matrix (`|det U| = 1`) with **`H = U · self`** (the
+    /// transform acts on the **left**). `U` is `m × m` for an `m × n` input.
+    pub fn hermite_normal_form_with_transform(
+        &self,
+    ) -> (Matrix<crate::int::Int>, Matrix<crate::int::Int>) {
+        let (h, u, _) = self.hnf_impl(true);
+        (
+            Matrix::new(self.rows, self.cols, h),
+            Matrix::new(self.rows, self.rows, u.expect("transform requested")),
+        )
+    }
+
+    /// Core Smith-normal-form reduction.
+    ///
+    /// Returns `(D, rank, U?, V?)` with `D = U · self · V` diagonal,
+    /// `diag(D) = (d₀, …, d_{r−1}, 0, …)` and `dᵢ | dᵢ₊₁`. `U` (`m × m`) and `V`
+    /// (`n × n`) are the unimodular transforms, returned only when requested.
+    #[allow(clippy::type_complexity)]
+    fn snf_impl(
+        &self,
+        want_u: bool,
+        want_v: bool,
+    ) -> (
+        Vec<crate::int::Int>,
+        usize,
+        Option<Vec<crate::int::Int>>,
+        Option<Vec<crate::int::Int>>,
+    ) {
+        use crate::int::Int;
+        let m = self.rows;
+        let n = self.cols;
+        let mut d = self.data.clone();
+        let mut u = if want_u {
+            Matrix::<Int>::identity(m).data
+        } else {
+            Vec::new()
+        };
+        let mut v = if want_v {
+            Matrix::<Int>::identity(n).data
+        } else {
+            Vec::new()
+        };
+        let kmax = m.min(n);
+        let mut t = 0usize;
+        'main: while t < kmax {
+            loop {
+                // Ensure a nonzero pivot at (t, t); otherwise pull one in, or stop
+                // when the whole trailing submatrix is zero.
+                if d[t * n + t].is_zero() {
+                    let mut found = None;
+                    'search: for i in t..m {
+                        for j in t..n {
+                            if !d[i * n + j].is_zero() {
+                                found = Some((i, j));
+                                break 'search;
+                            }
+                        }
+                    }
+                    match found {
+                        None => break 'main, // trailing submatrix all zero ⇒ done
+                        Some((pi, pj)) => {
+                            if pi != t {
+                                mat_swap_rows(&mut d, n, t, pi);
+                                if want_u {
+                                    mat_swap_rows(&mut u, m, t, pi);
+                                }
+                            }
+                            if pj != t {
+                                mat_swap_cols(&mut d, n, m, t, pj);
+                                if want_v {
+                                    mat_swap_cols(&mut v, n, n, t, pj);
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut changed = false;
+                // Clear the pivot column below (t, t).
+                for i in t + 1..m {
+                    let b = d[i * n + t].clone();
+                    if b.is_zero() {
+                        continue;
+                    }
+                    let a = d[t * n + t].clone();
+                    let coeffs = snf_clear_coeffs(&a, &b);
+                    mat_row_op(&mut d, n, t, i, &coeffs);
+                    if want_u {
+                        mat_row_op(&mut u, m, t, i, &coeffs);
+                    }
+                    changed = true;
+                }
+                // Clear the pivot row right of (t, t) (may re-dirty the column).
+                for j in t + 1..n {
+                    let b = d[t * n + j].clone();
+                    if b.is_zero() {
+                        continue;
+                    }
+                    let a = d[t * n + t].clone();
+                    let coeffs = snf_clear_coeffs(&a, &b);
+                    mat_col_op(&mut d, n, m, t, j, &coeffs);
+                    if want_v {
+                        mat_col_op(&mut v, n, n, t, j, &coeffs);
+                    }
+                    changed = true;
+                }
+                if changed {
+                    continue; // re-clear until the cross is a single pivot
+                }
+                // Divisibility repair: the pivot must divide the whole trailing
+                // block. If not, fold an offending row into the pivot row and
+                // re-reduce — this strictly shrinks the pivot (a gcd), so it
+                // terminates.
+                let piv = d[t * n + t].clone();
+                let mut fixed = false;
+                'divs: for i in t + 1..m {
+                    for j in t + 1..n {
+                        if !piv.divides(&d[i * n + j]) {
+                            let coeffs = [Int::ONE, Int::ONE, Int::ZERO, Int::ONE]; // row_t += row_i
+                            mat_row_op(&mut d, n, t, i, &coeffs);
+                            if want_u {
+                                mat_row_op(&mut u, m, t, i, &coeffs);
+                            }
+                            fixed = true;
+                            break 'divs;
+                        }
+                    }
+                }
+                if fixed {
+                    continue;
+                }
+                break;
+            }
+            // Normalize the invariant factor to be positive.
+            if d[t * n + t].is_negative() {
+                mat_negate_row(&mut d, n, t);
+                if want_u {
+                    mat_negate_row(&mut u, m, t);
+                }
+            }
+            t += 1;
+        }
+        let rank = (0..kmax).filter(|&i| !d[i * n + i].is_zero()).count();
+        (d, rank, want_u.then_some(u), want_v.then_some(v))
+    }
+
+    /// Returns the **Smith normal form** `D` of `self`: the `m × n` diagonal
+    /// matrix `diag(d₀, …, d_{r−1}, 0, …)` with each `dᵢ > 0` and
+    /// `dᵢ | dᵢ₊₁` (the invariant factors), such that `D = U · self · V` for some
+    /// unimodular `U`, `V`.
+    ///
+    /// For a square nonsingular matrix `∏ dᵢ = |det|`; in general `d₀` is the gcd
+    /// of all entries and `d₀·d₁·…·d_{k−1}` is the gcd of all `k × k` minors.
+    pub fn smith_normal_form(&self) -> Matrix<crate::int::Int> {
+        let (d, _, _, _) = self.snf_impl(false, false);
+        Matrix::new(self.rows, self.cols, d)
+    }
+
+    /// Returns `(U, D, V)` where `D` is the [Smith normal form](Self::smith_normal_form)
+    /// and `U` (`m × m`), `V` (`n × n`) are unimodular with **`D = U · self · V`**.
+    pub fn smith_normal_form_with_transforms(
+        &self,
+    ) -> (
+        Matrix<crate::int::Int>,
+        Matrix<crate::int::Int>,
+        Matrix<crate::int::Int>,
+    ) {
+        let (d, _, u, v) = self.snf_impl(true, true);
+        (
+            Matrix::new(self.rows, self.rows, u.expect("transform requested")),
+            Matrix::new(self.rows, self.cols, d),
+            Matrix::new(self.cols, self.cols, v.expect("transform requested")),
+        )
+    }
+
+    /// Returns the **rank over ℚ** — the number of linearly independent rows,
+    /// equal to the number of nonzero rows of the [row HNF](Self::hermite_normal_form).
+    pub fn rank(&self) -> usize {
+        self.hnf_impl(false).2
+    }
+
+    /// Returns the **invariant factors** `d₀ | d₁ | … | d_{r−1}` (the nonzero
+    /// Smith-normal-form diagonal, each `> 0`).
+    ///
+    /// Viewing `self` as the matrix of a map `ℤⁿ → ℤᵐ` (columns are the images of
+    /// the standard basis), the cokernel `ℤᵐ / (self·ℤⁿ)` is isomorphic to
+    /// `⨁ᵢ ℤ/dᵢℤ ⊕ ℤ^{m−r}` — its torsion part is described by these factors
+    /// (dropping any `dᵢ = 1`) and its free rank is `m − r`, where `r` is the
+    /// [rank](Self::rank).
+    pub fn invariant_factors(&self) -> Vec<crate::int::Int> {
+        let (d, rank, _, _) = self.snf_impl(false, false);
+        let n = self.cols;
+        (0..rank).map(|i| d[i * n + i].clone()).collect()
+    }
+
+    /// Returns a ℤ-basis of the **integer kernel** `{x ∈ ℤⁿ : self·x = 0}`, as a
+    /// list of `n`-long column vectors (empty when the kernel is trivial).
+    ///
+    /// From `D = U·self·V` (Smith form): `self·x = 0 ⇔ D·(V⁻¹x) = 0`, whose
+    /// solution space is spanned by the standard basis vectors past the rank, so
+    /// the last `n − r` columns of `V` form the basis.
+    pub fn kernel(&self) -> Vec<Vec<crate::int::Int>> {
+        let n = self.cols;
+        let (_, rank, _, v) = self.snf_impl(false, true);
+        let v = v.expect("transform requested");
+        (rank..n)
+            .map(|j| (0..n).map(|i| v[i * n + j].clone()).collect())
+            .collect()
+    }
+
+    /// Returns a ℤ-basis of the **integer image** (column lattice)
+    /// `self·ℤⁿ ⊆ ℤᵐ`, as a list of `m`-long column vectors (empty when `self`
+    /// is zero).
+    ///
+    /// Computed as the nonzero rows of the row HNF of `selfᵀ` (a basis of the
+    /// lattice spanned by the columns of `self`).
+    pub fn image_basis(&self) -> Vec<Vec<crate::int::Int>> {
+        let m = self.rows;
+        let (h, _, rank) = self.transpose().hnf_impl(false);
+        // selfᵀ is n × m; its HNF has `rank` nonzero rows, each of length m.
+        (0..rank)
+            .map(|i| (0..m).map(|k| h[i * m + k].clone()).collect())
+            .collect()
+    }
+
+    /// Solves `self · x = b` over the integers, returning some `x ∈ ℤⁿ`, or
+    /// `None` when no integer solution exists.
+    ///
+    /// Uses the Smith form `D = U·self·V`: with `c = U·b` and `y = V⁻¹x` the
+    /// system becomes `D·y = c`, which is solvable iff `dᵢ | cᵢ` for `i < r` and
+    /// `cᵢ = 0` for `i ≥ r`; then `x = V·y`. Panics if `b`'s length is not the row
+    /// count. When the kernel is nontrivial the solution is one particular
+    /// solution (add any [`kernel`](Self::kernel) vector for others).
+    pub fn solve_integer(&self, b: &[crate::int::Int]) -> Option<Vec<crate::int::Int>> {
+        use crate::int::Int;
+        let m = self.rows;
+        let n = self.cols;
+        assert_eq!(b.len(), m, "solve_integer: right-hand side length mismatch");
+        let (d, rank, u, v) = self.snf_impl(true, true);
+        let u = u.expect("transform requested");
+        let v = v.expect("transform requested");
+        // c = U · b.
+        let mut c = alloc::vec![Int::ZERO; m];
+        for (i, ci) in c.iter_mut().enumerate() {
+            let mut acc = Int::ZERO;
+            for (k, bk) in b.iter().enumerate() {
+                acc = acc.add(&u[i * m + k].mul(bk));
+            }
+            *ci = acc;
+        }
+        // Solve D · y = c.
+        let mut y = alloc::vec![Int::ZERO; n];
+        for i in 0..m {
+            if i < rank {
+                let di = &d[i * n + i];
+                let (q, r) = c[i].div_rem_trunc(di);
+                if !r.is_zero() {
+                    return None; // dᵢ ∤ cᵢ
+                }
+                y[i] = q;
+            } else if !c[i].is_zero() {
+                return None; // inconsistent
+            }
+        }
+        // x = V · y.
+        let mut x = alloc::vec![Int::ZERO; n];
+        for (i, xi) in x.iter_mut().enumerate() {
+            let mut acc = Int::ZERO;
+            for (k, yk) in y.iter().enumerate() {
+                acc = acc.add(&v[i * n + k].mul(yk));
+            }
+            *xi = acc;
+        }
+        Some(x)
+    }
+}
+
 // ---- exact rational linear algebra ----
 
 #[cfg(feature = "rational")]
@@ -1349,5 +1826,441 @@ mod strassen_tests {
         // A · I = A on the Strassen path.
         let id = Matrix::<Int>::identity(26);
         assert_eq!(a.mul(&id), a);
+    }
+}
+
+#[cfg(all(test, feature = "int"))]
+mod hnf_snf_tests {
+    use super::*;
+    use crate::int::Int;
+
+    /// Tiny deterministic LCG for reproducible random test matrices.
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Lcg {
+            Lcg(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        /// A signed integer in `[-range, range]`.
+        fn small(&mut self, range: i64) -> Int {
+            let span = (2 * range + 1) as u64;
+            Int::from_i64((self.next() % span) as i64 - range)
+        }
+        fn imatrix(&mut self, rows: usize, cols: usize, range: i64) -> Matrix<Int> {
+            let data = (0..rows * cols).map(|_| self.small(range)).collect();
+            Matrix::new(rows, cols, data)
+        }
+        /// A random unimodular `n × n` matrix built from `steps` elementary row
+        /// operations on the identity (transvections, swaps, negations).
+        fn unimodular(&mut self, n: usize, steps: usize) -> Matrix<Int> {
+            let mut m = Matrix::<Int>::identity(n);
+            for _ in 0..steps {
+                if n < 2 {
+                    break;
+                }
+                let i = (self.next() as usize) % n;
+                let mut j = (self.next() as usize) % n;
+                if i == j {
+                    j = (j + 1) % n;
+                }
+                match self.next() % 3 {
+                    0 => {
+                        // row_i += q · row_j
+                        let q = self.small(3);
+                        for c in 0..n {
+                            let add = q.mul(m.get(j, c));
+                            let v = m.get(i, c).add(&add);
+                            m.set(i, c, v);
+                        }
+                    }
+                    1 => {
+                        for c in 0..n {
+                            let a = m.get(i, c).clone();
+                            let b = m.get(j, c).clone();
+                            m.set(i, c, b);
+                            m.set(j, c, a);
+                        }
+                    }
+                    _ => {
+                        for c in 0..n {
+                            let v = m.get(i, c).neg();
+                            m.set(i, c, v);
+                        }
+                    }
+                }
+            }
+            m
+        }
+    }
+
+    /// Verifies the row-HNF shape conditions and returns the pivot list.
+    fn check_hnf_shape(h: &Matrix<Int>) -> Vec<(usize, Int)> {
+        let m = h.rows();
+        let n = h.cols();
+        let mut pivots = Vec::new();
+        let mut prev_col: Option<usize> = None;
+        let mut seen_zero_row = false;
+        for i in 0..m {
+            let lead = (0..n).find(|&j| !h.get(i, j).is_zero());
+            match lead {
+                None => seen_zero_row = true,
+                Some(j) => {
+                    assert!(!seen_zero_row, "nonzero row {i} after a zero row");
+                    if let Some(pc) = prev_col {
+                        assert!(j > pc, "pivot columns not strictly increasing at row {i}");
+                    }
+                    prev_col = Some(j);
+                    let piv = h.get(i, j).clone();
+                    assert!(piv.is_positive(), "pivot at ({i},{j}) not positive");
+                    for r in 0..i {
+                        let e = h.get(r, j);
+                        assert!(
+                            !e.is_negative() && e < &piv,
+                            "entry above pivot ({r},{j}) not reduced into [0,piv)"
+                        );
+                    }
+                    pivots.push((j, piv));
+                }
+            }
+        }
+        pivots
+    }
+
+    fn is_unimodular(u: &Matrix<Int>) -> bool {
+        u.is_square() && u.determinant().abs().is_one()
+    }
+
+    /// Verifies SNF diagonal shape and returns the invariant factors.
+    fn check_snf_shape(d: &Matrix<Int>) -> Vec<Int> {
+        let m = d.rows();
+        let n = d.cols();
+        for i in 0..m {
+            for j in 0..n {
+                if i != j {
+                    assert!(d.get(i, j).is_zero(), "off-diagonal ({i},{j}) nonzero");
+                }
+            }
+        }
+        let mut factors = Vec::new();
+        let mut seen_zero = false;
+        for i in 0..m.min(n) {
+            let e = d.get(i, i).clone();
+            if e.is_zero() {
+                seen_zero = true;
+            } else {
+                assert!(!seen_zero, "nonzero invariant factor after a zero one");
+                assert!(e.is_positive(), "invariant factor not positive");
+                factors.push(e);
+            }
+        }
+        for w in factors.windows(2) {
+            assert!(w[0].divides(&w[1]), "divisibility d_i | d_{{i+1}} fails");
+        }
+        factors
+    }
+
+    fn zero_vec(len: usize) -> Vec<Int> {
+        alloc::vec![Int::ZERO; len]
+    }
+
+    /// Full HNF contract on one matrix: `H = U·A`, `U` unimodular, shape valid,
+    /// canonical under row-equivalence, and diagonal-product = |det| when square.
+    fn assert_hnf_contract(a: &Matrix<Int>, rng: &mut Lcg) {
+        let (h, u) = a.hermite_normal_form_with_transform();
+        assert_eq!(
+            h,
+            a.hermite_normal_form(),
+            "with/without transform disagree"
+        );
+        assert!(is_unimodular(&u), "U not unimodular");
+        assert_eq!(u.mul(a), h, "H = U·A violated");
+        let pivots = check_hnf_shape(&h);
+        assert_eq!(pivots.len(), a.rank(), "rank mismatch vs pivot count");
+
+        // Canonical form: a row-equivalent matrix has the same HNF.
+        let w = rng.unimodular(a.rows(), 12);
+        let a2 = w.mul(a);
+        assert_eq!(h, a2.hermite_normal_form(), "HNF not canonical");
+
+        if a.is_square() {
+            let det = a.determinant();
+            if !det.is_zero() {
+                let mut prod = Int::ONE;
+                for (_, p) in &pivots {
+                    prod = prod.mul(p);
+                }
+                assert_eq!(prod, det.abs(), "∏ pivots ≠ |det|");
+            }
+        }
+    }
+
+    /// Full SNF contract on one matrix: `D = U·A·V`, transforms unimodular, shape
+    /// valid, `d₀ = gcd(entries)`, and `∏ dᵢ = |det|` when square nonsingular.
+    fn assert_snf_contract(a: &Matrix<Int>) {
+        let (u, d, v) = a.smith_normal_form_with_transforms();
+        assert_eq!(d, a.smith_normal_form(), "with/without transforms disagree");
+        assert!(is_unimodular(&u), "U not unimodular");
+        assert!(is_unimodular(&v), "V not unimodular");
+        assert_eq!(u.mul(a).mul(&v), d, "D = U·A·V violated");
+        let factors = check_snf_shape(&d);
+        assert_eq!(factors, a.invariant_factors(), "invariant_factors mismatch");
+        assert_eq!(
+            factors.len(),
+            a.rank(),
+            "rank mismatch vs #invariant factors"
+        );
+
+        // d₀ is the gcd of all entries.
+        if !factors.is_empty() {
+            let mut g = Int::ZERO;
+            for e in a.as_slice() {
+                g = g.gcd(e);
+            }
+            assert_eq!(factors[0], g, "d₀ ≠ gcd of entries");
+        }
+
+        if a.is_square() {
+            let det = a.determinant();
+            if !det.is_zero() {
+                let mut prod = Int::ONE;
+                for f in &factors {
+                    prod = prod.mul(f);
+                }
+                assert_eq!(prod, det.abs(), "∏ dᵢ ≠ |det|");
+            }
+        }
+    }
+
+    /// Verifies the kernel basis: each vector `k` satisfies `A·k = 0`, and the
+    /// count is `cols − rank`.
+    fn assert_kernel(a: &Matrix<Int>) {
+        let ker = a.kernel();
+        let n = a.cols();
+        assert_eq!(ker.len(), n - a.rank(), "kernel dimension wrong");
+        for k in &ker {
+            assert_eq!(k.len(), n);
+            let kv = Matrix::new(n, 1, k.clone());
+            assert_eq!(a.mul(&kv), Matrix::zeros(a.rows(), 1), "A·k ≠ 0");
+            // A kernel basis vector must be nonzero (primitive lattice basis).
+            assert!(k.iter().any(|e| !e.is_zero()), "zero kernel vector");
+        }
+    }
+
+    #[test]
+    fn hnf_known_small() {
+        // Hand example: two generators of a rank-1 row lattice in ℤ².
+        let a = Matrix::from_rows(alloc::vec![
+            alloc::vec![Int::from_i64(2), Int::from_i64(4)],
+            alloc::vec![Int::from_i64(3), Int::from_i64(6)],
+        ]);
+        let h = a.hermite_normal_form();
+        // Row lattice is spanned by (1,2); HNF = [[1,2],[0,0]].
+        assert_eq!(
+            h,
+            Matrix::from_rows(alloc::vec![
+                alloc::vec![Int::ONE, Int::from_i64(2)],
+                alloc::vec![Int::ZERO, Int::ZERO],
+            ])
+        );
+    }
+
+    #[test]
+    fn snf_known_example() {
+        // Classic hand-checkable case: invariant factors (2, 2, 156).
+        let a = Matrix::from_rows(alloc::vec![
+            alloc::vec![Int::from_i64(2), Int::from_i64(4), Int::from_i64(4)],
+            alloc::vec![Int::from_i64(-6), Int::from_i64(6), Int::from_i64(12)],
+            alloc::vec![Int::from_i64(10), Int::from_i64(4), Int::from_i64(16)],
+        ]);
+        assert_eq!(
+            a.invariant_factors(),
+            alloc::vec![Int::from_i64(2), Int::from_i64(2), Int::from_i64(156)]
+        );
+        assert_eq!(a.determinant().abs(), Int::from_i64(624));
+        assert_snf_contract(&a);
+    }
+
+    #[test]
+    fn structured_cases() {
+        let mut rng = Lcg::new(0x0BAD_F00D);
+        let cases = alloc::vec![
+            // identity, zero, single row/col, rank-deficient, zero row/col.
+            Matrix::<Int>::identity(4),
+            Matrix::<Int>::zeros(3, 4),
+            Matrix::from_rows(alloc::vec![alloc::vec![
+                Int::from_i64(6),
+                Int::from_i64(10),
+                Int::from_i64(15)
+            ]]),
+            Matrix::from_rows(alloc::vec![
+                alloc::vec![Int::from_i64(2)],
+                alloc::vec![Int::from_i64(3)],
+                alloc::vec![Int::from_i64(5)],
+            ]),
+            // rank-2, 3×3 (third row = row1 + row2).
+            Matrix::from_rows(alloc::vec![
+                alloc::vec![Int::from_i64(1), Int::from_i64(2), Int::from_i64(3)],
+                alloc::vec![Int::from_i64(4), Int::from_i64(5), Int::from_i64(6)],
+                alloc::vec![Int::from_i64(5), Int::from_i64(7), Int::from_i64(9)],
+            ]),
+            // a matrix with a zero column and a zero row.
+            Matrix::from_rows(alloc::vec![
+                alloc::vec![Int::from_i64(3), Int::ZERO, Int::from_i64(9)],
+                alloc::vec![Int::from_i64(6), Int::ZERO, Int::from_i64(3)],
+                alloc::vec![Int::ZERO, Int::ZERO, Int::ZERO],
+            ]),
+        ];
+        for a in &cases {
+            assert_hnf_contract(a, &mut rng);
+            assert_snf_contract(a);
+            assert_kernel(a);
+        }
+    }
+
+    #[test]
+    fn random_cases() {
+        let mut rng = Lcg::new(0x5EED_1234);
+        let shapes = [
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (5, 5),
+            (2, 4),
+            (4, 2),
+            (3, 5),
+            (5, 3),
+            (6, 6),
+        ];
+        for &(m, n) in &shapes {
+            for _ in 0..6 {
+                let a = rng.imatrix(m, n, 6);
+                assert_hnf_contract(&a, &mut rng);
+                assert_snf_contract(&a);
+                assert_kernel(&a);
+            }
+        }
+    }
+
+    #[test]
+    fn rank_deficient_and_larger_entries() {
+        let mut rng = Lcg::new(0xDEAD_BEEF);
+        // Force rank deficiency by making some rows integer combinations of others.
+        for _ in 0..8 {
+            let base = rng.imatrix(2, 5, 20);
+            let mut rows: Vec<Vec<Int>> = (0..2)
+                .map(|i| (0..5).map(|j| base.get(i, j).clone()).collect())
+                .collect();
+            // third row = 2·row0 − 3·row1, fourth row = row0 + row1.
+            let combo1: Vec<Int> = (0..5)
+                .map(|j| {
+                    Int::from_i64(2)
+                        .mul(base.get(0, j))
+                        .sub(&Int::from_i64(3).mul(base.get(1, j)))
+                })
+                .collect();
+            let combo2: Vec<Int> = (0..5).map(|j| base.get(0, j).add(base.get(1, j))).collect();
+            rows.push(combo1);
+            rows.push(combo2);
+            let a = Matrix::from_rows(rows);
+            assert!(a.rank() <= 2);
+            assert_hnf_contract(&a, &mut rng);
+            assert_snf_contract(&a);
+            assert_kernel(&a);
+        }
+    }
+
+    #[test]
+    fn image_basis_spans_columns() {
+        // The image lattice basis must contain every original column, and its
+        // size must equal the rank.
+        let mut rng = Lcg::new(0x1CE_B00C);
+        for _ in 0..6 {
+            let a = rng.imatrix(4, 3, 6);
+            let basis = a.image_basis();
+            assert_eq!(basis.len(), a.rank());
+            let m = a.rows();
+            // Each column of A must be an integer combination of the basis.
+            let bcols = basis.len();
+            let mut bdata = alloc::vec![Int::ZERO; m * bcols];
+            for (jb, bv) in basis.iter().enumerate() {
+                for (i, e) in bv.iter().enumerate() {
+                    bdata[i * bcols + jb] = e.clone();
+                }
+            }
+            let bmat = Matrix::new(m, bcols, bdata);
+            for j in 0..a.cols() {
+                let col: Vec<Int> = (0..m).map(|i| a.get(i, j).clone()).collect();
+                assert!(
+                    bmat.solve_integer(&col).is_some(),
+                    "column {j} not in image lattice"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn solve_integer_roundtrip_and_inconsistency() {
+        let mut rng = Lcg::new(0xF00D_F00D);
+        for _ in 0..10 {
+            let a = rng.imatrix(4, 4, 5);
+            // Solvable system: pick x0, set b = A·x0.
+            let x0: Vec<Int> = (0..4).map(|_| rng.small(4)).collect();
+            let xv = Matrix::new(4, 1, x0.clone());
+            let b: Vec<Int> = (0..4).map(|i| a.mul(&xv).get(i, 0).clone()).collect();
+            match a.solve_integer(&b) {
+                Some(x) => {
+                    let xm = Matrix::new(4, 1, x);
+                    let bcheck: Vec<Int> = (0..4).map(|i| a.mul(&xm).get(i, 0).clone()).collect();
+                    assert_eq!(bcheck, b, "A·x ≠ b");
+                }
+                None => panic!("consistent system reported unsolvable"),
+            }
+        }
+        // A clearly inconsistent system: 2x = 1 has no integer solution.
+        let a = Matrix::from_rows(alloc::vec![alloc::vec![Int::from_i64(2)]]);
+        assert!(a.solve_integer(&[Int::ONE]).is_none());
+        // Rank-deficient inconsistency: rows (1,1) and (1,1) with b = (0,1).
+        let a = Matrix::from_rows(alloc::vec![
+            alloc::vec![Int::ONE, Int::ONE],
+            alloc::vec![Int::ONE, Int::ONE],
+        ]);
+        assert!(a.solve_integer(&[Int::ZERO, Int::ONE]).is_none());
+        assert!(
+            a.solve_integer(&[Int::from_i64(2), Int::from_i64(2)])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn empty_and_degenerate_shapes() {
+        // Zero matrix: everything is trivial/consistent.
+        let z = Matrix::<Int>::zeros(3, 3);
+        assert_eq!(z.rank(), 0);
+        assert!(z.invariant_factors().is_empty());
+        assert_eq!(z.kernel().len(), 3);
+        assert_eq!(z.image_basis().len(), 0);
+        assert_eq!(z.solve_integer(&zero_vec(3)), Some(zero_vec(3)));
+        assert!(z.solve_integer(&[Int::ZERO, Int::ZERO, Int::ONE]).is_none());
+    }
+
+    #[test]
+    #[ignore = "slow: larger random matrices"]
+    fn large_random_stress() {
+        let mut rng = Lcg::new(0x00A1_1CE5);
+        for &(m, n) in &[(10usize, 10usize), (12, 8), (8, 12), (14, 14)] {
+            for _ in 0..4 {
+                let a = rng.imatrix(m, n, 30);
+                assert_hnf_contract(&a, &mut rng);
+                assert_snf_contract(&a);
+                assert_kernel(&a);
+            }
+        }
     }
 }

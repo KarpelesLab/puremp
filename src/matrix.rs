@@ -591,6 +591,120 @@ fn snf_clear_coeffs(a: &crate::int::Int, b: &crate::int::Int) -> [crate::int::In
     }
 }
 
+/// Row Hermite normal form of an `n × n` **nonsingular** integer matrix computed
+/// with *modulo-determinant arithmetic* (Domich–Kannan–Trotter 1987; Cohen,
+/// *CCANT* §2.4.2). `src` is the row-major matrix and `det_abs = |det(src)| > 0`.
+///
+/// The row lattice `L = rowspan(src)` has covolume `D = |det|`. After the first
+/// `col` pivots `p₀,…,p_{col-1}` are fixed, the lattice projected onto the
+/// remaining coordinates has covolume `R = D / (p₀···p_{col-1})`, so it contains
+/// `R·ℤ^{n-col}` — i.e. `R·e_j` is a lattice vector for every remaining column
+/// `j`. Reducing every entry modulo this **shrinking modulus `R`** (subtracting
+/// multiples of those `R·e_j`) keeps all intermediates in `[0, R) ⊆ [0, D)`,
+/// killing the coefficient explosion of the plain extended-gcd reduction.
+///
+/// The pivot for column `col` is `gcd(a, R)` where `a` is the gcd of the sub-column
+/// entries (the `R` folding in the modulus generator `R·e_col`); it divides `R`,
+/// and `R` then shrinks by it — so the diagonal telescopes to `∏pᵢ = D`. Every
+/// pivot lies in `[1, R]` and every above-pivot entry is reduced into `[0, pivot)`,
+/// giving the *same* canonical `H` as [`Matrix::hermite_normal_form`].
+#[cfg(feature = "int")]
+fn hnf_mod_det(
+    src: &[crate::int::Int],
+    n: usize,
+    det_abs: &crate::int::Int,
+) -> Vec<crate::int::Int> {
+    use crate::int::Int;
+    let idx = |i: usize, j: usize| i * n + j;
+    let mut r = det_abs.clone(); // current modulus D / ∏(pivots so far)
+    // Work with every entry reduced into [0, R).
+    let mut w: Vec<Int> = src.iter().map(|e| e.rem_euclid(&r)).collect();
+    for col in 0..n {
+        let row = col; // nonsingular ⇒ the pivot for column `col` lands on row `col`
+        // Combine the sub-column below the pivot into a single gcd entry at
+        // (row, col) with unimodular row operations, keeping everything mod R.
+        for i in row + 1..n {
+            if w[idx(i, col)].is_zero() {
+                continue;
+            }
+            let a = w[idx(row, col)].clone();
+            let b = w[idx(i, col)].clone();
+            // extended_gcd handles a == 0 (yields the swap-with-sign combination).
+            let (g, x, y) = a.extended_gcd(&b);
+            let ag = a.div_exact(&g);
+            let bg = b.div_exact(&g).neg();
+            for k in 0..n {
+                let xr = w[idx(row, k)].clone();
+                let yr = w[idx(i, k)].clone();
+                w[idx(row, k)] = x.mul(&xr).add(&y.mul(&yr)).rem_euclid(&r);
+                w[idx(i, k)] = bg.mul(&xr).add(&ag.mul(&yr)).rem_euclid(&r);
+            }
+        }
+        // Fold in the modulus generator `R·e_col`: the pivot is `p = gcd(a, R)`.
+        // With `p = a·x + R·y`, replacing the row by `x·row + y·(R·e_col)` sets
+        // the pivot entry to `p` and scales the rest by `x` (mod R). When `a = 0`
+        // we get `x = 0`, `p = R`: the row becomes the pure modulus vector.
+        let a = w[idx(row, col)].clone();
+        let (p, x, _y) = a.extended_gcd(&r);
+        for k in 0..n {
+            let v = w[idx(row, k)].clone();
+            w[idx(row, k)] = x.mul(&v).rem_euclid(&r);
+        }
+        w[idx(row, col)] = p.clone(); // pivot in [1, R]
+        // Reduce every entry above the pivot into `[0, p)`.
+        for i in 0..row {
+            let q = w[idx(i, col)].div_floor(&p); // remainder in [0, p)
+            if q.is_zero() {
+                continue;
+            }
+            for k in 0..n {
+                let sub = q.mul(&w[idx(row, k)]);
+                w[idx(i, k)] = w[idx(i, k)].sub(&sub).rem_euclid(&r);
+            }
+        }
+        // Shrink the modulus by the pivot (exact: p | R) and re-reduce the rows
+        // still to be processed into the new, smaller range.
+        r = r.div_exact(&p);
+        if !r.is_one() {
+            for i in row + 1..n {
+                for k in 0..n {
+                    w[idx(i, k)] = w[idx(i, k)].rem_euclid(&r);
+                }
+            }
+        }
+    }
+    w
+}
+
+/// Heuristic gate for the modulo-determinant HNF route. The modular path pays a
+/// fixed cost (a determinant / fraction-free pass) but then keeps every entry
+/// bounded by `|det|`, whereas the plain reduction blows intermediate entries up
+/// super-linearly in both the dimension and the entry size.
+///
+/// Measurements (the `#[ignore]`d `bench_modular_vs_reference` test) put the
+/// crossover around dimension 16: at `n = 8` the reference path is faster at every
+/// entry size, at `n = 16` the modular path wins once entries exceed ~64 bits
+/// (≈2×), and by `n = 24` it wins across the board (2.6× at 32-bit, 8–40× at
+/// 128–512-bit). We therefore route only when the dimension is at least
+/// `MIN_DIM`, and additionally require sizable entries (`MIN_BITS`) in the
+/// `MIN_DIM..BIG_DIM` band where the win is entry-size-dependent; from `BIG_DIM`
+/// up the modular path wins even for small entries.
+#[cfg(feature = "int")]
+fn hnf_modular_worthwhile(a: &Matrix<crate::int::Int>) -> bool {
+    const MIN_DIM: usize = 12;
+    const BIG_DIM: usize = 20;
+    const MIN_BITS: u32 = 64;
+    let n = a.rows;
+    if n < MIN_DIM {
+        return false;
+    }
+    if n >= BIG_DIM {
+        return true;
+    }
+    let max_bits = a.data.iter().map(|e| e.bit_len()).max().unwrap_or(0);
+    max_bits >= MIN_BITS
+}
+
 #[cfg(feature = "int")]
 impl Matrix<crate::int::Int> {
     /// Core row-style Hermite-normal-form reduction.
@@ -682,8 +796,175 @@ impl Matrix<crate::int::Int> {
     /// keeps `H`'s entries bounded by the pivots; pivots are produced by
     /// extended-gcd combination (so they are gcds, not growing products).
     pub fn hermite_normal_form(&self) -> Matrix<crate::int::Int> {
+        if let Some(h) = self.hnf_modular() {
+            return Matrix::new(self.rows, self.cols, h);
+        }
         let (h, _, _) = self.hnf_impl(false);
         Matrix::new(self.rows, self.cols, h)
+    }
+
+    /// Row HNF via *modulo-determinant arithmetic* ([`hnf_mod_det`]), returning
+    /// `Some(H)` only for full-rank inputs above the size/entry threshold where
+    /// the modular route beats the plain reduction, and `None` otherwise (small
+    /// inputs, or rank-deficient inputs, which fall back to [`Self::hnf_impl`]).
+    ///
+    /// The exact `H` is identical to [`Self::hermite_normal_form`]'s reference
+    /// path; only intermediate coefficient growth differs.
+    fn hnf_modular(&self) -> Option<Vec<crate::int::Int>> {
+        let m = self.rows;
+        let n = self.cols;
+        if m == 0 || n == 0 || m > n {
+            return None; // handled by the reference path (incl. tall matrices)
+        }
+        if !hnf_modular_worthwhile(self) {
+            return None;
+        }
+        if m == n {
+            // Square: nonsingular ⇔ full rank. |det| is the lattice determinant.
+            let det = self.determinant();
+            if det.is_zero() {
+                return None; // rank-deficient ⇒ reference path
+            }
+            return Some(hnf_mod_det(&self.data, n, &det.abs()));
+        }
+        // Wide (m < n): full row rank only. Find the pivot columns and the
+        // determinant of that square minor, HNF the minor modularly, then fill
+        // the remaining columns from the (exact) unimodular transform. The exact
+        // rational solve for the non-pivot columns carries a real overhead, so
+        // the wide crossover sits higher than the square one (measurements: it
+        // only wins reliably from ~dimension 20); gate it accordingly. The exact
+        // solve needs the `rational` layer — without it, wide inputs fall back to
+        // the reference path.
+        #[cfg(feature = "rational")]
+        {
+            const WIDE_MIN_DIM: usize = 20;
+            if m >= WIDE_MIN_DIM {
+                return self.hnf_modular_wide();
+            }
+        }
+        None
+    }
+
+    /// Wide-matrix (`m < n`) branch of [`Self::hnf_modular`], for full row rank.
+    ///
+    /// The HNF pivots sit at the leftmost independent columns `P` (found by a
+    /// fraction-free pass). Restricted to `P`, the HNF equals the HNF of the
+    /// nonsingular minor `A_P` — computed modularly — because the row lattice
+    /// projected onto `P` is `rowspan(A_P)`. The remaining columns are
+    /// `H_R = U·A_R` where `U = H_P·A_P⁻¹` is the (unique) transform of the
+    /// square subproblem; equivalently `H_R = H_P·(A_P⁻¹·A_R)`, which we obtain
+    /// from an exact rational solve. Returns `None` if not full row rank (⇒
+    /// reference path).
+    #[cfg(feature = "rational")]
+    fn hnf_modular_wide(&self) -> Option<Vec<crate::int::Int>> {
+        use crate::int::Int;
+        use crate::rational::Rational;
+        let m = self.rows;
+        let n = self.cols;
+        let (piv, det_abs) = self.pivot_columns_and_det()?;
+        if piv.len() != m {
+            return None; // not full row rank ⇒ reference path
+        }
+        let is_pivot = {
+            let mut v = alloc::vec![false; n];
+            for &c in &piv {
+                v[c] = true;
+            }
+            v
+        };
+        let rest: Vec<usize> = (0..n).filter(|&c| !is_pivot[c]).collect();
+        // Square minor A_P (m × m) and its modular HNF H_P.
+        let a_p: Vec<Int> = (0..m)
+            .flat_map(|i| piv.iter().map(move |&c| self.data[i * n + c].clone()))
+            .collect();
+        let h_p = hnf_mod_det(&a_p, m, &det_abs);
+        // Exact rational solve A_P · Z = A_R  (Z = A_P⁻¹·A_R), then H_R = H_P·Z.
+        let a_p_rat = Matrix::new(
+            m,
+            m,
+            a_p.iter()
+                .map(|e| Rational::from_integer(e.clone()))
+                .collect(),
+        );
+        let inv = a_p_rat.inverse()?; // nonsingular ⇒ Some
+        let h_out = {
+            // z[i][t] = (A_P⁻¹ · A_R)[i][t]
+            let ncols = rest.len();
+            let mut z = alloc::vec![Rational::ZERO; m * ncols];
+            for (t, &c) in rest.iter().enumerate() {
+                for i in 0..m {
+                    let mut acc = Rational::ZERO;
+                    for k in 0..m {
+                        let a_rk = Rational::from_integer(self.data[k * n + c].clone());
+                        acc = Rational::add(&acc, &Rational::mul(inv.get(i, k), &a_rk));
+                    }
+                    z[i * ncols + t] = acc;
+                }
+            }
+            // H_R = H_P · Z (integer); assemble full H at original column order.
+            let mut h = alloc::vec![Int::ZERO; m * n];
+            for i in 0..m {
+                for (k, &c) in piv.iter().enumerate() {
+                    h[i * n + c] = h_p[i * m + k].clone();
+                }
+                for (t, &c) in rest.iter().enumerate() {
+                    let mut acc = Rational::ZERO;
+                    for k in 0..m {
+                        let hpk = Rational::from_integer(h_p[i * m + k].clone());
+                        acc = Rational::add(&acc, &Rational::mul(&hpk, &z[k * ncols + t]));
+                    }
+                    debug_assert!(acc.is_integer(), "H_R entry not integral");
+                    h[i * n + c] = acc.numerator().clone();
+                }
+            }
+            h
+        };
+        Some(h_out)
+    }
+
+    /// Fraction-free (Bareiss) forward elimination that returns the leftmost
+    /// independent columns (the HNF pivot columns) together with `|det|` of the
+    /// square submatrix on those columns. All intermediate entries are integer
+    /// minors (bounded by the determinant), so this pivot search never suffers
+    /// the coefficient blow-up of the plain reduction.
+    #[cfg(feature = "rational")]
+    fn pivot_columns_and_det(&self) -> Option<(Vec<usize>, crate::int::Int)> {
+        use crate::int::Int;
+        let m = self.rows;
+        let n = self.cols;
+        let mut a = self.data.clone();
+        let idx = |i: usize, j: usize| i * n + j;
+        let mut prev = Int::ONE;
+        let mut piv: Vec<usize> = Vec::with_capacity(m);
+        let mut r = 0usize;
+        for col in 0..n {
+            if r == m {
+                break;
+            }
+            let pr = (r..m).find(|&i| !a[idx(i, col)].is_zero());
+            let pr = match pr {
+                Some(p) => p,
+                None => continue, // dependent column ⇒ no pivot here
+            };
+            if pr != r {
+                for c in col..n {
+                    a.swap(idx(r, c), idx(pr, c));
+                }
+            }
+            piv.push(col);
+            let arc = a[idx(r, col)].clone();
+            for i in r + 1..m {
+                let aic = a[idx(i, col)].clone();
+                for j in col + 1..n {
+                    let num = a[idx(i, j)].mul(&arc).sub(&aic.mul(&a[idx(r, j)]));
+                    a[idx(i, j)] = num.div_exact(&prev); // exact by the Bareiss identity
+                }
+                a[idx(i, col)] = Int::ZERO;
+            }
+            prev = arc;
+            r += 1;
+        }
+        Some((piv, prev.abs()))
     }
 
     /// Returns `(H, U)` where `H` is the [row HNF](Self::hermite_normal_form) and
@@ -1856,6 +2137,27 @@ mod hnf_snf_tests {
             let data = (0..rows * cols).map(|_| self.small(range)).collect();
             Matrix::new(rows, cols, data)
         }
+        /// A signed integer of roughly `nbits` bits.
+        fn bits(&mut self, nbits: u32) -> Int {
+            let mut v = Int::ZERO;
+            let mut got = 0u32;
+            while got < nbits {
+                v = v.mul_2k(32).add(&Int::from_u64(self.next() & 0xFFFF_FFFF));
+                got += 32;
+            }
+            if self.next() & 1 == 0 { v.neg() } else { v }
+        }
+        /// A full-(row-)rank `rows × cols` matrix (`rows ≤ cols`) with ~`nbits`
+        /// entries, by rejection sampling on the rank.
+        fn full_rank(&mut self, rows: usize, cols: usize, nbits: u32) -> Matrix<Int> {
+            loop {
+                let data = (0..rows * cols).map(|_| self.bits(nbits)).collect();
+                let a = Matrix::new(rows, cols, data);
+                if a.rank() == rows {
+                    return a;
+                }
+            }
+        }
         /// A random unimodular `n × n` matrix built from `steps` elementary row
         /// operations on the identity (transvections, swaps, negations).
         fn unimodular(&mut self, n: usize, steps: usize) -> Matrix<Int> {
@@ -2250,6 +2552,64 @@ mod hnf_snf_tests {
         assert!(z.solve_integer(&[Int::ZERO, Int::ZERO, Int::ONE]).is_none());
     }
 
+    /// The modulo-determinant HNF (both branches) must equal the reference
+    /// extended-gcd reduction **bit-for-bit** on full-rank inputs.
+    #[cfg(feature = "rational")]
+    #[test]
+    fn modular_hnf_matches_reference() {
+        let mut rng = Lcg::new(0xC0FF_EE42);
+        // Square (nonsingular) and wide (full row rank), assorted sizes/entry
+        // sizes straddling the routing threshold.
+        let cases: &[(usize, usize)] = &[
+            (2, 2),
+            (3, 3),
+            (5, 5),
+            (6, 6),
+            (7, 7),
+            (8, 8),
+            (2, 4),
+            (3, 6),
+            (5, 8),
+            (6, 12),
+            (4, 5),
+        ];
+        for &(m, n) in cases {
+            for &bits in &[4u32, 40, 80, 200] {
+                for _ in 0..3 {
+                    let a = rng.full_rank(m, n, bits);
+                    let reference = Matrix::new(m, n, a.hnf_impl(false).0);
+                    // Force the modular path regardless of the size threshold.
+                    let modular = if m == n {
+                        Matrix::new(m, n, hnf_mod_det(&a.data, n, &a.determinant().abs()))
+                    } else {
+                        Matrix::new(m, n, a.hnf_modular_wide().expect("full row rank"))
+                    };
+                    assert_eq!(
+                        modular, reference,
+                        "modular HNF ≠ reference ({m}×{n}, {bits}b)"
+                    );
+                    // Canonical shape + ∏pivots = |det| are checked by the shared
+                    // helper (also exercises the public routed path).
+                    check_hnf_shape(&modular);
+                }
+            }
+        }
+    }
+
+    /// The routed public `hermite_normal_form` (which dispatches to the modular
+    /// path for large full-rank inputs) still equals the reference and satisfies
+    /// the full HNF contract.
+    #[test]
+    fn routed_hnf_large_entries_contract() {
+        let mut rng = Lcg::new(0x1234_ABCD);
+        for &(m, n) in &[(6usize, 6usize), (8, 8), (6, 10)] {
+            let a = rng.full_rank(m, n, 300);
+            let reference = Matrix::new(m, n, a.hnf_impl(false).0);
+            assert_eq!(a.hermite_normal_form(), reference, "routed HNF ≠ reference");
+            assert_hnf_contract(&a, &mut rng);
+        }
+    }
+
     #[test]
     #[ignore = "slow: larger random matrices"]
     fn large_random_stress() {
@@ -2260,6 +2620,69 @@ mod hnf_snf_tests {
                 assert_hnf_contract(&a, &mut rng);
                 assert_snf_contract(&a);
                 assert_kernel(&a);
+            }
+        }
+    }
+
+    /// Exercises the *routed* public path at and above the routing threshold
+    /// (`n ≥ 20`, including the wide branch) and checks it is bit-identical to the
+    /// reference reduction. Kept `#[ignore]` because the reference side is slow at
+    /// these sizes.
+    #[cfg(feature = "rational")]
+    #[test]
+    #[ignore = "slow: reference reduction at n ≥ 20"]
+    fn routed_hnf_threshold_matches_reference() {
+        let mut rng = Lcg::new(0x2468_ACE0);
+        for &(m, n) in &[(20usize, 20usize), (22, 22), (20, 40), (24, 48)] {
+            let a = rng.full_rank(m, n, 96);
+            assert!(hnf_modular_worthwhile(&a), "expected routing at {m}×{n}");
+            let reference = Matrix::new(m, n, a.hnf_impl(false).0);
+            assert_eq!(
+                a.hermite_normal_form(),
+                reference,
+                "routed HNF ≠ reference ({m}×{n})"
+            );
+        }
+    }
+
+    /// Head-to-head timing of the reference extended-gcd reduction against the
+    /// modulo-determinant path, over full-rank square and `n×2n` matrices at
+    /// assorted dimensions and entry sizes. Run with:
+    /// `cargo test --release --features matrix,int,rational -- --ignored --nocapture bench_modular_vs_reference`
+    #[cfg(feature = "rational")]
+    #[test]
+    #[ignore = "benchmark: run in --release with --nocapture"]
+    fn bench_modular_vs_reference() {
+        use std::time::Instant;
+        fn secs<F: FnMut()>(mut f: F) -> f64 {
+            let t = Instant::now();
+            f();
+            t.elapsed().as_secs_f64()
+        }
+        let mut rng = Lcg::new(0xB0A7_1235);
+        std::println!("shape        n  bits   reference     modular   speedup");
+        for &(square, dims) in &[(true, &[8usize, 16, 24][..]), (false, &[8, 16, 24][..])] {
+            for &n in dims {
+                let cols = if square { n } else { 2 * n };
+                for &bits in &[32u32, 128, 512] {
+                    let a = rng.full_rank(n, cols, bits);
+                    let t_ref = secs(|| {
+                        let _ = a.hnf_impl(false).0;
+                    });
+                    // Force the modular path (includes its determinant / pivot pass).
+                    let t_mod = secs(|| {
+                        let _ = if square {
+                            Matrix::new(n, cols, hnf_mod_det(&a.data, n, &a.determinant().abs()))
+                        } else {
+                            Matrix::new(n, cols, a.hnf_modular_wide().expect("full row rank"))
+                        };
+                    });
+                    let shape = if square { "square" } else { "n x 2n" };
+                    std::println!(
+                        "{shape}  {n:>3} {bits:>5} {t_ref:>10.4}s {t_mod:>10.4}s  {:>6.1}x",
+                        t_ref / t_mod
+                    );
+                }
             }
         }
     }

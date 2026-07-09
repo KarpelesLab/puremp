@@ -175,6 +175,9 @@ pub mod elliptic;
 #[cfg(feature = "numberfield")]
 pub mod numberfield;
 
+#[cfg(feature = "numberfield")]
+pub mod numberfield_ideal;
+
 #[cfg(feature = "float")]
 pub mod float;
 #[cfg(feature = "float")]
@@ -270,6 +273,9 @@ pub use elliptic::{EllipticCurve, Point};
 
 #[cfg(feature = "numberfield")]
 pub use numberfield::{NumberField, NumberFieldElement};
+
+#[cfg(feature = "numberfield")]
+pub use numberfield_ideal::{Ideal, Order, PrimeIdeal};
 
 #[cfg(feature = "float")]
 pub use fixed_float::FixedFloat;

@@ -106,6 +106,7 @@ int main(void) {
 | `algebraic` | ✔ | `Quadratic` (ℚ(√d)) and general real `Algebraic` numbers |
 | `galois` | ✔ | `GaloisField` / `GfElement` — finite field extensions `GF(pᵏ)` (implies `int`) |
 | `elliptic` | ✔ | `EllipticCurve` / `Point` over GF(p) and ℚ — group law, Jacobian scalar mult, Schoof point counting (implies `rational`) |
+| `numberfield` | ✔ | Algebraic number fields `ℚ(θ)` — element arithmetic, ring of integers, ideals + prime factorization, unit group / regulator, class group (implies `rational` + `poly` + `matrix` + `lattice` + `algebraic`) |
 | `identify` | ✔ | Inverse symbolic calculator (`identify`, `machin_like`) via PSLQ (implies `lattice` + `float`) |
 | `primality` | ✔ | Primality proving with auditable certificates — Pocklington + BLS `n∓1`, and Atkin–Morain **ECPP** for the general case (implies `int` + `poly`) |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |

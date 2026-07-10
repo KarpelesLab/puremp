@@ -178,6 +178,9 @@ pub mod numberfield;
 #[cfg(feature = "numberfield")]
 pub mod numberfield_ideal;
 
+#[cfg(feature = "numberfield")]
+pub mod numberfield_units;
+
 #[cfg(feature = "float")]
 pub mod float;
 #[cfg(feature = "float")]
@@ -276,6 +279,9 @@ pub use numberfield::{NumberField, NumberFieldElement};
 
 #[cfg(feature = "numberfield")]
 pub use numberfield_ideal::{Ideal, Order, PrimeIdeal};
+
+#[cfg(feature = "numberfield")]
+pub use numberfield_units::UnitGroup;
 
 #[cfg(feature = "float")]
 pub use fixed_float::FixedFloat;

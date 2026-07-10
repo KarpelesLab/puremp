@@ -180,6 +180,8 @@ pub mod numberfield_ideal;
 
 #[cfg(feature = "numberfield")]
 pub mod numberfield_units;
+#[cfg(feature = "numberfield")]
+pub mod numberfield_class;
 
 #[cfg(feature = "float")]
 pub mod float;
@@ -282,6 +284,8 @@ pub use numberfield_ideal::{Ideal, Order, PrimeIdeal};
 
 #[cfg(feature = "numberfield")]
 pub use numberfield_units::UnitGroup;
+#[cfg(feature = "numberfield")]
+pub use numberfield_class::ClassGroup;
 
 #[cfg(feature = "float")]
 pub use fixed_float::FixedFloat;

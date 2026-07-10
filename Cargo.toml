@@ -81,7 +81,7 @@ algebraic = ["rational", "poly", "matrix", "float"]
 # `NumberFieldElement`): element arithmetic, norm/trace/char-poly/min-poly,
 # discriminant, signature and complex embeddings. Built on `Poly<Rational>`,
 # `Matrix<Rational>` and `Complex<Float>`.
-numberfield = ["rational", "poly", "matrix", "complex", "float"]
+numberfield = ["rational", "poly", "matrix", "complex", "float", "lattice"]
 # Elliptic curves `y² = x³ + a·x + b` over `GF(p)` (`ModInt`) or `ℚ` (`Rational`),
 # with the chord-and-tangent group law, point orders and point counting (naive
 # scan plus Schoof's polynomial-time algorithm, which needs `poly`).

@@ -111,6 +111,7 @@ int main(void) {
 | `primality` | ✔ | Primality proving with auditable certificates — Pocklington + BLS `n∓1`, and Atkin–Morain **ECPP** for the general case (implies `int` + `poly`) |
 | `float` | ✔ | Separable `Float` + `FixedFloat` layer (implies `int`); not part of the core contract, disable via `--no-default-features` |
 | `dlog` | | Discrete logarithm — BSGS, Pollard rho, Pohlig–Hellman (implies `int`) |
+| `gnfs` | | General Number Field Sieve integer factorization (implies `numberfield`) |
 | `num-traits` | | Implements `num-traits` interfaces for `Int`/`Rational`/`Nat`/`Decimal`/`Complex` |
 | `ffi` | | The C ABI module (`include/puremp.h`) |
 | `cli` | ✔ | The `puremp` binary |
@@ -189,20 +190,23 @@ available drafts) is the umbrella reference for much of this list.
 
 **Candidate new capabilities** (new operations / types):
 
-- **Factorization past ~60 digits (GNFS)** — SIQS, with the single/double
-  large-prime variations and a block-Lanczos GF(2) solver, factors balanced
-  semiprimes reliably to ~55–58 digits; the general number-field sieve is the path
-  to ~100+ digits. It needs number-field arithmetic, polynomial selection, lattice
-  sieving, and a number-field square root — a substantial subsystem of its own.
-- **SEA point counting** — the Elkies/Atkin improvements to Schoof (using modular
-  polynomials and isogenies) drop the per-prime cost from working modulo the
-  degree-`(ℓ²−1)/2` division polynomial to a small factor, extending exact point
-  counting from the current tens-of-bits `p` to cryptographic sizes. Schoof (1985)
-  → Elkies → Atkin; Blake–Seroussi–Smart ch. VII.
+- **GNFS at scale** — the general number-field sieve is implemented end-to-end
+  (`Int::factor_gnfs`, correct to ~19 digits) but not yet tuned to surpass SIQS:
+  it uses plain base-`m` polynomial selection and line sieving. Kleinjung-style
+  selection, lattice sieving, and large-prime relations are the path from a
+  correct pipeline to the ~100+ digit range SIQS can't reach.
+- **SEA at cryptographic sizes** — the Elkies improvement to Schoof is implemented
+  (exact point counting to ~64-bit `p` with a modular-polynomial table for
+  `ℓ ≤ 31`). The Atkin match-and-sort step and a larger `Φ_ℓ` table would extend
+  it to full cryptographic sizes. Atkin; Blake–Seroussi–Smart ch. VII.
 - **Wider ECPP** — the Atkin–Morain prover uses a fixed small table of
   class-number ≤ 2 discriminants, leaving a small fraction of primes `Unproven`;
   computing Hilbert class polynomials at runtime (or APR-CL as a deterministic
   alternative) would close the gap.
+- **Number fields beyond quadratics** — the class group / regulator have a
+  rigorous analytic certificate for quadratic fields; a general-degree `hR`
+  certificate and a faster relation engine (sieving / NUCOMP) would extend
+  Buchmann's method, and general `r ≥ 2` fundamental units remain.
 
 ## License
 

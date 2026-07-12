@@ -7,6 +7,29 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/KarpelesLab/puremp/compare/v0.2.4...v0.2.5) - 2026-07-12
+
+### Added
+
+- *(numberfield)* add Buchmann sub-exponential class group + regulator
+- *(elliptic)* SEA point counting — Elkies improvement over Schoof
+- *(gnfs)* add General Number Field Sieve integer factorization
+- *(numberfield)* class group and class number via Minkowski/relations/SNF
+- *(numberfield)* unit group, fundamental units, roots of unity, regulator
+- *(numberfield)* ring of integers, ideals, and prime factorization (phase 2)
+- *(matrix)* exact integer Hermite and Smith normal forms + applications
+- algebraic number fields ℚ(θ)=ℚ[x]/(T) under the numberfield feature
+- *(qsieve)* block Lanczos + double-large-prime, scaling SIQS toward 60 digits
+- *(elliptic)* add Schoof's point-counting algorithm over GF(p)
+- *(primality)* add Atkin–Morain ECPP proving for n∓1-hard primes
+
+### Other
+
+- roadmap — GNFS, SEA (Elkies), Buchmann shipped; scaling/Atkin/general-degree remain
+- add numberfield to the feature table (ℚ(θ), O_K, ideals, units, class group)
+- *(matrix)* modulo-determinant Hermite normal form for large full-rank inputs
+- roadmap — ECPP, Schoof, and scaled SIQS shipped; GNFS/SEA/wider-ECPP remain
+
 ## [0.2.4](https://github.com/KarpelesLab/puremp/compare/v0.2.3...v0.2.4) - 2026-07-08
 
 ### Other

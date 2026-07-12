@@ -57,11 +57,32 @@
 //!
 //! This is the standard elementary approach and is reliable for **small-to-
 //! moderate fields** (small `|d_K|`, so a small Minkowski bound and factor base):
-//! quadratic fields, small cubics, small quartics. It is *not* the
-//! sub-exponential Buchmann algorithm; for large discriminants the factor base
-//! and relation search become impractical and the method returns [`None`] rather
-//! than a wrong answer. All results are verified against known class-number
-//! tables in the test suite.
+//! quadratic fields, small cubics, small quartics.
+//!
+//! # The Buchmann (analytically-certified) method for large quadratics
+//!
+//! For quadratic fields whose discriminant is too large for the direct method
+//! (too many factor-base generators), [`Order::class_group`] falls back to
+//! [`Order::class_group_buchmann`], a **Buchmann sub-exponential relation
+//! method** (Cohen, *CCANT* §5.5 & §6.5; Buchmann, *A subexponential algorithm
+//! for the determination of class groups and regulators of algebraic number
+//! fields*, 1990; Hafner–McCurley). Relations are gathered from LLL-reduced
+//! random products of factor-base ideals, and the group is the Smith normal form
+//! of the relation matrix, exactly as above. The novelty is the **stopping
+//! criterion**: the exact class number `h_K` is computed independently from the
+//! **analytic class-number formula** (the finite Dirichlet sum for imaginary
+//! quadratics; the `log`-sum for real quadratics), and relation collection stops
+//! precisely when the relation-lattice index equals that `h_K`. Since the factor
+//! base spans every prime of norm `≤ M_K` it generates `Cl(K)`, so the index is
+//! always a *multiple* of the true `h_K`; matching the analytic value therefore
+//! **certifies completeness rigorously** rather than heuristically. This extends
+//! exact class-group computation to imaginary quadratics with `|d_K|` up to
+//! `~10⁶` (and beyond, resources permitting) and to real quadratics of moderate
+//! discriminant.
+//!
+//! For large fields outside this certified range the method returns [`None`]
+//! rather than a wrong answer. All results are verified against known
+//! class-number tables in the test suite.
 
 // Dense exact linear algebra over explicit index ranges (embeddings, relation
 // matrices) reads closer to the mathematics than iterator adapters here.
@@ -93,6 +114,24 @@ const MAX_ROUNDS: usize = 14;
 const MBOUND_CAP: i64 = 200_000;
 /// Refuse fields with more than this many factor-base generators.
 const MAX_GENERATORS: usize = 24;
+
+// --- Buchmann (sub-exponential / analytically-certified) method ---
+
+/// Refuse the Buchmann method above this Minkowski bound (factor base too big).
+/// For a quadratic field the Minkowski bound is `≈ c·√|d_K|`, so this admits
+/// imaginary quadratics up to `|d_K| ≈ 6·10⁹`.
+const BUCHMANN_MBOUND_CAP: i64 = 50_000;
+/// Refuse the Buchmann method with more than this many factor-base generators.
+const BUCHMANN_MAX_GENERATORS: usize = 400;
+/// Maximum relation-collection rounds in the Buchmann method.
+const BUCHMANN_MAX_ROUNDS: usize = 40;
+/// Cap on `|d_K|` for the exact finite Dirichlet sum (imaginary quadratic).
+const IMAG_ANALYTIC_DCAP: i64 = 20_000_000;
+/// Cap on `d_K` for the real-quadratic analytic class-number formula (its cost
+/// is linear in `d_K`).
+const REAL_ANALYTIC_DCAP: i64 = 200_000;
+/// Precision (bits) for the real-quadratic analytic class-number sum.
+const ANALYTIC_PREC: u64 = 256;
 
 /// The ideal class group `Cl(K)` of a number field: its **class number** and the
 /// **invariant factors** describing its structure as a finite abelian group
@@ -530,6 +569,161 @@ fn to_class_group(factors: &[Int]) -> ClassGroup {
 }
 
 // ===========================================================================
+// Analytic class-number formula (rigorous completeness certificate).
+// ===========================================================================
+//
+// For a quadratic field the analytic (Dirichlet) class-number formula pins down
+// `h_K` exactly, giving a *rigorous* stopping criterion for relation collection
+// (Cohen, *CCANT* §5.5; Buchmann 1990). Because the factor base spans every
+// prime of norm `≤ M_K` (the Minkowski bound), it **generates** `Cl(K)`, so the
+// index of any genuine relation sublattice is a *multiple* of the true `h_K`;
+// once that index equals the analytically-computed `h_K` the sublattice is the
+// full relation lattice and the Smith-normal-form structure is exactly `Cl(K)`.
+
+/// The Kronecker symbol `(a | b)` (Cohen, *CCANT* Algorithm 1.4.10), computed in
+/// machine integers. Extends the Jacobi symbol to even and negative `b`.
+fn kronecker(mut a: i64, mut b: i64) -> i32 {
+    const TAB2: [i32; 8] = [0, 1, 0, -1, 0, -1, 0, 1];
+    if b == 0 {
+        return if a == 1 || a == -1 { 1 } else { 0 };
+    }
+    if a % 2 == 0 && b % 2 == 0 {
+        return 0;
+    }
+    // Remove factors of 2 from b.
+    let mut v = 0u32;
+    while b % 2 == 0 {
+        b /= 2;
+        v += 1;
+    }
+    let mut k = if v.is_multiple_of(2) {
+        1
+    } else {
+        TAB2[a.rem_euclid(8) as usize]
+    };
+    if b < 0 {
+        b = -b;
+        if a < 0 {
+            k = -k;
+        }
+    }
+    // Now b is odd and positive.
+    loop {
+        if a == 0 {
+            return if b > 1 { 0 } else { k };
+        }
+        v = 0;
+        while a % 2 == 0 {
+            a /= 2;
+            v += 1;
+        }
+        if !v.is_multiple_of(2) {
+            k *= TAB2[b.rem_euclid(8) as usize];
+        }
+        if a.rem_euclid(4) == 3 && b.rem_euclid(4) == 3 {
+            k = -k;
+        }
+        let r = a.abs();
+        a = b % r;
+        b = r;
+    }
+}
+
+/// The class number `h_K` of the **imaginary** quadratic field of fundamental
+/// discriminant `d_K < 0`, from the exact finite Dirichlet formula
+/// `h = w/(2|d_K|) · |Σ_{a=1}^{|d_K|−1} a·(d_K | a)|` (`w = 6, 4, 2` for
+/// `d_K = −3, −4`, else `2`). Fully rigorous integer arithmetic. Returns `None`
+/// if `|d_K|` exceeds the supported cap.
+fn class_number_imag_quadratic(dk: i64) -> Option<Int> {
+    if !(-IMAG_ANALYTIC_DCAP..0).contains(&dk) {
+        return None;
+    }
+    let w: i128 = match dk {
+        -3 => 6,
+        -4 => 4,
+        _ => 2,
+    };
+    let d_abs = (-dk) as i128;
+    let mut sum: i128 = 0;
+    for a in 1..(-dk) {
+        let chi = kronecker(dk, a) as i128;
+        if chi != 0 {
+            sum += chi * (a as i128);
+        }
+    }
+    // `num` and `den` are both non-negative; use unsigned exact-division test.
+    let num = (w * sum.abs()) as u128;
+    let den = (2 * d_abs) as u128;
+    if !num.is_multiple_of(den) {
+        return None; // formula must divide exactly; guard against surprises
+    }
+    let h = num / den;
+    i64::try_from(h).ok().map(Int::from_i64)
+}
+
+/// The class number `h_K` of the **real** quadratic field of fundamental
+/// discriminant `d_K > 0`, from the analytic formula
+/// `h = −(1/(2·log ε)) · Σ_{a=1}^{d_K−1} (d_K | a)·log(2 sin(π a / d_K))`
+/// (Dirichlet; Cohen, *CCANT* §5.6/§5.7), where `ε > 1` is the fundamental unit
+/// so `R = log ε`. Evaluated at high `Float` precision and rounded; returns
+/// `None` if the value is not within a safe margin of an integer, or the field
+/// is out of the supported range.
+fn class_number_real_quadratic(field: &NumberField, dk: i64) -> Option<Int> {
+    if dk <= 0 || dk > REAL_ANALYTIC_DCAP {
+        return None;
+    }
+    let prec = ANALYTIC_PREC;
+    let near = RoundingMode::Nearest;
+    // R = log ε, computed exactly for real quadratic fields.
+    let reg = field.regulator(prec);
+    if reg.is_nan() || reg.is_zero() {
+        return None;
+    }
+    let pi = Float::pi(prec, near);
+    let two = Float::from_int(&Int::from_i64(2), prec, near);
+    let dfl = Float::from_int(&Int::from_i64(dk), prec, near);
+    // Σ (d_K | a) · log(2 sin(π a / d_K)); pair a with d_K − a (χ even, sin equal).
+    let mut sum = Float::zero(prec);
+    for a in 1..dk {
+        let chi = kronecker(dk, a);
+        if chi == 0 {
+            continue;
+        }
+        let afl = Float::from_int(&Int::from_i64(a), prec, near);
+        let arg = pi.mul(&afl, prec, near).div(&dfl, prec, near);
+        let term = two.mul(&arg.sin(prec, near), prec, near).ln(prec, near);
+        if chi == 1 {
+            sum = sum.add(&term, prec, near);
+        } else {
+            sum = sum.sub(&term, prec, near);
+        }
+    }
+    // h = − sum / (2 · log ε).
+    let hval = sum.div(&two.mul(&reg, prec, near), prec, near).neg();
+    let hint = hval.round_to_int()?;
+    if hint <= Int::ZERO {
+        return None;
+    }
+    let diff = hval
+        .sub(&Float::from_int(&hint, prec, near), prec, near)
+        .abs();
+    // Exact value is an integer; require the numeric result to be unambiguous.
+    if diff.to_f64() > 1e-6 {
+        return None;
+    }
+    Some(hint)
+}
+
+/// The product of a list of invariant factors (the class number).
+fn factors_product(factors: &[Int]) -> Int {
+    let mut h = Int::ONE;
+    for d in factors {
+        h = h.mul(d);
+    }
+    h
+}
+
+// ===========================================================================
 // Public API.
 // ===========================================================================
 
@@ -550,7 +744,23 @@ impl Order {
     /// This assumes `self` is the maximal order `O_K`
     /// (from [`NumberField::maximal_order`]); the class group is an invariant of
     /// the field.
+    ///
+    /// **Dispatch.** The classical **direct** (Minkowski-bound) method is tried
+    /// first; it succeeds for small `|d_K|` (few generators). When it declines
+    /// (large discriminant / factor base) the **Buchmann** relation method with
+    /// an analytic completeness certificate is used — see
+    /// [`class_group_buchmann`](Order::class_group_buchmann). On the overlap the
+    /// two methods agree.
     pub fn class_group(&self) -> Option<ClassGroup> {
+        if let Some(cg) = self.class_group_direct() {
+            return Some(cg);
+        }
+        self.class_group_buchmann()
+    }
+
+    /// The class group by the classical **direct** (Minkowski-bound / relations /
+    /// Smith-normal-form) method; `None` when the field is out of its range.
+    fn class_group_direct(&self) -> Option<ClassGroup> {
         let mbound = minkowski_bound(self);
         if mbound > Int::from_i64(MBOUND_CAP) {
             return None;
@@ -608,14 +818,161 @@ impl Order {
         }
         None
     }
+
+    /// The class group by **Buchmann's sub-exponential relation method**,
+    /// certified by the analytic class-number formula (Cohen, *CCANT* §5.5,
+    /// §6.5; Buchmann 1990; Hafner–McCurley).
+    ///
+    /// Currently certified for **quadratic fields** (imaginary and real). The
+    /// factor base is every prime ideal of norm `≤ M_K` (the Minkowski bound),
+    /// which therefore **generates** `Cl(K)`; random products of factor-base
+    /// ideals are LLL-reduced to short principal elements whose ideals factor
+    /// over the factor base, giving relations. The relation lattice is a
+    /// sublattice of the full relation lattice, so its index in `ℤ^g` is always
+    /// a *multiple* of `h_K`. Collection stops when that index equals the
+    /// **exact** `h_K` from the analytic class-number formula —
+    /// at which point the sublattice is the full lattice and the Smith normal
+    /// form gives `Cl(K)` exactly (a *rigorous* completeness guarantee, not a
+    /// saturation heuristic). Returns [`None`] if the field is out of range or
+    /// the relation search does not reach the certified index in budget; it
+    /// never returns a wrong class number.
+    ///
+    /// The regulator is `1` (imaginary quadratic) or `log ε` (real quadratic);
+    /// see [`class_group_and_regulator`](Order::class_group_and_regulator).
+    pub fn class_group_buchmann(&self) -> Option<ClassGroup> {
+        // Certified only for quadratic fields.
+        if self.degree() != 2 {
+            return None;
+        }
+        let (_r1, r2) = self.field().signature();
+        let dk_i64 = self.discriminant().to_i64()?;
+        // Rigorous target class number from the analytic class-number formula.
+        let h_target = if r2 == 1 {
+            class_number_imag_quadratic(dk_i64)?
+        } else {
+            class_number_real_quadratic(&self.field(), dk_i64)?
+        };
+
+        let mbound = minkowski_bound(self);
+        if mbound > Int::from_i64(BUCHMANN_MBOUND_CAP) {
+            return None;
+        }
+        let fb = factor_base(self, &mbound);
+        let g = fb.len();
+        if g == 0 {
+            // No generators ⇒ trivial class group; must match the certificate.
+            return if h_target.is_one() {
+                Some(ClassGroup {
+                    class_number: Int::ONE,
+                    invariant_factors: Vec::new(),
+                })
+            } else {
+                None
+            };
+        }
+        if g > BUCHMANN_MAX_GENERATORS {
+            return None;
+        }
+
+        let emb = Embedder::new(self);
+        let n = self.degree();
+        let mut relations: Vec<Vec<Int>> = Vec::new();
+
+        // Relations from the rational primes: (p) = ∏_{𝔭|p} 𝔭^{e_𝔭} is principal.
+        let mut p = Int::from_i64(2);
+        while p <= mbound {
+            let mut pc = alloc::vec![Rational::ZERO; n];
+            pc[0] = Rational::from_integer(p.clone());
+            let ip = self.principal_ideal(&pc);
+            if let Some(rel) = factor_over_fb(self, &ip, &fb, &mbound)
+                && rel.iter().any(|x| !x.is_zero())
+            {
+                push_unique(&mut relations, rel);
+            }
+            p = p.next_prime();
+        }
+        if let Some(cg) = certified_class_group(&relations, g, &h_target) {
+            return Some(cg);
+        }
+
+        // Relation collection: reduce random products of factor-base ideals and
+        // powers of single primes, stopping once the relation-lattice index
+        // equals the certified h_K.
+        let mut rng = SeedRng::new(0xb0c1_5591_0042_0001);
+        for round in 0..BUCHMANN_MAX_ROUNDS {
+            for exps in buchmann_exponents(g, round, &mut rng) {
+                let a = build_product(self, &fb, &exps);
+                collect_lll_relations(self, &emb, &fb, &mbound, &a, &mut relations);
+            }
+            if let Some(cg) = certified_class_group(&relations, g, &h_target) {
+                return Some(cg);
+            }
+        }
+        None
+    }
+
+    /// The [`ClassGroup`] together with the **regulator** `R_K` at `precision`
+    /// bits.
+    ///
+    /// Uses the same dispatch as [`class_group`](Order::class_group). The
+    /// regulator is `1` for fields of unit rank `0` (imaginary quadratic) and
+    /// `log ε` for real quadratic fields; for other fields it is taken from
+    /// [`Order::unit_group`] (and may be NaN where the fundamental units are
+    /// unknown — see [`crate::numberfield_units`]).
+    pub fn class_group_and_regulator(&self, precision: u64) -> Option<(ClassGroup, Float)> {
+        let cg = self.class_group()?;
+        let reg = self.unit_group().regulator(precision);
+        Some((cg, reg))
+    }
+}
+
+/// If the relation sublattice has full rank `g` and its index in `ℤ^g` equals
+/// the certified `h_target`, returns the exact [`ClassGroup`]; otherwise `None`
+/// (either not yet full rank, or the index is a proper multiple of `h_target`
+/// so more relations are needed). Because every relation is genuine, the index
+/// can never be *smaller* than the true `h_K`, so a match certifies the answer.
+fn certified_class_group(relations: &[Vec<Int>], g: usize, h_target: &Int) -> Option<ClassGroup> {
+    let factors = class_structure(relations, g)?;
+    if factors_product(&factors) == *h_target {
+        Some(to_class_group(&factors))
+    } else {
+        None
+    }
+}
+
+/// Factor-base exponent vectors whose product ideals are reduced in a Buchmann
+/// round: single primes raised to growing powers (to expose each generator's
+/// order) plus many random small-exponent products (to find independent
+/// relations). Scales with the round and generator count.
+fn buchmann_exponents(g: usize, round: usize, rng: &mut SeedRng) -> Vec<Vec<usize>> {
+    let mut set: Vec<Vec<usize>> = Vec::new();
+    // Single primes to growing powers.
+    for i in 0..g {
+        for e in 1..=(round + 4) {
+            let mut v = alloc::vec![0usize; g];
+            v[i] = e;
+            set.push(v);
+        }
+    }
+    // Random small-exponent products over the whole factor base.
+    let count = 40 * (round + 1) + 8 * g;
+    let cap = 3 + round / 4;
+    for _ in 0..count {
+        set.push(
+            (0..g)
+                .map(|_| (rng.next_u64() as usize) % (cap + 1))
+                .collect(),
+        );
+    }
+    set
 }
 
 impl NumberField {
     /// The **ideal class group** `Cl(K)` of this number field.
     ///
     /// Convenience wrapper for `self.maximal_order().class_group()`. Returns
-    /// [`None`] when the field is out of range for the direct method (see
-    /// [`Order::class_group`]).
+    /// [`None`] when the field is out of range for both the direct and the
+    /// Buchmann method (see [`Order::class_group`]).
     pub fn class_group(&self) -> Option<ClassGroup> {
         self.maximal_order().class_group()
     }
@@ -623,13 +980,13 @@ impl NumberField {
     /// The **class number** `h_K` of this number field.
     ///
     /// # Panics
-    /// If the class group cannot be determined by the direct method (large
-    /// discriminant / factor base, or non-saturating relation search). Use
+    /// If the class group cannot be determined (large discriminant / factor
+    /// base, or non-saturating relation search). Use
     /// [`NumberField::class_group`] for a non-panicking variant. See the
     /// [module documentation](crate::numberfield_class) for the supported range.
     pub fn class_number(&self) -> Int {
         self.class_group()
-            .expect("class_number: field is out of range for the direct method")
+            .expect("class_number: field is out of range for the available methods")
             .class_number
     }
 }
@@ -789,5 +1146,160 @@ mod tests {
         assert_eq!(imag_quad(5).class_number(), ii(2));
         assert_eq!(imag_quad(163).class_number(), ii(1));
         assert_eq!(real_quad(2).class_number(), ii(1));
+    }
+
+    // =======================================================================
+    // Buchmann (sub-exponential / analytically-certified) method.
+    // =======================================================================
+
+    /// Field discriminant `d_K` of the maximal order of `k`.
+    fn dk_of(k: &NumberField) -> i64 {
+        k.maximal_order().discriminant().to_i64().unwrap()
+    }
+
+    // ---- The exact analytic class number matches the direct method. ----
+
+    #[test]
+    fn analytic_imag_matches_direct() {
+        for d in [1, 2, 3, 5, 6, 7, 11, 13, 14, 15, 19, 21, 23, 47, 71] {
+            let k = imag_quad(d);
+            let o = k.maximal_order();
+            let dk = o.discriminant().to_i64().unwrap();
+            let ha = class_number_imag_quadratic(dk).unwrap();
+            let hd = o.class_group_direct().unwrap().class_number;
+            assert_eq!(ha, hd, "ℚ(√−{d}), d_K = {dk}");
+        }
+    }
+
+    #[test]
+    fn analytic_real_matches_direct() {
+        for d in [2, 3, 5, 6, 7, 10, 13, 15] {
+            let k = real_quad(d);
+            let dk = dk_of(&k);
+            let ha = class_number_real_quadratic(&k, dk).unwrap();
+            let hd = k.maximal_order().class_group_direct().unwrap().class_number;
+            assert_eq!(ha, hd, "ℚ(√{d}), d_K = {dk}");
+        }
+    }
+
+    // ---- Direct and Buchmann agree on the overlap (both h and structure). ----
+
+    #[test]
+    fn buchmann_agrees_direct_imag() {
+        for d in [5, 6, 13, 14, 15, 21, 23] {
+            let o = imag_quad(d).maximal_order();
+            let direct = o.class_group_direct().expect("direct");
+            let buch = o.class_group_buchmann().expect("buchmann");
+            assert_eq!(buch, direct, "ℚ(√−{d})");
+        }
+    }
+
+    #[test]
+    fn buchmann_agrees_direct_real() {
+        for d in [2, 5, 10, 15] {
+            let o = real_quad(d).maximal_order();
+            let direct = o.class_group_direct().expect("direct");
+            let buch = o.class_group_buchmann().expect("buchmann");
+            assert_eq!(buch, direct, "ℚ(√{d})");
+        }
+    }
+
+    // ---- Regulator exposed alongside the class group. ----
+
+    #[test]
+    fn class_group_and_regulator_smoke() {
+        // Imaginary quadratic: rank 0, regulator 1.
+        let (cg, reg) = imag_quad(5)
+            .maximal_order()
+            .class_group_and_regulator(128)
+            .unwrap();
+        assert_eq!(cg.class_number, ii(2));
+        let one = Float::from_int(&Int::ONE, 128, RoundingMode::Nearest);
+        assert!(reg.sub(&one, 128, RoundingMode::Nearest).abs().to_f64() < 1e-20);
+        // Real quadratic: regulator = log ε.
+        let (cg, reg) = real_quad(10)
+            .maximal_order()
+            .class_group_and_regulator(128)
+            .unwrap();
+        assert_eq!(cg.class_number, ii(2));
+        // log(3 + √10) ≈ 1.8184.
+        assert!((reg.to_f64() - 1.818446).abs() < 1e-4, "reg = {reg}");
+    }
+
+    // ---- Larger tabulated imaginary quadratics (Buchmann only). ----
+    // Class numbers/structures verified against binary-quadratic-form tables.
+    // Slow: run with `cargo test --release -- --ignored`.
+
+    fn assert_buchmann_imag(m: i64, h: i64, factors: &[i64]) {
+        let o = imag_quad(m).maximal_order();
+        let cg = o.class_group_buchmann().expect("buchmann must saturate");
+        assert_eq!(cg.class_number, ii(h), "ℚ(√−{m})");
+        assert_eq!(cg.invariant_factors, ivec(factors), "ℚ(√−{m})");
+        // The dispatched entry point must give the same answer.
+        assert_eq!(o.class_group().unwrap(), cg, "dispatch ℚ(√−{m})");
+    }
+
+    #[test]
+    #[ignore = "large discriminant (|d_K| ≈ 4·10³); run --release"]
+    fn buchmann_imag_d4036() {
+        // ℚ(√−1009), d_K = −4036: Cl ≅ ℤ/20.
+        assert_buchmann_imag(1009, 20, &[20]);
+    }
+
+    #[test]
+    #[ignore = "large discriminant; non-cyclic; run --release"]
+    fn buchmann_imag_d5460() {
+        // ℚ(√−1365), d_K = −5460: Cl ≅ (ℤ/2)⁴.
+        assert_buchmann_imag(1365, 16, &[2, 2, 2, 2]);
+    }
+
+    #[test]
+    #[ignore = "large discriminant; non-cyclic; run --release"]
+    fn buchmann_imag_d3896() {
+        // ℚ(√−974), d_K = −3896: Cl ≅ ℤ/3 × ℤ/12.
+        assert_buchmann_imag(974, 36, &[3, 12]);
+    }
+
+    #[test]
+    #[ignore = "large discriminant (|d_K| ≈ 5·10³); run --release"]
+    fn buchmann_imag_d4999() {
+        // ℚ(√−4999), d_K = −4999: Cl ≅ ℤ/33.
+        assert_buchmann_imag(4999, 33, &[33]);
+    }
+
+    #[test]
+    #[ignore = "large discriminant (|d_K| ≈ 10⁴); run --release"]
+    fn buchmann_imag_d10007() {
+        // ℚ(√−10007), d_K = −10007: Cl ≅ ℤ/77.
+        assert_buchmann_imag(10007, 77, &[77]);
+    }
+
+    #[test]
+    #[ignore = "large discriminant (|d_K| ≈ 10⁵, ~30 s); run --release"]
+    fn buchmann_imag_d100003() {
+        // ℚ(√−100003), d_K = −100003: Cl ≅ ℤ/39.
+        assert_buchmann_imag(100003, 39, &[39]);
+    }
+
+    // ---- Real quadratics with large discriminant (Buchmann only). ----
+
+    #[test]
+    #[ignore = "real quadratic, larger d_K; run --release"]
+    fn buchmann_real_sqrt79() {
+        // ℚ(√79), d_K = 316: Cl ≅ ℤ/3.
+        let o = real_quad(79).maximal_order();
+        let cg = o.class_group_buchmann().expect("buchmann");
+        assert_eq!(cg.class_number, ii(3));
+        assert_eq!(cg.invariant_factors, ivec(&[3]));
+    }
+
+    #[test]
+    #[ignore = "real quadratic, larger d_K; run --release"]
+    fn buchmann_real_sqrt401() {
+        // ℚ(√401), d_K = 401: Cl ≅ ℤ/5.
+        let o = real_quad(401).maximal_order();
+        let cg = o.class_group_buchmann().expect("buchmann");
+        assert_eq!(cg.class_number, ii(5));
+        assert_eq!(cg.invariant_factors, ivec(&[5]));
     }
 }

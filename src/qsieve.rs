@@ -842,6 +842,25 @@ fn solve_dependencies(relations: &[Relation], cols: usize) -> Vec<Vec<usize>> {
     }
 }
 
+/// Crate-internal reuse hook for GF(2) dependency finding over an arbitrary
+/// parity matrix (used by the `gnfs` module). Each row is a bit-packed GF(2)
+/// exponent-parity vector (`bit c` in word `c/64`, bit `c%64`), `cols` is the
+/// number of columns. Returns subsets of row indices whose parities XOR to zero,
+/// each verified exactly — the same guarantee as [`solve_dependencies`], through
+/// the identical dense/block-Lanczos dispatch.
+#[cfg(feature = "gnfs")]
+pub(crate) fn gf2_dependencies(parity: &[alloc::vec::Vec<u64>], cols: usize) -> Vec<Vec<usize>> {
+    let relations: Vec<Relation> = parity
+        .iter()
+        .map(|p| Relation {
+            base: Nat::zero(),
+            exps: Vec::new(),
+            parity: p.clone(),
+        })
+        .collect();
+    solve_dependencies(&relations, cols)
+}
+
 /// Turns each square congruence into a `gcd` attempt, returning the first
 /// non-trivial factor found.
 fn factor_from_dependencies(

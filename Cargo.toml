@@ -86,6 +86,12 @@ numberfield = ["rational", "poly", "matrix", "complex", "float", "lattice"]
 # with the chord-and-tangent group law, point orders and point counting (naive
 # scan plus Schoof's polynomial-time algorithm, which needs `poly`).
 elliptic = ["rational", "poly"]
+# The General Number Field Sieve (`gnfs`) integer factorization: `Int::factor_gnfs`.
+# A clean-room, correctness-first end-to-end pipeline (base-m polynomial
+# selection, rational/algebraic/quadratic-character factor bases, line sieving,
+# GF(2) block-Lanczos dependencies reused from the quadratic sieve, and a
+# Hensel-lifted algebraic square root). Built on the number field machinery.
+gnfs = ["numberfield"]
 
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --lib --features ffi --crate-type staticlib`

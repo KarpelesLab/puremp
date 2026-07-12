@@ -54,8 +54,18 @@
 //! prime `ℓ = 2` is special-cased via `gcd(x^p − x, x³ + a·x + b)` (a nontrivial
 //! gcd means a rational 2-torsion point, so `#E` is even, i.e. `t ≡ 0 mod 2`).
 //!
-//! Only the classical Schoof algorithm is implemented; the Elkies/Atkin
-//! improvements (SEA) are left as future work.
+//! For large `p` the **Elkies improvement** (the "E" of SEA,
+//! [`sea_point_count`](EllipticCurve::sea_point_count)) is used. A prime `ℓ` is
+//! an *Elkies* prime when the modular polynomial `Φ_ℓ(j, X)` (the fixed integer
+//! data of the `modular_poly` module) has a root `j̃` in `GF(p)` — equivalently
+//! when the Frobenius has its eigenvalues in `F_ℓ`. For such `ℓ`, Elkies' builds
+//! the **kernel polynomial** `h_ℓ(x)` of the `ℓ`-isogeny (degree `(ℓ−1)/2`, a
+//! factor of `ψ_ℓ`) and the eigenvalue `λ` is found by testing
+//! `(x^p, y^p) = [λ](x, y)` modulo `h_ℓ` — degree `(ℓ−1)/2` rather than Schoof's
+//! `(ℓ²−1)/2`, then `t ≡ λ + p/λ (mod ℓ)`. Non-Elkies (*Atkin*) primes are not
+//! resolved by the Atkin match-and-sort here; instead each falls back to the
+//! classical Schoof step for that `ℓ`, so the count is always exact. See
+//! [`sea_point_count`](EllipticCurve::sea_point_count) for the full account.
 //!
 //! # Clean-room provenance
 //!
@@ -66,8 +76,13 @@
 //! Computational Algebraic Number Theory* §7. Schoof's point-counting algorithm
 //! follows R. Schoof, *Elliptic curves over finite fields and the computation of
 //! square roots mod p*, Math. Comp. **44** (1985); Cohen §7.4–7.5; and
-//! Blake–Seroussi–Smart, *Elliptic Curves in Cryptography*, ch. VII. No
-//! third-party source was consulted.
+//! Blake–Seroussi–Smart, *Elliptic Curves in Cryptography*, ch. VII. The Elkies
+//! (SEA) step follows R. Schoof, *Counting points on elliptic curves over finite
+//! fields*, J. Théor. Nombres Bordeaux **7** (1995), §7–8; N. Elkies, *Elliptic
+//! and modular curves over finite fields and related computational issues*
+//! (1998); and S. Galbraith, *Mathematics of Public Key Cryptography*, §25.2
+//! (whose Algorithm 28, "Elkies' algorithm", gives the explicit kernel-polynomial
+//! recurrence used here). No third-party source code was consulted.
 
 use core::fmt;
 
@@ -75,6 +90,7 @@ use alloc::vec::Vec;
 
 use crate::int::Int;
 use crate::mod_int::ModInt;
+use crate::modular_poly;
 use crate::poly::Poly;
 use crate::ring::{Field, Ring};
 
@@ -86,6 +102,19 @@ use crate::ring::{Field, Ring};
 /// above it, where Schoof is already several times faster (e.g. ~3.5× at
 /// `p ≈ 10^6`, ~70× at `p ≈ 10^8`) and the scan starts to hurt.
 const SCHOOF_BITS: u32 = 20;
+
+/// Bit-length of `p` at or above which [`EllipticCurve::point_count`] switches
+/// from classical [Schoof](EllipticCurve::schoof_point_count) to the
+/// **Elkies/Atkin (SEA)** variant
+/// ([`sea_point_count`](EllipticCurve::sea_point_count)).
+///
+/// SEA replaces Schoof's work modulo the degree-`(ℓ²−1)/2` division polynomial
+/// `ψ_ℓ` with, for the *Elkies* primes, work modulo a degree-`(ℓ−1)/2` kernel
+/// polynomial — a large asymptotic saving that only pays for itself once `p` is
+/// big enough that the extra machinery (modular-polynomial evaluation, isogeny
+/// kernel) is outweighed. Below this threshold classical Schoof is simpler and
+/// no slower.
+const SEA_BITS: u32 = 40;
 
 /// Returns `n · x` for a small non-negative integer `n`, built from repeated
 /// doubling within the field of `x` (so it works for any [`Field`], including
@@ -640,12 +669,15 @@ impl EllipticCurve<ModInt> {
     /// only feasible route for cryptographic-size primes.
     pub fn point_count(&self) -> Int {
         let p = self.field_prime();
-        // Schoof needs characteristic ≠ 2, 3 and only pays off well above the
+        // Schoof/SEA need characteristic ≠ 2, 3 and only pay off well above the
         // scan's reach; small `p` (including p ∈ {2, 3}) take the exact scan.
-        if p.bit_len() >= SCHOOF_BITS && p > Int::from(3) {
+        let bits = p.bit_len();
+        if p <= Int::from(3) || bits < SCHOOF_BITS {
+            self.naive_curve_order()
+        } else if bits < SEA_BITS {
             self.schoof_point_count()
         } else {
-            self.naive_curve_order()
+            self.sea_point_count()
         }
     }
 
@@ -1173,5 +1205,617 @@ impl EllipticCurve<ModInt> {
             psi.push(poly_n);
         }
         psi
+    }
+}
+
+// ===========================================================================
+// The Elkies improvement (SEA) over GF(p).
+//
+// For each odd prime ℓ, the modular polynomial Φ_ℓ(X, Y) (a factor of which is
+// the classical modular equation) detects an ℓ-isogeny: ℓ is an *Elkies* prime
+// exactly when Φ_ℓ(j, X) has a root j̃ ∈ F_p, i.e. when the Frobenius eigenvalues
+// on E[ℓ] lie in F_ℓ. For an Elkies prime, Elkies' algorithm produces the
+// **kernel polynomial** h_ℓ(x) — the degree-(ℓ−1)/2 factor of ψ_ℓ whose roots are
+// the x-coordinates of the isogeny kernel — and the trace residue is recovered
+// from the Frobenius eigenvalue λ (found modulo h_ℓ) as t ≡ λ + p/λ (mod ℓ).
+//
+// This mirrors the classical Schoof structure above (the same RingPoint group
+// law is reused), but the eigenvalue search runs modulo a degree-(ℓ−1)/2
+// polynomial instead of degree (ℓ²−1)/2. Non-Elkies (Atkin) primes are not
+// resolved by the Atkin match-and-sort; each falls back to the classical Schoof
+// step, keeping the count exact. See Schoof 1995 §7–8 and Galbraith §25.2
+// (Algorithm 28).
+// ===========================================================================
+
+/// The modular inverse of `a` modulo the small prime `l` (`a` not a multiple of
+/// `l`), by trial — `l` is tiny so this is negligible.
+fn small_mod_inv(a: i64, l: i64) -> i64 {
+    let a = ((a % l) + l) % l;
+    for x in 1..l {
+        if (a * x) % l == 1 {
+            return x;
+        }
+    }
+    unreachable!("small_mod_inv: {a} not invertible mod {l}")
+}
+
+impl EllipticCurve<ModInt> {
+    /// Returns `#E(GF(p)) = p + 1 − t` via the **Elkies (SEA) improvement** of
+    /// Schoof's algorithm — the route [`point_count`](Self::point_count) takes for
+    /// large `p` (above the `SEA_BITS` size threshold).
+    ///
+    /// For each small prime `ℓ`, the modular polynomial `Φ_ℓ(j, X)` (the fixed
+    /// integer data of the `modular_poly` module) is tested for a root
+    /// `j̃ ∈ GF(p)`:
+    ///
+    /// - **Elkies prime** (a root exists): Elkies' algorithm (Galbraith
+    ///   §25.2, Algorithm 28) computes the kernel polynomial `h_ℓ(x)` of the
+    ///   `ℓ`-isogeny — a degree-`(ℓ−1)/2` factor of the division polynomial
+    ///   `ψ_ℓ`. The Frobenius eigenvalue `λ` is then located by testing
+    ///   `(x^p, y^p) = [λ](x, y)` modulo `h_ℓ` for `λ = 1, …, ℓ−1`, and
+    ///   `t ≡ λ + p·λ⁻¹ (mod ℓ)`. This is the asymptotic win: the ring has degree
+    ///   `(ℓ−1)/2` rather than Schoof's `(ℓ²−1)/2`.
+    /// - **Atkin prime** (no root): the Atkin match-and-sort is not implemented;
+    ///   the residue `t (mod ℓ)` is obtained from the classical Schoof step
+    ///   [`schoof`-style](Self::schoof_point_count) instead, so the answer stays
+    ///   exact (just without the Elkies speedup for that `ℓ`).
+    ///
+    /// Residues are gathered until `∏ ℓ > 4√p`, combined by CRT, and `t` taken in
+    /// the Hasse interval `[−2√p, 2√p]`. The result is cross-checked by verifying
+    /// `[#E]·P = O` for several points `P`; on the (unexpected) failure of that
+    /// check it falls back to classical [`schoof_point_count`](Self::schoof_point_count),
+    /// which is unconditionally correct. Both routes always return the same value
+    /// as [`naive_curve_order`](Self::naive_curve_order); this one is just faster
+    /// for large `p`. Requires `p > 3`.
+    pub fn sea_point_count(&self) -> Int {
+        let p = self.field_prime();
+        assert!(
+            p > Int::from(3),
+            "sea_point_count: requires characteristic ≠ 2, 3"
+        );
+        let count = self.sea_count_unchecked();
+        // Correctness guard: the true group order N annihilates every point.
+        // A wrong candidate would (with overwhelming probability) fail on a
+        // random point; if it does, fall back to classical Schoof.
+        if self.order_annihilates(&count) {
+            count
+        } else {
+            self.schoof_point_count()
+        }
+    }
+
+    /// SEA without the final `[#E]·P = O` verification (the caller adds it).
+    fn sea_count_unchecked(&self) -> Int {
+        let p = self.field_prime();
+        let mut moduli: Vec<Int> = Vec::new();
+        let mut residues: Vec<Int> = Vec::new();
+        let mut used: Vec<usize> = Vec::new();
+        let mut prod = Int::ONE;
+        // Need ∏ ℓ > 4√p, tested as (∏ ℓ)² > 16·p in integers.
+        let bound = Int::from(16) * p.clone();
+        let enough = |prod: &Int| prod.clone() * prod.clone() > bound;
+
+        // ℓ = 2 by the parity gcd (same as classical Schoof).
+        residues.push(Int::from(self.schoof_t_mod_2()));
+        moduli.push(Int::from(2));
+        used.push(2);
+        prod *= Int::from(2);
+
+        // Phase 1 — Elkies primes from the modular-polynomial table (cheap). Atkin
+        // (and any degenerate) primes are deferred rather than paying Schoof now.
+        let mut deferred: Vec<usize> = Vec::new();
+        for &l in modular_poly::AVAILABLE_PRIMES {
+            if enough(&prod) {
+                break;
+            }
+            if Int::from(l as i64) == p {
+                continue;
+            }
+            match self.elkies_t_mod_l(l) {
+                Some(t) => {
+                    residues.push(Int::from(t));
+                    moduli.push(Int::from(l as i64));
+                    used.push(l);
+                    prod *= Int::from(l as i64);
+                }
+                None => deferred.push(l),
+            }
+        }
+
+        // Phase 2 — if still short, resolve the deferred (Atkin) primes and then
+        // any further primes by the classical Schoof step (exact, but slower).
+        if !enough(&prod) {
+            let mut l = 3usize;
+            let mut di = 0usize;
+            loop {
+                if enough(&prod) {
+                    break;
+                }
+                let next = if di < deferred.len() {
+                    let v = deferred[di];
+                    di += 1;
+                    v
+                } else {
+                    // Advance to the next prime not already used.
+                    while !is_small_prime(l) || used.contains(&l) || Int::from(l as i64) == p {
+                        l += 1;
+                    }
+                    let v = l;
+                    l += 1;
+                    v
+                };
+                if Int::from(next as i64) == p || used.contains(&next) {
+                    continue;
+                }
+                let lm = next as i64;
+                let t = self.schoof_t_mod_odd_l(next);
+                let t = (((t % lm) + lm) % lm) as u64;
+                residues.push(Int::from(t));
+                moduli.push(Int::from(lm));
+                used.push(next);
+                prod *= Int::from(lm);
+            }
+        }
+
+        let m = prod;
+        let t0 = Int::crt(&residues, &moduli).expect("moduli are distinct primes");
+        // Symmetric representative in (−M/2, M/2].
+        let t = if t0.clone() * Int::from(2) > m {
+            t0 - m
+        } else {
+            t0
+        };
+        p + Int::ONE - t
+    }
+
+    /// Whether the candidate order `n` annihilates a handful of curve points
+    /// (`n·P = O`). The true `#E` always does; a wrong candidate almost never
+    /// does, making this a cheap correctness check for [`sea_point_count`].
+    fn order_annihilates(&self, n: &Int) -> bool {
+        let p = self.field_prime();
+        let mut found = 0;
+        let mut x = Int::from(2);
+        while found < 6 && x < p {
+            if let Some(pt) = self.point_from_x(&self.a.of(x.clone()))
+                && !pt.is_infinity()
+            {
+                if !pt.scalar_mul(n).is_infinity() {
+                    return false;
+                }
+                found += 1;
+            }
+            x += Int::ONE;
+        }
+        true
+    }
+
+    /// `t (mod ℓ)` in `[0, ℓ)` for an Elkies prime `ℓ`, or `None` when `ℓ` is an
+    /// Atkin prime (no root of `Φ_ℓ(j, ·)` in `GF(p)`) or the Elkies computation
+    /// hits a degenerate case (`j ∈ {0, 1728}`, a non-simple root, an isogeny that
+    /// fails to yield a usable kernel, …). The caller falls back to classical
+    /// Schoof in those cases, so a `None` never threatens correctness.
+    fn elkies_t_mod_l(&self, l: usize) -> Option<u64> {
+        let p = self.field_prime();
+        // Elkies' formulas need characteristic > ℓ + 2.
+        if p <= Int::from((l + 2) as i64) {
+            return None;
+        }
+        let j = self.j_invariant();
+        let j1728 = self.a.of(Int::from(1728));
+        if j.is_zero() || j == j1728 {
+            return None; // j ∈ {0, 1728}: use the fallback.
+        }
+        // Elkies test: does Φ_ℓ(j, X) have a root j̃ ∈ F_p?
+        let phi = modular_poly::instantiate_x(l, &j)?;
+        let jt = self.any_root_fp(&phi)?; // None ⟹ Atkin prime.
+        // Elkies' kernel polynomial h_ℓ(x), then the eigenvalue λ.
+        let h = self.elkies_kernel_poly(l, &j, &jt)?;
+        let lambda = self.elkies_eigenvalue(l, &h)?;
+        // t ≡ λ + p·λ⁻¹ (mod ℓ).
+        let lm = l as i64;
+        let lambda = ((lambda % lm) + lm) % lm;
+        if lambda == 0 {
+            return None;
+        }
+        let p_mod = p
+            .rem_euclid(&Int::from(lm))
+            .to_u64()
+            .expect("ℓ fits in u64") as i64;
+        let t = (lambda + p_mod * small_mod_inv(lambda, lm)) % lm;
+        Some(t as u64)
+    }
+
+    /// Returns some root of `f` in `GF(p)`, or `None` if it has none — the Elkies
+    /// vs Atkin decision. Uses the standard root extraction: intersect `f` with
+    /// `x^p − x` (the product of its linear factors), then split off a root.
+    fn any_root_fp(&self, f: &Poly<ModInt>) -> Option<ModInt> {
+        let p = self.field_prime();
+        let one = self.a.one();
+        let x = Poly::monomial(one.clone(), 1);
+        let xp = poly_powmod(&x, &p, f, &one);
+        let g = f.gcd(&xp.sub(&x));
+        match g.degree() {
+            Some(d) if d >= 1 => self.split_root(&g.monic()),
+            _ => None,
+        }
+    }
+
+    /// One root of a monic `g` known to split into distinct linear factors over
+    /// `GF(p)`, by Cantor–Zassenhaus equal-degree splitting with shifts.
+    fn split_root(&self, g: &Poly<ModInt>) -> Option<ModInt> {
+        if g.degree() == Some(1) {
+            // g = x + c0 (monic): root = −c0.
+            return Some(g.coeff(0).neg());
+        }
+        let p = self.field_prime();
+        let one = self.a.one();
+        let one_poly = Poly::constant(one.clone());
+        let half = (p.clone() - Int::ONE).div_floor(&Int::from(2));
+        let mut delta = 1u64;
+        loop {
+            let shifted = Poly::new(alloc::vec![self.a.of(Int::from(delta)), one.clone()]);
+            let powered = poly_powmod(&shifted, &half, g, &one);
+            let cand = g.gcd(&powered.sub(&one_poly));
+            if let Some(dg) = cand.degree()
+                && dg >= 1
+                && dg < g.degree().expect("g nonzero")
+            {
+                let (quot, _) = g.div_rem(&cand);
+                let smaller = if cand.degree() <= quot.degree() {
+                    cand.monic()
+                } else {
+                    quot.monic()
+                };
+                return self.split_root(&smaller);
+            }
+            delta += 1;
+            if delta > 8 * p.bit_len() as u64 + 64 {
+                return None; // should not happen for a genuine prime p
+            }
+        }
+    }
+
+    /// Elkies' algorithm (Galbraith, *Mathematics of Public Key Cryptography*
+    /// §25.2, Algorithm 28): from the curve `E : y² = x³ + A·x + B`, the prime
+    /// `ℓ`, `j = j(E)` and a simple root `j̃` of `Φ_ℓ(j, ·)`, returns the kernel
+    /// polynomial `ψ(x)` (here `h_ℓ`) of degree `(ℓ−1)/2` whose roots are the
+    /// `x`-coordinates of the `ℓ`-isogeny kernel. Returns `None` on any degenerate
+    /// case (a required inverse fails, or the modular-polynomial partials vanish).
+    ///
+    /// The steps and constants are exactly those of Algorithm 28: the partial
+    /// derivatives of `Φ_ℓ` give `j̃′` and the isogenous curve `(Ã, B̃)`; then the
+    /// coefficient `p₁` fixes the (non-normalised) isogeny; then a recurrence
+    /// derived from the Weierstrass `℘`/`ζ` power series yields the power sums
+    /// `t_n` of the kernel `x`-coordinates, from which the elementary symmetric
+    /// functions (Newton's identities) build `ψ(x)`.
+    fn elkies_kernel_poly(&self, l: usize, j: &ModInt, jt: &ModInt) -> Option<Poly<ModInt>> {
+        let s = &self.a; // ring sample
+        let of = |n: i64| s.of(Int::from(n));
+        let inv = |x: &ModInt| x.inv();
+        let a = self.a.clone();
+        let b = self.b.clone();
+        let d = (l - 1) / 2;
+        let ll = of(l as i64);
+
+        let dv = modular_poly::derivatives(l, j, jt)?;
+        let (phi_x, phi_y) = (dv.phi_x, dv.phi_y);
+        if phi_x.is_zero() || phi_y.is_zero() {
+            return None; // not a simple root — bail to the fallback.
+        }
+
+        // Step 2: m = 18B/A, j′ = m·j, k = j′/(1728 − j).
+        if a.is_zero() {
+            return None;
+        }
+        let m = of(18) * b.clone() * inv(&a)?;
+        let jp = m.clone() * j.clone();
+        let d1728 = of(1728) - j.clone();
+        let k = jp.clone() * inv(&d1728)?;
+
+        // Step 3: j̃′ = −j′·φx/(ℓ·φy), m̃ = j̃′/j̃, k̃ = j̃′/(1728 − j̃).
+        let jtp = (jp.clone().neg() * phi_x.clone()) * inv(&(ll.clone() * phi_y.clone()))?;
+        if jt.is_zero() {
+            return None;
+        }
+        let mt = jtp.clone() * inv(jt)?;
+        let d1728t = of(1728) - jt.clone();
+        let kt = jtp.clone() * inv(&d1728t)?;
+
+        // Step 4: Ã = ℓ⁴·m̃·k̃/48, B̃ = ℓ⁶·m̃²·k̃/864.
+        let l2 = ll.clone() * ll.clone();
+        let l4 = l2.clone() * l2.clone();
+        let l6 = l4.clone() * l2.clone();
+        let at = l4 * mt.clone() * kt.clone() * inv(&of(48))?;
+        let bt = l6 * mt.clone() * mt.clone() * kt.clone() * inv(&of(864))?;
+
+        // Step 5: r = −(j′²φxx + 2ℓ·j′·j̃′·φxy + ℓ²·j̃′²·φyy)/(j′·φx).
+        let jp2 = jp.clone() * jp.clone();
+        let r_num = (jp2 * dv.phi_xx
+            + of(2) * ll.clone() * jp.clone() * jtp.clone() * dv.phi_xy
+            + ll.clone() * ll.clone() * jtp.clone() * jtp.clone() * dv.phi_yy)
+            .neg();
+        let r = r_num * inv(&(jp.clone() * phi_x.clone()))?;
+
+        // Step 6: p₁ = ℓ·(r/2 + (k − ℓk̃)/4 + (ℓm̃ − m)/3).
+        let p1 = ll.clone()
+            * (r * inv(&of(2))?
+                + (k.clone() - ll.clone() * kt.clone()) * inv(&of(4))?
+                + (ll.clone() * mt.clone() - m.clone()) * inv(&of(3))?);
+
+        // Step 7–8: power sums t₀ … of the roots of ψ (as many as `d` needs).
+        let dd = of(d as i64);
+        let mut t: Vec<ModInt> = Vec::with_capacity(d + 1);
+        t.push(dd.clone()); // t0 = d
+        t.push(p1.clone() * inv(&of(2))?); // t1 = p1/2
+        if d >= 2 {
+            // t2 = ((1 − 10d)A − Ã)/30.
+            t.push(((of(1) - of(10) * dd.clone()) * a.clone() - at.clone()) * inv(&of(30))?);
+        }
+        if d >= 3 {
+            // t3 = ((1 − 28d)B − 42·t1·A − B̃)/70.
+            t.push(
+                ((of(1) - of(28) * dd.clone()) * b.clone()
+                    - of(42) * t[1].clone() * a.clone()
+                    - bt.clone())
+                    * inv(&of(70))?,
+            );
+        }
+
+        // Steps 9–16: for d ≥ 4 the higher power sums come from the ℘-series
+        // coefficients c_n and their recurrence.
+        if d >= 4 {
+            let mut c: Vec<ModInt> = Vec::with_capacity(d + 1);
+            c.push(of(0)); // c0 = 0
+            c.push(of(6) * t[2].clone() + of(2) * a.clone() * t[0].clone()); // c1
+            c.push(
+                of(10) * t[3].clone()
+                    + of(6) * a.clone() * t[1].clone()
+                    + of(4) * b.clone() * t[0].clone(),
+            ); // c2
+            // Step 10–13: c_{n+1} for n = 2 … d−1.
+            for n in 2..=d - 1 {
+                let mut sum = of(0);
+                for i in 1..n {
+                    sum += c[i].clone() * c[n - i].clone();
+                }
+                let num = of(3) * sum
+                    - of(((2 * n - 1) * (n - 1)) as i64) * a.clone() * c[n - 1].clone()
+                    - of(((2 * n - 2) * (n - 2)) as i64) * b.clone() * c[n - 2].clone();
+                let den = of(((n - 1) * (2 * n + 5)) as i64);
+                c.push(num * inv(&den)?);
+            }
+            // Step 14–16: t_{n+1} for n = 3 … d−1.
+            for n in 3..=d - 1 {
+                let num = c[n].clone()
+                    - of((4 * n - 2) as i64) * a.clone() * t[n - 1].clone()
+                    - of((4 * n - 4) as i64) * b.clone() * t[n - 2].clone();
+                let den = of((4 * n + 2) as i64);
+                t.push(num * inv(&den)?);
+            }
+        }
+
+        // Steps 17–20: elementary symmetric functions s₀ … s_d via Newton.
+        let mut sym: Vec<ModInt> = Vec::with_capacity(d + 1);
+        sym.push(of(1)); // s0 = 1
+        for n in 1..=d {
+            let mut sum = of(0);
+            for i in 1..=n {
+                let sign = if i % 2 == 0 { of(1) } else { of(-1) };
+                sum += sign * t[i].clone() * sym[n - i].clone();
+            }
+            sym.push(sum.neg() * inv(&of(n as i64))?);
+        }
+
+        // Step 21: ψ(x) = Σ (−1)ⁱ s_i x^{d−i}. Coefficient of x^{d−i} is (−1)ⁱ s_i.
+        let mut coeffs: Vec<ModInt> = alloc::vec![of(0); d + 1];
+        for (i, si) in sym.iter().enumerate() {
+            let sign = if i % 2 == 0 { of(1) } else { of(-1) };
+            coeffs[d - i] = sign * si.clone();
+        }
+        Some(Poly::new(coeffs))
+    }
+
+    /// Finds the Frobenius eigenvalue `λ ∈ [1, ℓ−1]` on the isogeny kernel by
+    /// testing `(x^p, y^p) = [λ](x, y)` modulo the kernel polynomial `h`. Returns
+    /// `None` if no eigenvalue matches (a signal that `h` was not a genuine kernel
+    /// polynomial — the caller falls back to Schoof). Restarts modulo an exposed
+    /// factor of `h` should a ring inverse reveal one.
+    fn elkies_eigenvalue(&self, l: usize, h: &Poly<ModInt>) -> Option<i64> {
+        let mut modulus = h.monic();
+        loop {
+            match self.try_elkies_eigenvalue(l, &modulus) {
+                Ok(res) => return res,
+                Err(factor) => match factor.degree() {
+                    Some(dg) if dg >= 1 => modulus = factor.monic(),
+                    _ => return None,
+                },
+            }
+        }
+    }
+
+    /// One attempt at the eigenvalue search modulo `h`. `Err(g)` requests a
+    /// restart modulo a smaller factor `g` (as in the classical Schoof step).
+    fn try_elkies_eigenvalue(
+        &self,
+        l: usize,
+        h: &Poly<ModInt>,
+    ) -> Result<Option<i64>, Poly<ModInt>> {
+        let p = self.field_prime();
+        let one = self.a.one();
+        let f_full = self.rhs_poly();
+        let f = f_full.rem(h);
+        let f_inv = match poly_inv_mod(&f, h) {
+            PolyInv::Unit(v) => v,
+            PolyInv::Factor(g) => return Err(g),
+            PolyInv::Zero => return Err(h.clone()),
+        };
+        let ctx = SchoofCtx {
+            h: h.clone(),
+            f,
+            f_inv,
+            a_poly: Poly::constant(self.a.clone()),
+            one: one.clone(),
+        };
+        let x = Poly::monomial(one.clone(), 1);
+        // φ(P) = (x^p, y^p) with y^p = y·f^{(p−1)/2}.
+        let xp = poly_powmod(&x, &p, h, &one);
+        let e1 = (p.clone() - Int::ONE).div_floor(&Int::from(2));
+        let yp = poly_powmod(&f_full, &e1, h, &one);
+        let phi = RingPoint::Aff { a: xp, b: yp };
+        // Generic kernel point P = (x, y·1).
+        let base = RingPoint::Aff {
+            a: x.rem(h),
+            b: Poly::constant(one.clone()),
+        };
+        let mut acc = base.clone();
+        for lam in 1..l {
+            if lam > 1 {
+                acc = ring_add(&acc, &base, &ctx)?;
+            }
+            if let (RingPoint::Aff { a: aa, b: bb }, RingPoint::Aff { a: pa, b: pb }) = (&acc, &phi)
+                && aa == pa
+                && bb == pb
+            {
+                return Ok(Some(lam as i64));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod sea_internal_tests {
+    use super::*;
+
+    fn mk(v: i64, p: &Int) -> ModInt {
+        ModInt::new(Int::from(v), p.clone())
+    }
+
+    /// The trace `t = p + 1 − #E` computed the trusted way (naive scan / Schoof).
+    fn trusted_trace(c: &EllipticCurve<ModInt>) -> Int {
+        let p = c.field_prime();
+        &p + &Int::ONE - &c.naive_curve_order()
+    }
+
+    /// The Elkies per-prime residues, wherever `ℓ` is an Elkies prime, must equal
+    /// `t mod ℓ`. Also asserts the Elkies path actually fires (isn't always the
+    /// Atkin/degenerate fallback), so the machinery is genuinely exercised.
+    #[test]
+    fn elkies_residues_match_true_trace() {
+        let mut elkies_hits = 0usize;
+        for &pv in &[10007i64, 10009, 10037, 10039, 10061, 10067, 10069, 10079] {
+            let p = Int::from(pv);
+            for &(av, bv) in &[
+                (1i64, 1),
+                (2, 3),
+                (3, 5),
+                (5, 7),
+                (4, 9),
+                (7, 2),
+                (6, 11),
+                (8, 4),
+            ] {
+                let c = match EllipticCurve::new(mk(av, &p), mk(bv, &p)) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let t = trusted_trace(&c);
+                for &l in modular_poly::AVAILABLE_PRIMES {
+                    if Int::from(l as i64) >= p {
+                        continue;
+                    }
+                    if let Some(res) = c.elkies_t_mod_l(l) {
+                        let lm = Int::from(l as i64);
+                        let want = t.rem_euclid(&lm).to_u64().unwrap();
+                        assert_eq!(
+                            res, want,
+                            "GF({pv}) a={av} b={bv} ℓ={l}: elkies {res} != t mod ℓ {want}"
+                        );
+                        elkies_hits += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            elkies_hits > 20,
+            "Elkies path barely fired ({elkies_hits} hits) — machinery not exercised"
+        );
+    }
+
+    /// `sea_count_unchecked` (the raw SEA result, before the annihilation guard)
+    /// must equal the naive scan exactly — this is the real end-to-end SEA test,
+    /// bypassing the Schoof safety net so a bug cannot hide.
+    #[test]
+    fn sea_unchecked_matches_naive() {
+        for &pv in &[65537i64, 100003, 100019] {
+            let p = Int::from(pv);
+            for &(av, bv) in &[(1i64, 1), (3, 5), (0, 7), (5, 0)] {
+                let c = match EllipticCurve::new(mk(av, &p), mk(bv, &p)) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                assert_eq!(
+                    c.sea_count_unchecked(),
+                    c.naive_curve_order(),
+                    "GF({pv}) a={av} b={bv}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "slow: naive O(p) scan at p≈10^6; run with --release --ignored"]
+    fn sea_unchecked_matches_naive_million() {
+        for &pv in &[1000003i64, 1000033, 1000037] {
+            let p = Int::from(pv);
+            for &(av, bv) in &[(1i64, 1), (2, 3), (3, 5), (0, 7), (7, 11)] {
+                let c = match EllipticCurve::new(mk(av, &p), mk(bv, &p)) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                assert_eq!(
+                    c.sea_count_unchecked(),
+                    c.naive_curve_order(),
+                    "GF({pv}) a={av} b={bv}"
+                );
+            }
+        }
+    }
+
+    /// The kernel polynomial `h_ℓ` produced by Elkies' algorithm must genuinely
+    /// divide the `ℓ`-division polynomial `ψ_ℓ` (its roots are `ℓ`-torsion
+    /// `x`-coordinates), and have degree `(ℓ−1)/2`.
+    #[test]
+    fn kernel_poly_divides_division_poly() {
+        let p = Int::from(10007i64);
+        let mut checked = 0;
+        for &(av, bv) in &[(1i64, 1), (2, 3), (3, 5), (5, 7), (7, 2)] {
+            let c = match EllipticCurve::new(mk(av, &p), mk(bv, &p)) {
+                Some(c) => c,
+                None => continue,
+            };
+            let j = c.j_invariant();
+            for &l in &[3usize, 5, 7, 11, 13] {
+                let phi = match modular_poly::instantiate_x(l, &j) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let jt = match c.any_root_fp(&phi) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let h = match c.elkies_kernel_poly(l, &j, &jt) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                assert_eq!(h.degree(), Some((l - 1) / 2), "ℓ={l} degree");
+                let psis = c.division_polys(l);
+                let psi = psis[l].monic();
+                let (_, rem) = psi.div_rem(&h.monic());
+                assert!(rem.is_zero(), "GF(10007) a={av} b={bv} ℓ={l}: h ∤ ψ_ℓ");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no kernel polynomials checked");
     }
 }

@@ -170,6 +170,9 @@ pub mod quadratic;
 pub mod algebraic;
 
 #[cfg(feature = "elliptic")]
+mod modular_poly;
+
+#[cfg(feature = "elliptic")]
 pub mod elliptic;
 
 #[cfg(feature = "numberfield")]

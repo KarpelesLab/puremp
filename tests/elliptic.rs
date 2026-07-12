@@ -688,3 +688,129 @@ fn schoof_large_primes_hasse_and_order() {
         assert!(found > 0, "no points found for p={s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// SEA (Elkies) point counting: `sea_point_count` / the large-p dispatch must
+// match classical Schoof exactly where both are feasible, and satisfy Hasse +
+// `[#E]·P = O` far beyond the reach of the naive scan.
+// ---------------------------------------------------------------------------
+
+/// Verifies `[#E]·P = O` for a few points recovered from small x-coordinates.
+fn annihilates(curve: &EllipticCurve<ModInt>, n: &Int, p: &Int) {
+    let mut found = 0;
+    let mut xi = 1i64;
+    while found < 3 && xi < 2000 {
+        if let Some(pt) = curve.point_from_x(&mkp(xi, p)) {
+            assert!(pt.scalar_mul(n).is_infinity(), "[#E]·P != O at x={xi}");
+            found += 1;
+        }
+        xi += 1;
+    }
+    assert!(found > 0, "no points found");
+}
+
+/// SEA must equal classical Schoof over a spread of curve shapes at a given
+/// prime (both routes are exact; SEA is the faster one for large `p`).
+fn assert_sea_eq_schoof(p: &Int, shapes: &[(i64, i64)]) {
+    for &(av, bv) in shapes {
+        let curve = match EllipticCurve::new(mkp(av, p), mkp(bv, p)) {
+            Some(c) => c,
+            None => continue,
+        };
+        let sea = curve.sea_point_count();
+        let schoof = curve.schoof_point_count();
+        assert_eq!(
+            sea, schoof,
+            "p={p} a={av} b={bv}: SEA {sea} != Schoof {schoof}"
+        );
+        assert!(hasse_holds(&sea, p));
+    }
+}
+
+#[test]
+fn sea_matches_schoof_around_threshold() {
+    // Fast always-run subset: a ~24-bit prime, several Elkies-rich and Atkin-rich
+    // curve shapes. SEA must equal Schoof.
+    let p = "16777259".parse::<Int>().unwrap(); // ~24-bit
+    assert_sea_eq_schoof(&p, &[(1, 1), (3, 5), (0, 7), (5, 0)]);
+}
+
+#[test]
+#[ignore = "slow: SEA vs Schoof at ~28–34 bits; run with --release --ignored"]
+fn sea_matches_schoof_larger() {
+    for s in ["268435459", "4294967311", "17179869209"] {
+        let p = s.parse::<Int>().unwrap();
+        assert_sea_eq_schoof(
+            &p,
+            &[(1, 1), (2, 3), (3, 5), (0, 7), (5, 0), (7, 11), (9, 4)],
+        );
+    }
+}
+
+#[test]
+fn sea_supersingular_trace_zero() {
+    // y² = x³ + x is supersingular for p ≡ 3 (mod 4): #E = p + 1 (t = 0). Here
+    // j = 1728, so every ℓ takes the Schoof fallback inside SEA — the count must
+    // still be exact.
+    let p = "1099511627791".parse::<Int>().unwrap(); // ~40-bit, ≡ 3 (mod 4)
+    assert_eq!((&p % &Int::from(4)), Int::from(3));
+    let curve = EllipticCurve::new(mkp(1, &p), mkp(0, &p)).unwrap();
+    assert_eq!(curve.sea_point_count(), &p + Int::from(1));
+}
+
+#[test]
+fn sea_dispatch_through_point_count() {
+    // point_count() dispatches to SEA above SEA_BITS (~2^40). The result must
+    // satisfy Hasse and annihilate points.
+    let p = "1099511627791".parse::<Int>().unwrap(); // ~40-bit prime
+    assert!(p.bit_len() >= 40);
+    let curve = EllipticCurve::new(mkp(3, &p), mkp(7, &p)).unwrap();
+    let n = curve.point_count();
+    assert!(hasse_holds(&n, &p));
+    annihilates(&curve, &n, &p);
+}
+
+#[test]
+#[ignore = "slow: large-p SEA; run with --release --ignored"]
+fn sea_large_primes_hasse_and_order() {
+    // Primes far beyond the naive scan's reach (and where classical Schoof, while
+    // possible, is markedly slower): verify Hasse + [#E]·P = O. With the ℓ ≤ 31
+    // modular-polynomial table the practical ceiling is ~64 bits; above that the
+    // Schoof fallback on primes ℓ > 31 begins to dominate (see the module docs).
+    for s in [
+        "1000000000000000003",  // ~60-bit
+        "1152921504606847009",  // ~61-bit (Atkin-heavy: leans on the fallback)
+        "18446744073709551557", // ~64-bit
+    ] {
+        let p = s.parse::<Int>().unwrap();
+        for &(av, bv) in &[(3i64, 7), (2, 5)] {
+            let curve = match EllipticCurve::new(mkp(av, &p), mkp(bv, &p)) {
+                Some(c) => c,
+                None => continue,
+            };
+            let n = curve.sea_point_count();
+            assert!(hasse_holds(&n, &p), "Hasse failed p={s}: #E={n}");
+            annihilates(&curve, &n, &p);
+        }
+    }
+}
+
+#[test]
+#[ignore = "slow: SEA vs Schoof crossover benchmark; run with --release --ignored --nocapture"]
+fn sea_vs_schoof_crossover_bench() {
+    use std::time::Instant;
+    // At the crossover both algorithms agree; SEA is the faster route, and it
+    // keeps scaling to primes where classical Schoof grows impractical.
+    for s in ["1099511627791", "1000000000000000003"] {
+        let p = s.parse::<Int>().unwrap();
+        let curve = EllipticCurve::new(mkp(3, &p), mkp(7, &p)).unwrap();
+        let t0 = Instant::now();
+        let schoof = curve.schoof_point_count();
+        let dt_schoof = t0.elapsed();
+        let t1 = Instant::now();
+        let sea = curve.sea_point_count();
+        let dt_sea = t1.elapsed();
+        assert_eq!(sea, schoof, "SEA != Schoof at p={s}");
+        println!("p≈2^{}: Schoof {dt_schoof:?}  SEA {dt_sea:?}", p.bit_len());
+    }
+}

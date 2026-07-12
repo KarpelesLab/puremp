@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "puremp"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.88"
 description = "A pure-Rust arbitrary-precision arithmetic library — integers, rationals and MPFR-class floats — with a dependency-free clean-room core (optional serde/rand bridges), plus a C ABI and a CLI."

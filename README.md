@@ -36,10 +36,9 @@ use puremp::{Int, Rational};
 let big = Int::from_i64(2).pow(100);
 assert_eq!(big.to_string(), "1267650600228229401496703205376");
 
-let sum = Rational::new(Int::from_i64(1), Int::from_i64(2))?   // 1/2
-    .add(&Rational::new(Int::from_i64(1), Int::from_i64(3))?); // + 1/3
+let sum = Rational::new(Int::from_i64(1), Int::from_i64(2))   // 1/2
+    .add(&Rational::new(Int::from_i64(1), Int::from_i64(3))); // + 1/3
 assert_eq!(sum.to_string(), "5/6");
-# Ok::<(), puremp::Error>(())
 ```
 
 ## Quick start (CLI)

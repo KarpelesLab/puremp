@@ -204,23 +204,38 @@ fn mp_to_mont(x: u64, pr: &MpPrime) -> u64 {
     mp_csub(mp_mul(x, pr.r2, pr.p, pr.pinv), pr.p)
 }
 
+/// Fills `out[k] = w^k` (Montgomery form, canonical) for `w` in Montgomery
+/// form. Only the first 64 powers form a serial chain; every later entry steps
+/// from the one 64 places back by `w^64`, so 64 independent multiplication
+/// chains overlap instead of one latency-bound chain.
+fn mp_fill_powers(out: &mut [u64], w: u64, pr: &MpPrime) {
+    const CHAINS: usize = 64;
+    let (p, pinv) = (pr.p, pr.pinv);
+    let mut x = mp_to_mont(1, pr);
+    let head = out.len().min(CHAINS);
+    for slot in &mut out[..head] {
+        *slot = x;
+        x = mp_csub(mp_mul(x, w, p, pinv), p);
+    }
+    // x = w^CHAINS whenever the table extends past the head.
+    for k in CHAINS..out.len() {
+        out[k] = mp_csub(mp_mul(out[k - CHAINS], x, p, pinv), p);
+    }
+}
+
 /// Twiddle table for an `n`-point transform: for every stage of half-length
 /// `h` (a power of two below `n`), `tw[h + k] = ω_{2h}^k·2^64 mod p` for
-/// `0 ≤ k < h`, canonical. The largest stage is built by repeated
-/// multiplication and each smaller one takes every other entry of the next.
+/// `0 ≤ k < h`, canonical. The largest stage is built by [`mp_fill_powers`]
+/// and each smaller one takes every other entry of the next.
 fn mp_twiddles(n: usize, pr: &MpPrime) -> Vec<u64> {
-    let (p, pinv) = (pr.p, pr.pinv);
+    let p = pr.p;
     let mut tw = alloc::vec![0u64; n.max(2)];
     let half = n / 2;
     if half == 0 {
         return tw;
     }
     let w = mp_to_mont(mp_pow_slow(pr.g, (p - 1) / n as u64, p), pr);
-    let mut x = mp_to_mont(1, pr);
-    for slot in &mut tw[half..n] {
-        *slot = x;
-        x = mp_csub(mp_mul(x, w, p, pinv), p);
-    }
+    mp_fill_powers(&mut tw[half..n], w, pr);
     let mut h = half / 2;
     while h >= 1 {
         for k in 0..h {
@@ -271,11 +286,13 @@ fn mp_dit_stage(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
         let q = mp_csub(hi[0], p2);
         lo[0] = u + q;
         hi[0] = u + p2 - q;
-        for k in 1..half {
-            let u = mp_csub(lo[k], p2);
-            let q = mp_mul(hi[k], tw[len - k], p, pinv); // y·ω^(h−k) = −y·ω^-k
-            lo[k] = u + p2 - q;
-            hi[k] = u + q;
+        // tw[len − k] for k = 1, 2, …, h − 1: the stage's table read backwards.
+        let wr = tw[half + 1..len].iter().rev();
+        for ((x, y), &w) in lo[1..].iter_mut().zip(hi[1..].iter_mut()).zip(wr) {
+            let u = mp_csub(*x, p2);
+            let q = mp_mul(*y, w, p, pinv); // y·ω^(h−k) = −y·ω^-k
+            *x = u + p2 - q;
+            *y = u + q;
         }
     }
 }
@@ -323,14 +340,10 @@ fn mp_dit(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
 /// and their inverses `ω^(n−j)`, `ω^(n−2j)`, and the cube roots of unity
 /// `ω^m`, `ω^2m`.
 fn mp_powers(n: usize, pr: &MpPrime) -> Vec<u64> {
-    let (p, pinv) = (pr.p, pr.pinv);
+    let p = pr.p;
     let w = mp_to_mont(mp_pow_slow(pr.g, (p - 1) / n as u64, p), pr);
-    let mut out = Vec::with_capacity(n);
-    let mut x = mp_to_mont(1, pr);
-    for _ in 0..n {
-        out.push(x);
-        x = mp_csub(mp_mul(x, w, p, pinv), p);
-    }
+    let mut out = alloc::vec![0u64; n];
+    mp_fill_powers(&mut out, w, pr);
     out
 }
 

@@ -27,6 +27,9 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   the three primes have `3 | p − 1`), capping the zero-padding at a third
   instead of a half: 12–19% faster products and squares at sizes just past a
   power of two
+- *(nat)* NTT twiddle tables built from 64 interleaved power chains instead of
+  one latency-bound chain, and a bounds-check-free inverse butterfly loop:
+  a further 6–20% on NTT-sized products and squares
 - add a `mul_bench` example for large `Nat` multiplication and squaring
 
 ## [0.2.5](https://github.com/KarpelesLab/puremp/compare/v0.2.4...v0.2.5) - 2026-09-27

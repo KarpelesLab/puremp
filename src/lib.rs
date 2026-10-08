@@ -41,6 +41,9 @@
 //!   `GF(p)` or `ℚ`, with the chord-and-tangent group law (`elliptic`).
 //! - [`TwoIsogenyCurve`] — certified Mordell–Weil ranks over `ℚ` for curves
 //!   with a rational 2-torsion point, by 2-isogeny descent (`elliptic`).
+//! - [`sum_of_two_cubes`] — rational solutions of `x³ + y³ = n` by a sieved
+//!   search on the 3-isogeny descent coverings, plus a general rational point
+//!   search on elliptic curves ([`cubes`], `elliptic`).
 //!
 //! `Int`/`Rational` also carry a number-theory toolkit (factorization,
 //! `sqrt_mod`, Jacobi/Legendre, CRT, `random_prime`, combinatorics,
@@ -186,6 +189,9 @@ pub mod elliptic;
 #[cfg(feature = "elliptic")]
 pub mod elliptic_descent;
 
+#[cfg(feature = "elliptic")]
+pub mod cubes;
+
 #[cfg(feature = "numberfield")]
 pub mod numberfield;
 
@@ -292,6 +298,8 @@ pub use algebraic::Algebraic;
 #[cfg(feature = "algebraic")]
 pub use quadratic::Quadratic;
 
+#[cfg(feature = "elliptic")]
+pub use cubes::sum_of_two_cubes;
 #[cfg(feature = "elliptic")]
 pub use elliptic::{EllipticCurve, Point};
 #[cfg(feature = "elliptic")]

@@ -14,6 +14,17 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   digits with a length ≥ 2^33 (the field only has 2^k-th roots of unity for
   k ≤ 32), silently producing wrong products; such sizes now fall back to Toom-4
 
+### Other
+
+- *(nat)* three-prime NTT multiplication (Pollard's multi-modular convolution
+  with Garner CRT, lazy-reduction Montgomery butterflies, no bit-reversal pass)
+  replaces the single-prime Goldilocks NTT: each transform point carries a whole
+  64-bit limb instead of a 2–3-byte digit, the transform is ~5x faster, and it
+  now takes over from ~800–1300 limbs — `Nat::mul`/`Nat::square` are 2–7x
+  faster from 2k to 1M limbs and up to 13x on unbalanced operands; the
+  transform-length limit rises from 2^32 to 2^42 points
+- add a `mul_bench` example for large `Nat` multiplication and squaring
+
 ## [0.2.5](https://github.com/KarpelesLab/puremp/compare/v0.2.4...v0.2.5) - 2026-09-27
 
 ### Added

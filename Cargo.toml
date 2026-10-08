@@ -166,6 +166,10 @@ name = "factorial_bench"
 required-features=["std","int"]
 
 [[example]]
+name = "mul_bench"
+required-features = ["std", "int"]
+
+[[example]]
 name = "bench"
 required-features = ["std", "float"]
 

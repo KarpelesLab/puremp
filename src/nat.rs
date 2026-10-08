@@ -6,8 +6,8 @@
 //! lets the derived [`PartialEq`]/[`Eq`] be correct.
 //!
 //! This is the layer that carries the heavy limb-level algorithms: addition,
-//! subtraction, multiplication (schoolbook → Karatsuba → Toom-3 → NTT),
-//! squaring, division (single-limb, Knuth Algorithm D, and Burnikel–Ziegler),
+//! subtraction, multiplication (schoolbook → Karatsuba → Toom-3/4 → three-prime
+//! NTT), squaring, division (single-limb, Knuth Algorithm D, and Burnikel–Ziegler),
 //! shifts, GCD (binary → Lehmer), roots, and sub-quadratic radix I/O.
 
 use core::cmp::Ordering;
@@ -25,7 +25,9 @@ use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 // module) with the addmul_2 schoolbook loop. The faster basecase pushes every
 // crossover up: Karatsuba from ~128 limbs, Toom-3 from ~1.4k, Toom-4 from ~6k.
 // The NTT hand-off is decided per-shape by `ntt_worthwhile` rather than a
-// single size threshold. Re-measure per platform to retune.
+// single size threshold (see `measure_ntt_paths`); in practice it takes over
+// from roughly 800–1300 limbs, so the Toom stages mostly serve as the fallback
+// for the shapes it declines. Re-measure per platform to retune.
 
 /// Operands with fewer than this many limbs use schoolbook multiplication.
 const KARATSUBA_THRESHOLD: usize = 128;
@@ -103,253 +105,371 @@ pub(crate) const HGCD_MODINV_THRESHOLD: usize = 32;
 /// tail well below the recursion base, so recursing further pays.
 const HGCD_EXTGCD_FLOOR: usize = 8;
 
-/// Base-2 logarithm of the longest power-of-two transform the Goldilocks field
-/// supports: `p − 1 = 2^32·(2^32 − 1)`, so primitive `2^k`-th roots of unity
-/// exist only for `k ≤ 32`.
-const NTT_MAX_LOG2: u32 = 32;
-
-/// The digit width (bytes) and transform length [`mul_ntt`] uses for a product
-/// totalling `total_bytes` of operand, or `None` if no digit width satisfies
-/// both the coefficient bound `n·2^(16·bpd) < p` and the transform-length limit
-/// `n ≤ 2^32`. Wider digits shorten the transform, so try 3-byte digits first.
-/// In practice 2-byte digits cover everything up to `n = 2^31` (about 4 GiB of
-/// combined operand bytes); past that the 1-byte transform would need
-/// `n ≥ 2^33`, which the field cannot provide, so the answer is `None` and the
-/// caller falls back to Toom-4.
-fn ntt_shape(total_bytes: usize) -> Option<(usize, usize)> {
-    for bpd in (1usize..=3).rev() {
-        let need = total_bytes.div_ceil(bpd) + 2;
-        let n = need.checked_next_power_of_two()?;
-        if (n as u64) <= 1u64 << NTT_MAX_LOG2
-            && (n as u128) << (16 * bpd as u32) < GOLDILOCKS as u128
-        {
-            return Some((bpd, n));
-        }
-    }
-    None
-}
-
-/// Decides whether the Goldilocks NTT beats the Toom ladder for a product of
-/// the given operand sizes (in limbs). The transform length is a power of two,
-/// so the NTT's cost is a step function of the input size: it wins while the
-/// transform is well filled and loses again just past each doubling, which a
-/// single size threshold cannot express. Squares need only two forward/inverse
-/// transforms instead of three, which lowers the bar. (Cutoffs measured on
-/// Apple Silicon; re-measure per platform to retune.)
-fn ntt_worthwhile(la: usize, lb: usize, square: bool) -> bool {
-    let min = la.min(lb);
-    let total_bytes = (la + lb) * 8;
-    let Some((bpd, n)) = ntt_shape(total_bytes) else {
-        return false;
-    };
-    match bpd {
-        // 24-bit digits keep the transform short; the NTT wins across the
-        // whole window once the operands leave the mid Toom range.
-        3 => min >= 3500,
-        // 16-bit digits: only with a well-filled transform.
-        2 => {
-            let need = total_bytes.div_ceil(2) + 2;
-            let fill_pct = need * 100 / n;
-            min >= if square { 7000 } else { 8000 } && fill_pct >= if square { 72 } else { 88 }
-        }
-        // 8-bit digits: never produced (see `ntt_shape`), kept for safety.
-        _ => false,
-    }
-}
-
-// --- Number-theoretic transform over the Goldilocks field 2^64 − 2^32 + 1 ---
+// --- Three-prime NTT with full 64-bit limb coefficients ---
 //
-// This prime has `p − 1 = 2^32·(2^32 − 1)`, so it supports NTTs of any power-of-
-// two length up to 2^32, and 7 is a primitive root. Modular reduction is
-// division-free, exploiting `2^64 ≡ 2^32 − 1` and `2^96 ≡ −1 (mod p)`.
+// Pollard's multi-modular convolution (Pollard 1971; Brent & Zimmermann, MCA
+// §2.3): the limbs themselves are the polynomial coefficients, the cyclic
+// convolution is computed modulo three primes `p = c·2^42 + 1` just below 2^62,
+// and each product coefficient (`< min(la, lb)·2^128 < p₁p₂p₃ ≈ 2^186`) is
+// recovered exactly by Garner's CRT. This replaced a single-prime transform over
+// the Goldilocks field 2^64 − 2^32 + 1, which had to keep each coefficient
+// below the prime and so could carry only 16–24 bits per point (and at most
+// 2^32 points): three transforms of whole limbs measured ~5× faster than one
+// transform of 2–3-byte digits, and the length limit rises to 2^42 points.
+//
+// The butterflies use lazy reduction in the style of Harvey ("Faster arithmetic
+// for number-theoretic transforms", J. Symbolic Comput. 2014): values live in
+// `[0, 2p)` or `[0, 4p)` (hence `p < 2^62`) and are only made canonical at the
+// end. Products use Montgomery's REDC with twiddles stored as `w·2^64 mod p`, so
+// one REDC yields `x·w` directly. The forward transform is decimation-in-
+// frequency (natural order in, bit-reversed out) and the inverse is
+// decimation-in-time (bit-reversed in, natural out), so no bit-reversal
+// permutation is ever needed: the pointwise product does not care about order.
 
-/// The Goldilocks prime `2^64 − 2^32 + 1`.
-const GOLDILOCKS: u64 = 0xFFFF_FFFF_0000_0001;
-/// A primitive root of the Goldilocks multiplicative group.
-const GOLDILOCKS_ROOT: u64 = 7;
-/// `2^64 mod p = 2^32 − 1`.
-const GF_EPSILON: u128 = 0xFFFF_FFFF;
+/// One NTT prime `p < 2^62` with its Montgomery constants.
+struct MpPrime {
+    /// The prime.
+    p: u64,
+    /// `p^-1 mod 2^64`.
+    pinv: u64,
+    /// `2^128 mod p` (converts into Montgomery form).
+    r2: u64,
+    /// A primitive root modulo `p`.
+    g: u64,
+}
 
-/// Reduces a 128-bit value modulo the Goldilocks prime without any division,
-/// using `2^64 ≡ 2^32 − 1` and `2^96 ≡ −1 (mod p)`. Returns a canonical result
-/// in `[0, p)`.
-#[inline]
-fn gf_reduce128(x: u128) -> u64 {
-    let lo = (x as u64) as u128;
-    let hi = (x >> 64) as u64;
-    let hi_hi = (hi >> 32) as u128; // top 32 bits contribute ·2^96 ≡ −1
-    let hi_lo = (hi & 0xFFFF_FFFF) as u128; // next 32 bits contribute ·2^64 ≡ ε
-    // acc ≡ x (mod p); adding one p keeps the `− hi_hi` non-negative. acc < 2^66.
-    let acc = lo + hi_lo * GF_EPSILON + GOLDILOCKS as u128 - hi_hi;
-    // Fold the ≤ 2 high bits back in (value·2^64 ≡ value·ε). folded < 2^64 + 2^34.
-    let folded = (acc & u64::MAX as u128) + (acc >> 64) * GF_EPSILON;
-    let mut r = folded as u64;
-    if (folded >> 64) != 0 {
-        // One more 2^64 to fold; `s + ε` cannot overflow (s < ε here).
-        let (s, c) = r.overflowing_add(GF_EPSILON as u64);
-        r = if c { s + GF_EPSILON as u64 } else { s };
+/// Builds an [`MpPrime`], deriving the Montgomery constants at compile time.
+const fn mp_prime(p: u64, g: u64) -> MpPrime {
+    // Newton's iteration for the inverse mod 2^64 (each step doubles the bits).
+    let mut pinv = p; // correct to 3 bits for odd p
+    let mut i = 0;
+    while i < 5 {
+        pinv = pinv.wrapping_mul(2u64.wrapping_sub(p.wrapping_mul(pinv)));
+        i += 1;
     }
-    if r >= GOLDILOCKS { r - GOLDILOCKS } else { r }
+    let r = ((1u128 << 64) % p as u128) as u64;
+    let r2 = ((r as u128 * r as u128) % p as u128) as u64;
+    MpPrime { p, pinv, r2, g }
 }
 
-#[inline]
-fn gf_mul(a: u64, b: u64) -> u64 {
-    gf_reduce128(a as u128 * b as u128)
+/// The three NTT primes `c·2^42 + 1` (each with `3 | c`), in Garner order.
+const MP_PRIMES: [MpPrime; 3] = [
+    mp_prime(0x3FFF_8400_0000_0001, 19),
+    mp_prime(0x3FFF_5400_0000_0001, 5),
+    mp_prime(0x3FFE_0400_0000_0001, 5),
+];
+
+/// Base-2 logarithm of the longest transform all three primes support.
+const MP_MAX_LOG2: u32 = 42;
+
+/// Transforms at or below this many points run every remaining stage on one
+/// cache-resident block before moving on (depth-first), instead of sweeping
+/// the whole array once per stage.
+const MP_BLOCK: usize = 1 << 12;
+
+/// Montgomery product `a·b·2^-64 mod p`, lazily reduced into `[1, 2p)`.
+/// Requires `a·b < p·2^64` (e.g. `a < 4p, b < p` or `a, b < 2p`).
+#[inline(always)]
+fn mp_mul(a: u64, b: u64, p: u64, pinv: u64) -> u64 {
+    let t = a as u128 * b as u128;
+    let m = (t as u64).wrapping_mul(pinv);
+    let mp = ((m as u128 * p as u128) >> 64) as u64;
+    // t − m·p is an exact multiple of 2^64 (the low halves cancel), and both
+    // high halves are below p, so the difference lies in (−p, p).
+    ((t >> 64) as u64) + p - mp
 }
 
-#[inline]
-fn gf_add(a: u64, b: u64) -> u64 {
-    let s = a as u128 + b as u128;
-    (if s >= GOLDILOCKS as u128 {
-        s - GOLDILOCKS as u128
-    } else {
-        s
-    }) as u64
+/// Subtracts `m` once if `x ≥ m`.
+#[inline(always)]
+fn mp_csub(x: u64, m: u64) -> u64 {
+    if x >= m { x - m } else { x }
 }
 
-#[inline]
-fn gf_sub(a: u64, b: u64) -> u64 {
-    if a >= b {
-        a - b
-    } else {
-        (a as u128 + GOLDILOCKS as u128 - b as u128) as u64
-    }
-}
-
-fn gf_pow(mut base: u64, mut exp: u64) -> u64 {
+/// `b^e mod p` by plain square-and-multiply (setup only).
+fn mp_pow_slow(mut b: u64, mut e: u64, p: u64) -> u64 {
     let mut r = 1u64;
-    base %= GOLDILOCKS;
-    while exp > 0 {
-        if exp & 1 == 1 {
-            r = gf_mul(r, base);
+    while e > 0 {
+        if e & 1 == 1 {
+            r = ((r as u128 * b as u128) % p as u128) as u64;
         }
-        base = gf_mul(base, base);
-        exp >>= 1;
+        b = ((b as u128 * b as u128) % p as u128) as u64;
+        e >>= 1;
     }
     r
 }
 
-/// In-place iterative NTT (or its inverse) over the Goldilocks field. The
-/// length must be a power of two no larger than `2^32` (see [`NTT_MAX_LOG2`]),
-/// or `(p − 1)/len` below is inexact and the root is not primitive.
-fn ntt(a: &mut [u64], inverse: bool) {
-    let n = a.len();
-    debug_assert!(n.is_power_of_two() && (n as u64) <= 1u64 << NTT_MAX_LOG2);
-    // Bit-reversal permutation.
-    let mut j = 0;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
+/// `x·2^64 mod p` (canonical) for `x < p`.
+#[inline]
+fn mp_to_mont(x: u64, pr: &MpPrime) -> u64 {
+    mp_csub(mp_mul(x, pr.r2, pr.p, pr.pinv), pr.p)
+}
+
+/// Twiddle table for an `n`-point transform: for every stage of half-length
+/// `h` (a power of two below `n`), `tw[h + k] = ω_{2h}^k·2^64 mod p` for
+/// `0 ≤ k < h`, canonical. The largest stage is built by repeated
+/// multiplication and each smaller one takes every other entry of the next.
+fn mp_twiddles(n: usize, pr: &MpPrime) -> Vec<u64> {
+    let (p, pinv) = (pr.p, pr.pinv);
+    let mut tw = alloc::vec![0u64; n.max(2)];
+    let half = n / 2;
+    if half == 0 {
+        return tw;
+    }
+    let w = mp_to_mont(mp_pow_slow(pr.g, (p - 1) / n as u64, p), pr);
+    let mut x = mp_to_mont(1, pr);
+    for slot in &mut tw[half..n] {
+        *slot = x;
+        x = mp_csub(mp_mul(x, w, p, pinv), p);
+    }
+    let mut h = half / 2;
+    while h >= 1 {
+        for k in 0..h {
+            tw[h + k] = tw[2 * h + 2 * k];
         }
-        j ^= bit;
-        if i < j {
-            a.swap(i, j);
+        h /= 2;
+    }
+    tw
+}
+
+/// One decimation-in-frequency stage over every `len`-point block of `a`.
+/// Inputs and outputs in `[0, 2p)`.
+#[inline]
+fn mp_dif_stage(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
+    let half = len / 2;
+    let p2 = 2 * p;
+    if half == 1 {
+        for pair in a.as_chunks_mut::<2>().0 {
+            let (u, v) = (pair[0], pair[1]);
+            pair[0] = mp_csub(u + v, p2);
+            pair[1] = mp_csub(u + p2 - v, p2);
+        }
+        return;
+    }
+    let w = &tw[half..len];
+    for blk in a.chunks_exact_mut(len) {
+        let (lo, hi) = blk.split_at_mut(half);
+        for ((x, y), &w) in lo.iter_mut().zip(hi.iter_mut()).zip(w) {
+            let (u, v) = (*x, *y);
+            *x = mp_csub(u + v, p2);
+            *y = mp_mul(u + p2 - v, w, p, pinv);
         }
     }
-    // Twiddle scratch, reused across stages (largest stage needs n/2 entries).
-    let mut tw: Vec<u64> = Vec::with_capacity(n / 2);
-    let mut len = 2;
-    while len <= n {
-        let mut wlen = gf_pow(GOLDILOCKS_ROOT, (GOLDILOCKS - 1) / len as u64);
-        if inverse {
-            wlen = gf_pow(wlen, GOLDILOCKS - 2);
+}
+
+/// One decimation-in-time stage of the inverse transform over every
+/// `len`-point block of `a`. Inputs and outputs in `[0, 4p)`. The inverse
+/// twiddle `ω^-k = −ω^(h−k)` (as `ω^h = −1`) is read from the forward table
+/// with the butterfly's two outputs swapped, so no second table is needed.
+#[inline]
+fn mp_dit_stage(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
+    let half = len / 2;
+    let p2 = 2 * p;
+    for blk in a.chunks_exact_mut(len) {
+        let (lo, hi) = blk.split_at_mut(half);
+        // k = 0: unit twiddle.
+        let u = mp_csub(lo[0], p2);
+        let q = mp_csub(hi[0], p2);
+        lo[0] = u + q;
+        hi[0] = u + p2 - q;
+        for k in 1..half {
+            let u = mp_csub(lo[k], p2);
+            let q = mp_mul(hi[k], tw[len - k], p, pinv); // y·ω^(h−k) = −y·ω^-k
+            lo[k] = u + p2 - q;
+            hi[k] = u + q;
         }
-        let half = len / 2;
-        // Precompute this stage's twiddles once, then reuse across every block.
-        tw.clear();
-        let mut w = 1u64;
-        for _ in 0..half {
-            tw.push(w);
-            w = gf_mul(w, wlen);
+    }
+}
+
+/// Forward transform of `src` zero-padded to `n` points (DIF, natural order in,
+/// bit-reversed out; values in `[0, 2p)`). When `src` fits in the low half the
+/// first stage is fused into the load: its butterflies see a zero upper input.
+fn mp_forward(src: &[Limb], n: usize, tw: &[u64], pr: &MpPrime) -> Vec<u64> {
+    let (p, pinv) = (pr.p, pr.pinv);
+    let (p2, p4) = (2 * p, 4 * p);
+    // A limb is below 2^64 < 5p; two conditional subtractions land in [0, 2p).
+    let reduce = |x: u64| mp_csub(mp_csub(x, p4), p2);
+    let mut a = alloc::vec![0u64; n];
+    let half = n / 2;
+    let mut len = n;
+    if half >= 1 && src.len() <= half {
+        let w = &tw[half..n];
+        let (lo, hi) = a.split_at_mut(half);
+        for (((x, y), &s), &w) in lo.iter_mut().zip(hi.iter_mut()).zip(src).zip(w) {
+            let s = reduce(s);
+            *x = s;
+            *y = mp_mul(s, w, p, pinv);
         }
-        let mut i = 0;
-        while i < n {
-            for k in 0..half {
-                let u = a[i + k];
-                let v = gf_mul(a[i + k + half], tw[k]);
-                a[i + k] = gf_add(u, v);
-                a[i + k + half] = gf_sub(u, v);
+        len = half;
+    } else {
+        for (x, &s) in a.iter_mut().zip(src) {
+            *x = reduce(s);
+        }
+    }
+    while len > MP_BLOCK {
+        mp_dif_stage(&mut a, len, tw, p, pinv);
+        len /= 2;
+    }
+    if len >= 2 {
+        for blk in a.chunks_exact_mut(len) {
+            let mut l = len;
+            while l >= 2 {
+                mp_dif_stage(blk, l, tw, p, pinv);
+                l /= 2;
             }
-            i += len;
         }
-        len <<= 1;
     }
-    if inverse {
-        let n_inv = gf_pow(n as u64, GOLDILOCKS - 2);
-        for x in a.iter_mut() {
-            *x = gf_mul(*x, n_inv);
+    a
+}
+
+/// Inverse transform (DIT, bit-reversed in, natural order out), unscaled:
+/// the result is `n` times the true inverse. Values in `[0, 4p)`.
+fn mp_inverse(a: &mut [u64], tw: &[u64], pr: &MpPrime) {
+    let (p, pinv) = (pr.p, pr.pinv);
+    let n = a.len();
+    let blk_len = n.min(MP_BLOCK);
+    if blk_len >= 2 {
+        for blk in a.chunks_exact_mut(blk_len) {
+            let mut l = 2;
+            while l <= blk_len {
+                mp_dit_stage(blk, l, tw, p, pinv);
+                l *= 2;
+            }
         }
+    }
+    let mut len = blk_len * 2;
+    while len <= n {
+        mp_dit_stage(a, len, tw, p, pinv);
+        len *= 2;
     }
 }
 
-/// Splits `x` into little-endian digits of `bpd` bytes each (at least one).
-fn to_digits(x: &Nat, bpd: usize) -> Vec<u64> {
-    let bytes = x.to_bytes_le();
-    let mut d = Vec::with_capacity(bytes.len() / bpd + 1);
-    for chunk in bytes.chunks(bpd) {
-        let mut digit = 0u64;
-        for (i, &b) in chunk.iter().enumerate() {
-            digit |= (b as u64) << (8 * i);
-        }
-        d.push(digit);
-    }
-    if d.is_empty() {
-        d.push(0);
-    }
-    d
+/// Transform length for a three-prime product with `out_len` result limbs, or
+/// `None` past the primes' `2^42`-point limit.
+fn mp_shape(out_len: usize) -> Option<usize> {
+    let n = out_len.checked_next_power_of_two()?.max(2);
+    ((n as u64) <= 1u64 << MP_MAX_LOG2).then_some(n)
 }
 
-/// NTT-based multiplication over a single Goldilocks prime.
-///
-/// The digit width adapts to the operand size so the convolution coefficients
-/// (`≈ n · 2^(16·bpd)`) always stay below the prime: 3 bytes/digit for short
-/// transforms, 2 bytes/digit up to the field's `2^32` transform-length limit
-/// (about 4 GiB of combined operand bytes), and a Toom-4 fallback beyond.
+/// Three-prime NTT multiplication (see the section comment above): the
+/// convolution of the limb vectors modulo each prime, recombined by Garner's
+/// CRT and carry-propagated straight into the result limbs.
 fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
-    // Fall back once no digit width fits the field (see `ntt_shape`).
-    let total_bytes = (a.limbs.len() + b.limbs.len()) * 8;
-    let Some((bpd, n)) = ntt_shape(total_bytes) else {
+    let (la, lb) = (a.limbs.len(), b.limbs.len());
+    if la == 0 || lb == 0 {
+        return Nat::zero();
+    }
+    let out_len = la + lb;
+    // `la + lb − 1` coefficients; a cyclic length at least that avoids wrap.
+    let Some(n) = mp_shape(out_len - 1) else {
         return a.mul_toom4(b);
     };
+    let square = core::ptr::eq(a, b) || a.limbs == b.limbs;
 
-    let da = to_digits(a, bpd);
-    let mut fa = alloc::vec![0u64; n];
-    fa[..da.len()].copy_from_slice(&da);
-    ntt(&mut fa, false);
-    // Squaring (the dispatcher may route equal operands here): one forward
-    // transform instead of two.
-    if core::ptr::eq(a, b) || a.limbs == b.limbs {
-        for x in fa.iter_mut() {
-            *x = gf_mul(*x, *x);
+    // Per prime: forward transforms, pointwise product (in Montgomery form,
+    // which contributes a factor 2^-64), unscaled inverse.
+    let mut res: [Vec<u64>; 3] = Default::default();
+    for (slot, pr) in res.iter_mut().zip(&MP_PRIMES) {
+        let (p, pinv) = (pr.p, pr.pinv);
+        let tw = mp_twiddles(n, pr);
+        let mut fa = mp_forward(&a.limbs, n, &tw, pr);
+        if square {
+            for x in fa.iter_mut() {
+                *x = mp_mul(*x, *x, p, pinv);
+            }
+        } else {
+            let fb = mp_forward(&b.limbs, n, &tw, pr);
+            for (x, &y) in fa.iter_mut().zip(&fb) {
+                *x = mp_mul(*x, y, p, pinv);
+            }
         }
-    } else {
-        let db = to_digits(b, bpd);
-        let mut fb = alloc::vec![0u64; n];
-        fb[..db.len()].copy_from_slice(&db);
-        ntt(&mut fb, false);
-        for (x, y) in fa.iter_mut().zip(&fb) {
-            *x = gf_mul(*x, *y);
-        }
+        mp_inverse(&mut fa, &tw, pr);
+        *slot = fa;
     }
-    ntt(&mut fa, true);
 
-    // Carry-propagate the coefficients in base 2^(8·bpd).
-    let mut bytes: Vec<u8> = Vec::with_capacity(bpd * n + 8);
-    let mut carry: u128 = 0;
-    for &coef in &fa {
-        carry += coef as u128;
-        for _ in 0..bpd {
-            bytes.push((carry & 0xFF) as u8);
-            carry >>= 8;
-        }
+    // Undoing both the transform's factor n and the pointwise 2^-64 takes a
+    // Montgomery multiply by n^-1·2^128 (n | p − 1, so n^-1 = p − (p − 1)/n).
+    let scale = |pr: &MpPrime| {
+        let n_inv = pr.p - (pr.p - 1) / n as u64;
+        ((n_inv as u128 * pr.r2 as u128) % pr.p as u128) as u64
+    };
+    let [q1, q2, q3] = &MP_PRIMES;
+    let (p1, p2, p3) = (q1.p, q2.p, q3.p);
+    let (s1, s2, s3) = (scale(q1), scale(q2), scale(q3));
+    // Garner constants, in Montgomery form for their respective primes.
+    let inv_p1_mod_p2 = mp_to_mont(mp_pow_slow(p1 % p2, p2 - 2, p2), q2);
+    let p1_mod_p3 = mp_to_mont(p1 % p3, q3);
+    let p12_mod_p3 = ((p1 as u128 * p2 as u128) % p3 as u128) as u64;
+    let inv_p12_mod_p3 = mp_to_mont(mp_pow_slow(p12_mod_p3, p3 - 2, p3), q3);
+    let p12 = p1 as u128 * p2 as u128;
+    let (p12_lo, p12_hi) = (p12 as u64, (p12 >> 64) as u64);
+
+    let mut out: Vec<Limb> = Vec::with_capacity(out_len);
+    // Running 192-bit carry: each coefficient is < 2^186 and the carried-over
+    // high part < 2^128, so three limbs never overflow.
+    let (mut c0, mut c1) = (0u64, 0u64);
+    let [res1, res2, res3] = &res;
+    let coeffs = res1.iter().zip(res2).zip(res3).take(out_len - 1);
+    for ((&x1, &x2), &x3) in coeffs {
+        let r1 = mp_csub(mp_mul(x1, s1, p1, q1.pinv), p1);
+        let r2 = mp_csub(mp_mul(x2, s2, p2, q2.pinv), p2);
+        let r3 = mp_csub(mp_mul(x3, s3, p3, q3.pinv), p3);
+        // x ≡ r1 (p1): x12 = r1 + p1·v2 with v2 = (r2 − r1)/p1 mod p2.
+        // (r1 < p1 < 2·p2, so r2 + 2·p2 − r1 > 0 and < 4·p2.)
+        let v2 = mp_csub(mp_mul(r2 + 2 * p2 - r1, inv_p1_mod_p2, p2, q2.pinv), p2);
+        // x12 mod p3 = (r1 + p1·v2) mod p3, with r1 < p1 < 2·p3.
+        let t = mp_csub(mp_mul(v2, p1_mod_p3, p3, q3.pinv), p3) + r1;
+        let t = mp_csub(mp_csub(t, 2 * p3), p3);
+        let v3 = mp_csub(mp_mul(r3 + p3 - t, inv_p12_mod_p3, p3, q3.pinv), p3);
+        // x = x12 + p1·p2·v3 (< p1·p2·p3 < 2^186), added into the carry.
+        let x12 = r1 as u128 + p1 as u128 * v2 as u128;
+        let lo = p12_lo as u128 * v3 as u128;
+        let hi = p12_hi as u128 * v3 as u128 + (lo >> 64);
+        let s = c0 as u128 + (x12 as u64) as u128 + (lo as u64) as u128;
+        let m = c1 as u128 + (x12 >> 64) + (hi as u64) as u128 + (s >> 64);
+        out.push(s as u64);
+        c0 = m as u64;
+        c1 = ((hi >> 64) + (m >> 64)) as u64;
     }
-    while carry != 0 {
-        bytes.push((carry & 0xFF) as u8);
-        carry >>= 8;
+    out.push(c0);
+    debug_assert_eq!(c1, 0, "three-prime product overflowed");
+    let mut r = Nat { limbs: out };
+    r.normalize();
+    r
+}
+
+/// Decides whether the three-prime NTT beats the Karatsuba/Toom ladder for a
+/// product of the given operand sizes (in limbs). The transform length is the
+/// power of two at or above `la + lb − 1`, so the NTT's cost is a step function
+/// of the input size: on short transforms it wins only while the transform is
+/// well filled, and from 8192 points on it wins outright. Squares compete with
+/// Karatsuba squaring (about two thirds of a general product) and need a fuller
+/// transform. A small operand keeps Karatsuba's `la·lb^0.585` cost below the
+/// transform's `(la + lb)·log(la + lb)`, hence the floor on the shorter side,
+/// raised for very long transforms. (Cutoffs measured on x86-64 (Zen 5);
+/// re-measure per platform to retune.)
+fn ntt_worthwhile(la: usize, lb: usize, square: bool) -> bool {
+    let min = la.min(lb);
+    if min < 500 {
+        return false;
     }
-    Nat::from_bytes_le(&bytes)
+    let len = la + lb - 1;
+    let Some(n) = mp_shape(len) else {
+        return false;
+    };
+    if min < 1000 && n > 1 << 16 {
+        return false;
+    }
+    // Percentage of the transform the product fills (> 50 by construction).
+    let fill = (len as u64 * 100 / n as u64) as u32;
+    match (n, square) {
+        (..=1024, _) => false,
+        (2048, false) => fill >= 75,
+        (2048, true) => fill >= 83,
+        (4096, false) => fill >= 62,
+        (4096, true) => fill >= 66,
+        (8192, true) => fill >= 55,
+        _ => true,
+    }
 }
 
 /// Divisors with at least this many limbs use Burnikel–Ziegler recursive
@@ -3863,39 +3983,78 @@ mod tests {
     }
 
     #[test]
-    fn goldilocks_reduce_matches_modulo() {
-        let p = GOLDILOCKS as u128;
-        // Edge and structured values around the reduction's fold boundaries.
-        let edges: &[u64] = &[
-            0,
-            1,
-            GOLDILOCKS - 1,
-            GOLDILOCKS,
-            0xFFFF_FFFF,
-            0x1_0000_0000,
-            0xFFFF_FFFF_0000_0000,
-            u64::MAX,
-            0x1234_5678_9ABC_DEF0,
-        ];
-        for &a in edges {
-            for &b in edges {
-                let x = a as u128 * b as u128;
-                assert_eq!(gf_reduce128(x), (x % p) as u64, "reduce({a}·{b})");
+    fn ntt_primes_and_montgomery_product() {
+        // Each prime is c·2^42 + 1 below 2^62 (the lazy butterflies need 4p <
+        // 2^64), its constants are right, and `g` generates the whole group:
+        // g^((p−1)/q) ≠ 1 for every prime q | p − 1.
+        let factors: [&[u64]; 3] = [&[2, 3, 5, 863], &[2, 3, 181, 1931], &[2, 3, 349_483]];
+        for (pr, qs) in MP_PRIMES.iter().zip(factors) {
+            let p = pr.p;
+            assert!(p < 1 << 62 && (p - 1) % (1 << MP_MAX_LOG2) == 0);
+            assert_eq!(p.wrapping_mul(pr.pinv), 1);
+            assert_eq!(
+                pr.r2 as u128,
+                (1u128 << 64) % p as u128 * ((1u128 << 64) % p as u128) % p as u128
+            );
+            let mut rest = (p - 1) >> MP_MAX_LOG2;
+            for &q in qs {
+                assert_ne!(
+                    mp_pow_slow(pr.g, (p - 1) / q, p),
+                    1,
+                    "g not primitive mod {p}"
+                );
+                while rest.is_multiple_of(q) {
+                    rest /= q;
+                }
+            }
+            assert_eq!(rest, 1, "incomplete factorization of p − 1");
+            // The Montgomery product lands in [1, 2p) and is ≡ a·b·2^-64.
+            let r_inv = mp_pow_slow(((1u128 << 64) % p as u128) as u64, p - 2, p);
+            let mut s: u64 = 0x9E37_79B9_7F4A_7C15 ^ p;
+            let mut next = || {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                s
+            };
+            let edges = [0, 1, p - 1, p, 2 * p - 1, 3 * p, 4 * p - 1];
+            let check = |a: u64, b: u64| {
+                let r = mp_mul(a, b, p, pr.pinv);
+                assert!((1..2 * p).contains(&r), "range {a}·{b} mod {p}");
+                let want = (a as u128 % p as u128) * (b as u128 % p as u128) % p as u128;
+                let want = (want * r_inv as u128 % p as u128) as u64;
+                assert_eq!(r % p, want, "{a}·{b} mod {p}");
+            };
+            for &a in &edges {
+                for &b in &[0, 1, p - 1] {
+                    check(a, b); // a < 4p, b < p
+                }
+                if a < 2 * p {
+                    for &b in &edges[..5] {
+                        check(a, b); // a, b < 2p
+                    }
+                }
+            }
+            for _ in 0..20_000 {
+                check(next() % (4 * p), next() % p);
+                check(next() % (2 * p), next() % (2 * p));
+            }
+            // Twiddles: each stage's root ω_2h (stored at tw[h + 1] in Montgomery
+            // form) has ω_2h^h = −1.
+            let tw = mp_twiddles(1 << 10, pr);
+            let mut h = 2;
+            while h < 1 << 10 {
+                let w = mp_csub(mp_mul(tw[h + 1], 1, p, pr.pinv), p); // out of Montgomery form
+                assert_eq!(mp_pow_slow(w, h as u64, p), p - 1, "stage h={h}");
+                h *= 2;
             }
         }
-        // Pseudo-random coverage across the full 128-bit product range.
-        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            s
-        };
-        for _ in 0..200_000 {
-            let (a, b) = (next() % GOLDILOCKS, next() % GOLDILOCKS);
-            let x = a as u128 * b as u128;
-            assert_eq!(gf_reduce128(x), (x % p) as u64);
-            // Also full-width u128 inputs (products can be up to (p-1)^2 < 2^128).
-            let y = ((next() as u128) << 64) | next() as u128;
-            assert_eq!(gf_reduce128(y), (y % p) as u64);
+        // Transform-length limit: lengths past 2^42 are refused (Toom fallback).
+        assert_eq!(mp_shape(1), Some(2));
+        assert_eq!(mp_shape(1025), Some(2048));
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(mp_shape(1 << 42), Some(1 << 42));
+            assert_eq!(mp_shape((1 << 42) + 1), None);
+            assert!(!ntt_worthwhile(1 << 42, 1 << 42, false));
         }
     }
 
@@ -3963,33 +4122,6 @@ mod tests {
     }
 
     #[test]
-    fn ntt_shape_respects_field_limits() {
-        // Small products use 3-byte digits while `n·2^48 < p` (n ≤ 2^15).
-        assert_eq!(ntt_shape(16), Some((3, 8)));
-        let three_max = (1usize << 15) - 2; // need = 2^15 exactly at 3 bytes/digit
-        assert_eq!(ntt_shape(three_max * 3), Some((3, 1 << 15)));
-        assert_eq!(ntt_shape(three_max * 3 + 3).map(|s| s.0), Some(2));
-        // Every shape stays inside both field limits.
-        for &tb in &[1usize, 1000, 98_298, 98_304, 1 << 20, 1 << 26] {
-            let (bpd, n) = ntt_shape(tb).unwrap();
-            assert!(n.is_power_of_two() && (n as u64) <= 1 << NTT_MAX_LOG2);
-            assert!((n as u128) << (16 * bpd as u32) < GOLDILOCKS as u128);
-            assert!(n >= tb.div_ceil(bpd) + 2);
-        }
-        #[cfg(target_pointer_width = "64")]
-        {
-            // 2-byte digits reach the field's 2^31 bound (`n·2^32 < p`); past it
-            // the 1-byte transform would need n ≥ 2^33 > 2^32, which has no
-            // primitive root, so the shape must be refused (Toom-4 fallback).
-            let two_max = ((1usize << 31) - 2) * 2;
-            assert_eq!(ntt_shape(two_max), Some((2, 1 << 31)));
-            assert_eq!(ntt_shape(two_max + 8), None);
-            assert_eq!(ntt_shape(1 << 40), None);
-            assert!(!ntt_worthwhile(1 << 29, 1 << 29, false));
-        }
-    }
-
-    #[test]
     fn ntt_matches_toom3() {
         // NTT multiplication must agree with the (verified) Toom-3 path, and
         // with a value computed a different way.
@@ -4014,6 +4146,154 @@ mod tests {
             let a = build(200 + (next() % 400) as usize, &mut next);
             let b = build(200 + (next() % 400) as usize, &mut next);
             assert_eq!(mul_ntt(&a, &b), a.mul_toom3(&b), "NTT vs Toom-3 mismatch");
+        }
+    }
+
+    #[test]
+    fn ntt_matches_reference() {
+        // The NTT must agree with the (verified) Karatsuba/Toom
+        // paths across sizes straddling power-of-two transform lengths (the
+        // fused first stage only applies when an operand fits in the low half),
+        // squares, unbalanced shapes, and all-ones limbs (the largest possible
+        // convolution coefficients, exercising the full CRT range).
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let rand = |cnt: usize, f: &mut dyn FnMut() -> u64| {
+            let limbs: Vec<Limb> = (0..cnt).map(|_| f()).collect();
+            Nat::from_limbs(&limbs)
+        };
+        let ones = |cnt: usize| Nat::from_limbs(&alloc::vec![Limb::MAX; cnt]);
+        let reference = |a: &Nat, b: &Nat| {
+            if a.limbs.len().min(b.limbs.len()) >= TOOM3_THRESHOLD {
+                a.mul_toom3(b)
+            } else {
+                a.mul_karatsuba(b)
+            }
+        };
+        // Tiny shapes against schoolbook (including n = 2 and odd lengths).
+        for la in 1..=9 {
+            for lb in 1..=9 {
+                let (a, b) = (rand(la, &mut next), rand(lb, &mut next));
+                assert_eq!(mul_ntt(&a, &b), a.mul_schoolbook(&b), "{la}x{lb}");
+                let (a, b) = (ones(la), ones(lb));
+                assert_eq!(mul_ntt(&a, &b), a.mul_schoolbook(&b), "ones {la}x{lb}");
+            }
+        }
+        // Around the 2^k boundaries of la + lb − 1 and the block size.
+        for &(la, lb) in &[
+            (512usize, 513usize),
+            (512, 512),
+            (513, 512),
+            (1000, 24),
+            (2048, 2049),
+            (2048, 2048),
+            (2047, 2050),
+            (4096, 4097),
+            (3000, 5193),
+            (7000, 129),
+            (130, 9000),
+        ] {
+            let (a, b) = (rand(la, &mut next), rand(lb, &mut next));
+            assert_eq!(mul_ntt(&a, &b), reference(&a, &b), "{la}x{lb}");
+            let (a, b) = (ones(la), ones(lb));
+            assert_eq!(mul_ntt(&a, &b), reference(&a, &b), "ones {la}x{lb}");
+        }
+        // Squares (one forward transform) against Karatsuba squaring.
+        for &l in &[1usize, 2, 3, 300, 1024, 1025, 2049, 4097] {
+            let a = rand(l, &mut next);
+            assert_eq!(mul_ntt(&a, &a), a.square_karatsuba(), "square {l}");
+            let a = ones(l);
+            assert_eq!(mul_ntt(&a, &a), a.square_karatsuba(), "ones square {l}");
+        }
+        // Random shapes, with sparse/zero limbs mixed in.
+        for _ in 0..12 {
+            let la = 1 + (next() % 3000) as usize;
+            let lb = 1 + (next() % 3000) as usize;
+            let mut a = rand(la, &mut next);
+            let b = rand(lb, &mut next);
+            if la > 4 {
+                let mut l = a.limbs.clone();
+                l[1] = 0;
+                l[la / 2] = 0;
+                a = Nat::from_limbs(&l);
+            }
+            assert_eq!(mul_ntt(&a, &b), reference(&a, &b), "{la}x{lb}");
+        }
+    }
+
+    #[test]
+    fn ntt_dispatch_matches_reference() {
+        // `Nat::mul`/`Nat::square` on shapes `ntt_worthwhile` hands to the NTT
+        // agree with the Karatsuba/Toom paths.
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let rand = |cnt: usize, f: &mut dyn FnMut() -> u64| {
+            let limbs: Vec<Limb> = (0..cnt).map(|_| f()).collect();
+            Nat::from_limbs(&limbs)
+        };
+        for &(la, lb) in &[
+            (800usize, 800usize),
+            (1300, 1301),
+            (3000, 500),
+            (4000, 2100),
+        ] {
+            assert!(ntt_worthwhile(la, lb, false), "{la}x{lb}");
+            let (a, b) = (rand(la, &mut next), rand(lb, &mut next));
+            assert_eq!(a.mul(&b), a.mul_karatsuba(&b), "{la}x{lb}");
+        }
+        for &l in &[900usize, 1500, 2300] {
+            assert!(ntt_worthwhile(l, l, true), "square {l}");
+            let a = rand(l, &mut next);
+            assert_eq!(a.square(), a.square_karatsuba(), "square {l}");
+            assert_eq!(a.mul(&a.clone()), a.square_karatsuba(), "self-mul {l}");
+        }
+        assert!(!ntt_worthwhile(700, 700, false) && !ntt_worthwhile(400, 9000, false));
+    }
+
+    #[test]
+    #[ignore = "slow in debug: cargo test --release -- --ignored ntt_matches_reference_large"]
+    fn ntt_matches_reference_large() {
+        // Large shapes, including la + lb − 1 landing exactly on and just past
+        // a power of two (2^16), against Toom-3 / Karatsuba squaring.
+        let mut state = 0xfeed_face_cafe_beefu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let rand = |cnt: usize, f: &mut dyn FnMut() -> u64| {
+            let limbs: Vec<Limb> = (0..cnt).map(|_| f()).collect();
+            Nat::from_limbs(&limbs)
+        };
+        let ones = |cnt: usize| Nat::from_limbs(&alloc::vec![Limb::MAX; cnt]);
+        for &(la, lb) in &[
+            (20_000usize, 20_000usize),
+            (32_768, 32_769),
+            (32_768, 32_770),
+            (100_000, 37_000),
+            (250_000, 3_000),
+        ] {
+            let (a, b) = (rand(la, &mut next), rand(lb, &mut next));
+            assert_eq!(mul_ntt(&a, &b), a.mul_toom3(&b), "{la}x{lb}");
+        }
+        let (a, b) = (ones(50_000), ones(50_001));
+        assert_eq!(mul_ntt(&a, &b), a.mul_toom3(&b), "ones 50000x50001");
+        for &l in &[16_384usize, 40_000] {
+            let a = rand(l, &mut next);
+            assert_eq!(mul_ntt(&a, &a), a.square_karatsuba(), "square {l}");
+            let a = ones(l);
+            assert_eq!(mul_ntt(&a, &a), a.square_karatsuba(), "ones square {l}");
         }
     }
 
@@ -4090,6 +4370,118 @@ mod tests {
             let ntt = bench(&|| mul_ntt(&a, &b));
             std::println!(
                 "sz={sz:<6} school={school:>11?} kara={kara:>11?} toom3={t3:>11?} toom4={t4:>11?} ntt={ntt:>11?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement only: cargo test --release -- --ignored --nocapture measure_ntt_paths"]
+    fn measure_ntt_paths() {
+        // NTT vs Karatsuba/Toom per shape (mul and square), for retuning
+        // `ntt_worthwhile`. `NTT_SIZES=a,b,c` overrides the size list.
+        use std::time::Instant;
+        let mkbig = |limbs: usize, seed: usize| -> Nat {
+            let v: Vec<Limb> = (0..limbs)
+                .map(|i| ((i + seed) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1 << 63)
+                .collect();
+            Nat::from_limbs(&v)
+        };
+        let bench = |f: &dyn Fn() -> Nat| {
+            let mut best = core::time::Duration::MAX;
+            let _ = f();
+            let start = Instant::now();
+            let mut runs = 0;
+            while runs < 3 || (start.elapsed().as_millis() < 300 && runs < 30) {
+                let t = Instant::now();
+                let r = f();
+                best = best.min(t.elapsed());
+                drop(r);
+                runs += 1;
+            }
+            best
+        };
+        let sizes: Vec<usize> = std::env::var("NTT_SIZES")
+            .ok()
+            .map(|s| s.split(',').map(|x| x.trim().parse().unwrap()).collect())
+            .unwrap_or_else(|| {
+                std::vec![
+                    1000, 1400, 2000, 2800, 3500, 4100, 5000, 6000, 8000, 10000, 12000, 16000,
+                    20000, 24000, 32000, 48000, 64000, 100000, 131000, 200000, 262000
+                ]
+            });
+        for &sz in &sizes {
+            let a = mkbig(sz, 1);
+            let b = mkbig(sz + 1, 7);
+            let k = bench(&|| a.mul_karatsuba(&b));
+            let t3 = bench(&|| a.mul_toom3(&b));
+            std::println!("sz={sz:<7} kara={k:>10.3?} toom3={t3:>10.3?}");
+            let m = bench(&|| mul_ntt(&a, &b));
+            let t = if sz <= 70000 {
+                bench(&|| a.mul_toom4(&b))
+            } else {
+                Default::default()
+            };
+            let ms = bench(&|| mul_ntt(&a, &a));
+            let ks = if sz <= 70000 {
+                bench(&|| a.square_karatsuba())
+            } else {
+                Default::default()
+            };
+            std::println!(
+                "sz={sz:<7} mul: ntt={m:>10.3?} toom4={t:>10.3?} | sqr: ntt={ms:>10.3?} kara={ks:>10.3?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement only: cargo test --release -- --ignored --nocapture measure_ntt_unbalanced"]
+    fn measure_ntt_unbalanced() {
+        use std::time::Instant;
+        let mkbig = |limbs: usize, seed: usize| -> Nat {
+            let v: Vec<Limb> = (0..limbs)
+                .map(|i| ((i + seed) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1 << 63)
+                .collect();
+            Nat::from_limbs(&v)
+        };
+        let bench = |f: &dyn Fn() -> Nat| {
+            let mut best = core::time::Duration::MAX;
+            let _ = f();
+            let start = Instant::now();
+            let mut runs = 0;
+            while runs < 3 || (start.elapsed().as_millis() < 300 && runs < 30) {
+                let t = Instant::now();
+                let r = f();
+                best = best.min(t.elapsed());
+                drop(r);
+                runs += 1;
+            }
+            best
+        };
+        for &(la, lb) in &[
+            (1500usize, 200usize),
+            (3000, 200),
+            (8000, 200),
+            (3000, 500),
+            (6000, 500),
+            (20000, 500),
+            (3000, 1000),
+            (6000, 1000),
+            (12000, 1000),
+            (50000, 1000),
+            (6000, 2000),
+            (12000, 2000),
+            (40000, 3000),
+            (100000, 5000),
+            (300000, 20000),
+        ] {
+            let a = mkbig(la, 1);
+            let b = mkbig(lb, 7);
+            let k = bench(&|| a.mul_karatsuba(&b));
+            let t3 = bench(&|| a.mul_toom3(&b));
+            let t4 = bench(&|| a.mul_toom4(&b));
+            let m = bench(&|| mul_ntt(&a, &b));
+            std::println!(
+                "{la:>7}x{lb:<6} kara={k:>10.3?} toom3={t3:>10.3?} toom4={t4:>10.3?} ntt={m:>10.3?}"
             );
         }
     }

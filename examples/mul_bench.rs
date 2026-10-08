@@ -4,7 +4,8 @@
 //! plus a few unbalanced shapes.
 //!
 //! Run with `cargo run --release --example mul_bench`. Timings are meaningful
-//! only in `--release`; the fastest of several runs is reported.
+//! only in `--release`; the fastest of several runs is reported. Set
+//! `MUL_SIZES=1000,5000,...` to time only those balanced sizes.
 
 use std::time::{Duration, Instant};
 
@@ -45,11 +46,17 @@ fn time<R>(f: impl Fn() -> R) -> Duration {
 
 fn main() {
     let mut rng = Lcg(0x5eed_1234_abcd_ef01);
+    let custom: Option<Vec<usize>> = std::env::var("MUL_SIZES")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().parse().unwrap()).collect());
+    let sizes = custom.clone().unwrap_or_else(|| {
+        vec![
+            2_000, 3_500, 5_000, 8_000, 12_000, 16_000, 24_000, 32_000, 48_000, 64_000, 100_000,
+            131_000, 200_000, 262_000, 500_000, 1_000_000,
+        ]
+    });
     println!("{:>22} {:>14} {:>14}", "shape (limbs)", "mul", "square");
-    for &n in &[
-        2_000usize, 3_500, 5_000, 8_000, 12_000, 16_000, 24_000, 32_000, 48_000, 64_000, 100_000,
-        131_000, 200_000, 262_000, 500_000, 1_000_000,
-    ] {
+    for &n in &sizes {
         let a = rand_nat(&mut rng, n);
         let b = rand_nat(&mut rng, n);
         let m = time(|| a.mul(&b));

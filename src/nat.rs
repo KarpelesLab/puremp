@@ -280,15 +280,102 @@ fn mp_dit_stage(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
     }
 }
 
-/// Forward transform of `src` zero-padded to `n` points (DIF, natural order in,
-/// bit-reversed out; values in `[0, 2p)`). When `src` fits in the low half the
-/// first stage is fused into the load: its butterflies see a zero upper input.
-fn mp_forward(src: &[Limb], n: usize, tw: &[u64], pr: &MpPrime) -> Vec<u64> {
+/// Runs the DIF stages `len, len/2, …, 2` over every `len`-point block of `a`:
+/// breadth-first while blocks exceed [`MP_BLOCK`], then depth-first per block.
+fn mp_dif(a: &mut [u64], mut len: usize, tw: &[u64], p: u64, pinv: u64) {
+    while len > MP_BLOCK {
+        mp_dif_stage(a, len, tw, p, pinv);
+        len /= 2;
+    }
+    if len >= 2 {
+        for blk in a.chunks_exact_mut(len) {
+            let mut l = len;
+            while l >= 2 {
+                mp_dif_stage(blk, l, tw, p, pinv);
+                l /= 2;
+            }
+        }
+    }
+}
+
+/// Runs the DIT stages `2, 4, …, len` over every `len`-point block of `a`
+/// (the mirror image of [`mp_dif`]).
+fn mp_dit(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
+    let blk_len = len.min(MP_BLOCK);
+    if blk_len >= 2 {
+        for blk in a.chunks_exact_mut(blk_len) {
+            let mut l = 2;
+            while l <= blk_len {
+                mp_dit_stage(blk, l, tw, p, pinv);
+                l *= 2;
+            }
+        }
+    }
+    let mut l = blk_len * 2;
+    while l <= len {
+        mp_dit_stage(a, l, tw, p, pinv);
+        l *= 2;
+    }
+}
+
+/// Powers `ω_n^k·2^64 mod p` (`0 ≤ k < n`) of a primitive `n`-th root, for
+/// the radix-3 stage of an `n = 3m`-point transform: it reads `ω^j`, `ω^2j`
+/// and their inverses `ω^(n−j)`, `ω^(n−2j)`, and the cube roots of unity
+/// `ω^m`, `ω^2m`.
+fn mp_powers(n: usize, pr: &MpPrime) -> Vec<u64> {
+    let (p, pinv) = (pr.p, pr.pinv);
+    let w = mp_to_mont(mp_pow_slow(pr.g, (p - 1) / n as u64, p), pr);
+    let mut out = Vec::with_capacity(n);
+    let mut x = mp_to_mont(1, pr);
+    for _ in 0..n {
+        out.push(x);
+        x = mp_csub(mp_mul(x, w, p, pinv), p);
+    }
+    out
+}
+
+/// Forward transform of `src` zero-padded to `n` points (values in `[0, 2p)`,
+/// in an order only [`mp_inverse`] needs to understand). For `n = 2^k` this is
+/// a plain DIF pass; when `src` fits in the low half its first stage is fused
+/// into the load (the butterflies see a zero upper input). For `n = 3m` a
+/// radix-3 DIF stage splits the input into three twisted `m`-point
+/// sub-transforms: `y_r[j] = ω^(rj)·Σ_s x[j + sm]·ω₃^(rs)`, whose DFTs give
+/// the outputs `X[3k + r]`.
+fn mp_forward(src: &[Limb], n: usize, tw: &[u64], pow3: &[u64], pr: &MpPrime) -> Vec<u64> {
     let (p, pinv) = (pr.p, pr.pinv);
     let (p2, p4) = (2 * p, 4 * p);
     // A limb is below 2^64 < 5p; two conditional subtractions land in [0, 2p).
     let reduce = |x: u64| mp_csub(mp_csub(x, p4), p2);
     let mut a = alloc::vec![0u64; n];
+    if !pow3.is_empty() {
+        let m = n / 3;
+        let (y0, rest) = a.split_at_mut(m);
+        let (y1, y2) = rest.split_at_mut(m);
+        if src.len() <= m {
+            // x1 = x2 = 0: every output is x0 times a twiddle.
+            for (j, &s) in src.iter().enumerate() {
+                let x0 = reduce(s);
+                y0[j] = x0;
+                y1[j] = mp_mul(x0, pow3[j], p, pinv);
+                y2[j] = mp_mul(x0, pow3[2 * j], p, pinv);
+            }
+        } else {
+            // ω₃² = −1 − ω₃, so one product t = ω₃·(x1 − x2) serves both
+            // y1 = x0 − x2 + t and y2 = x0 − x1 − t. With the inputs in
+            // [0, p) and t in [1, 2p), every sum below stays under 4p < 2^64.
+            let w3 = pow3[m];
+            let at = |i: usize| src.get(i).map_or(0, |&s| mp_csub(reduce(s), p));
+            for j in 0..m {
+                let (x0, x1, x2) = (at(j), at(j + m), at(j + 2 * m));
+                let t = mp_mul(x1 + p - x2, w3, p, pinv);
+                y0[j] = mp_csub(x0 + x1 + x2, p2);
+                y1[j] = mp_mul(x0 + p - x2 + t, pow3[j], p, pinv);
+                y2[j] = mp_mul(x0 + 3 * p - x1 - t, pow3[2 * j], p, pinv);
+            }
+        }
+        mp_dif(&mut a, m, tw, p, pinv);
+        return a;
+    }
     let half = n / 2;
     let mut len = n;
     if half >= 1 && src.len() <= half {
@@ -305,49 +392,50 @@ fn mp_forward(src: &[Limb], n: usize, tw: &[u64], pr: &MpPrime) -> Vec<u64> {
             *x = reduce(s);
         }
     }
-    while len > MP_BLOCK {
-        mp_dif_stage(&mut a, len, tw, p, pinv);
-        len /= 2;
-    }
-    if len >= 2 {
-        for blk in a.chunks_exact_mut(len) {
-            let mut l = len;
-            while l >= 2 {
-                mp_dif_stage(blk, l, tw, p, pinv);
-                l /= 2;
-            }
-        }
-    }
+    mp_dif(&mut a, len, tw, p, pinv);
     a
 }
 
-/// Inverse transform (DIT, bit-reversed in, natural order out), unscaled:
-/// the result is `n` times the true inverse. Values in `[0, 4p)`.
-fn mp_inverse(a: &mut [u64], tw: &[u64], pr: &MpPrime) {
+/// Inverse of [`mp_forward`], unscaled: the result is `n` times the true
+/// inverse, in natural order. Values in `[0, 4p)`. For `n = 3m` the three
+/// `m`-point blocks are inverted first, then untwisted by `ω^-(rj)` and
+/// recombined by the inverse 3-point DFT (with `ω₃^-1 = ω₃²`).
+fn mp_inverse(a: &mut [u64], tw: &[u64], pow3: &[u64], pr: &MpPrime) {
     let (p, pinv) = (pr.p, pr.pinv);
     let n = a.len();
-    let blk_len = n.min(MP_BLOCK);
-    if blk_len >= 2 {
-        for blk in a.chunks_exact_mut(blk_len) {
-            let mut l = 2;
-            while l <= blk_len {
-                mp_dit_stage(blk, l, tw, p, pinv);
-                l *= 2;
-            }
-        }
+    if pow3.is_empty() {
+        mp_dit(a, n, tw, p, pinv);
+        return;
     }
-    let mut len = blk_len * 2;
-    while len <= n {
-        mp_dit_stage(a, len, tw, p, pinv);
-        len *= 2;
+    let m = n / 3;
+    mp_dit(a, m, tw, p, pinv);
+    let w3_inv = pow3[2 * m];
+    let (y0, rest) = a.split_at_mut(m);
+    let (y1, y2) = rest.split_at_mut(m);
+    // As in the forward stage: canonical inputs keep every sum under 4p.
+    for j in 0..m {
+        let z0 = mp_csub(mp_csub(y0[j], 2 * p), p);
+        let z1 = mp_csub(mp_mul(y1[j], pow3[(n - j) % n], p, pinv), p);
+        let z2 = mp_csub(mp_mul(y2[j], pow3[(n - 2 * j) % n], p, pinv), p);
+        let t = mp_mul(z1 + p - z2, w3_inv, p, pinv);
+        y0[j] = z0 + z1 + z2;
+        y1[j] = z0 + p - z2 + t;
+        y2[j] = z0 + 3 * p - z1 - t;
     }
 }
 
-/// Transform length for a three-prime product with `out_len` result limbs, or
-/// `None` past the primes' `2^42`-point limit.
-fn mp_shape(out_len: usize) -> Option<usize> {
-    let n = out_len.checked_next_power_of_two()?.max(2);
-    ((n as u64) <= 1u64 << MP_MAX_LOG2).then_some(n)
+/// Transform length for a three-prime product with `len` coefficients: the
+/// smaller of the next power of two and the next `3·2^k`, which caps the
+/// zero-padding at a third instead of a half. `None` past the primes'
+/// `2^42`-point (power-of-two part) limit.
+fn mp_shape(len: usize) -> Option<usize> {
+    let pow2 = len.checked_next_power_of_two()?.max(2);
+    let n = match len.div_ceil(3).checked_next_power_of_two() {
+        Some(m) if m >= 2 && m.checked_mul(3).is_some_and(|t| t < pow2) => 3 * m,
+        _ => pow2,
+    };
+    let pow2_part = if n % 3 == 0 { n / 3 } else { n };
+    ((pow2_part as u64) <= 1u64 << MP_MAX_LOG2).then_some(n)
 }
 
 /// Three-prime NTT multiplication (see the section comment above): the
@@ -364,30 +452,35 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
         return a.mul_toom4(b);
     };
     let square = core::ptr::eq(a, b) || a.limbs == b.limbs;
+    // Power-of-two sub-transform length (n itself, or n/3 under a radix-3 stage).
+    let radix3 = n % 3 == 0;
+    let m = if radix3 { n / 3 } else { n };
 
     // Per prime: forward transforms, pointwise product (in Montgomery form,
     // which contributes a factor 2^-64), unscaled inverse.
     let mut res: [Vec<u64>; 3] = Default::default();
     for (slot, pr) in res.iter_mut().zip(&MP_PRIMES) {
         let (p, pinv) = (pr.p, pr.pinv);
-        let tw = mp_twiddles(n, pr);
-        let mut fa = mp_forward(&a.limbs, n, &tw, pr);
+        let tw = mp_twiddles(m, pr);
+        let pow3 = if radix3 { mp_powers(n, pr) } else { Vec::new() };
+        let mut fa = mp_forward(&a.limbs, n, &tw, &pow3, pr);
         if square {
             for x in fa.iter_mut() {
                 *x = mp_mul(*x, *x, p, pinv);
             }
         } else {
-            let fb = mp_forward(&b.limbs, n, &tw, pr);
+            let fb = mp_forward(&b.limbs, n, &tw, &pow3, pr);
             for (x, &y) in fa.iter_mut().zip(&fb) {
                 *x = mp_mul(*x, y, p, pinv);
             }
         }
-        mp_inverse(&mut fa, &tw, pr);
+        mp_inverse(&mut fa, &tw, &pow3, pr);
         *slot = fa;
     }
 
     // Undoing both the transform's factor n and the pointwise 2^-64 takes a
-    // Montgomery multiply by n^-1·2^128 (n | p − 1, so n^-1 = p − (p − 1)/n).
+    // Montgomery multiply by n^-1·2^128 (n | p − 1 — including the factor 3 of
+    // a radix-3 length — so n^-1 = p − (p − 1)/n).
     let scale = |pr: &MpPrime| {
         let n_inv = pr.p - (pr.p - 1) / n as u64;
         ((n_inv as u128 * pr.r2 as u128) % pr.p as u128) as u64
@@ -438,15 +531,15 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
 }
 
 /// Decides whether the three-prime NTT beats the Karatsuba/Toom ladder for a
-/// product of the given operand sizes (in limbs). The transform length is the
-/// power of two at or above `la + lb − 1`, so the NTT's cost is a step function
-/// of the input size: on short transforms it wins only while the transform is
-/// well filled, and from 8192 points on it wins outright. Squares compete with
-/// Karatsuba squaring (about two thirds of a general product) and need a fuller
-/// transform. A small operand keeps Karatsuba's `la·lb^0.585` cost below the
-/// transform's `(la + lb)·log(la + lb)`, hence the floor on the shorter side,
-/// raised for very long transforms. (Cutoffs measured on x86-64 (Zen 5);
-/// re-measure per platform to retune.)
+/// product of the given operand sizes (in limbs). The transform length (see
+/// [`mp_shape`]) steps through `2^k` and `3·2^k`, so the NTT's cost is a step
+/// function of the input size: on short transforms it wins only while the
+/// transform is well filled, and from 4096 points on it wins outright. Squares
+/// compete with Karatsuba squaring (about two thirds of a general product) and
+/// need a fuller transform. A small operand keeps Karatsuba's `la·lb^0.585`
+/// cost below the transform's `(la + lb)·log(la + lb)`, hence the floor on the
+/// shorter side, raised for very long transforms. (Cutoffs measured on x86-64
+/// (Zen 5); re-measure per platform to retune.)
 fn ntt_worthwhile(la: usize, lb: usize, square: bool) -> bool {
     let min = la.min(lb);
     if min < 500 {
@@ -459,15 +552,14 @@ fn ntt_worthwhile(la: usize, lb: usize, square: bool) -> bool {
     if min < 1000 && n > 1 << 16 {
         return false;
     }
-    // Percentage of the transform the product fills (> 50 by construction).
+    // Percentage of the transform the product fills (> 66 by construction).
     let fill = (len as u64 * 100 / n as u64) as u32;
     match (n, square) {
-        (..=1024, _) => false,
-        (2048, false) => fill >= 75,
-        (2048, true) => fill >= 83,
-        (4096, false) => fill >= 62,
-        (4096, true) => fill >= 66,
-        (8192, true) => fill >= 55,
+        (..=1024, _) | (1536, true) => false,
+        (1536, false) => fill >= 88,
+        (2048, true) => fill >= 80,
+        (3072, false) => fill >= 75,
+        (3072, true) => fill >= 83,
         _ => true,
     }
 }
@@ -4049,11 +4141,16 @@ mod tests {
         }
         // Transform-length limit: lengths past 2^42 are refused (Toom fallback).
         assert_eq!(mp_shape(1), Some(2));
-        assert_eq!(mp_shape(1025), Some(2048));
+        assert_eq!(mp_shape(1024), Some(1024));
+        assert_eq!(mp_shape(1025), Some(1536)); // 3·2^9 beats 2^11
+        assert_eq!(mp_shape(1537), Some(2048));
+        assert_eq!(mp_shape(5), Some(6));
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(mp_shape(1 << 42), Some(1 << 42));
-            assert_eq!(mp_shape((1 << 42) + 1), None);
+            assert_eq!(mp_shape((1 << 42) + 1), Some(3 << 41));
+            assert_eq!(mp_shape(3 << 42), Some(3 << 42));
+            assert_eq!(mp_shape((3 << 42) + 1), None);
             assert!(!ntt_worthwhile(1 << 42, 1 << 42, false));
         }
     }
@@ -4257,7 +4354,8 @@ mod tests {
             assert_eq!(a.square(), a.square_karatsuba(), "square {l}");
             assert_eq!(a.mul(&a.clone()), a.square_karatsuba(), "self-mul {l}");
         }
-        assert!(!ntt_worthwhile(700, 700, false) && !ntt_worthwhile(400, 9000, false));
+        assert!(!ntt_worthwhile(600, 600, false) && !ntt_worthwhile(400, 9000, false));
+        assert!(!ntt_worthwhile(800, 800, true) && !ntt_worthwhile(1100, 1100, true));
     }
 
     #[test]

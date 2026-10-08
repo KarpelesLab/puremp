@@ -23,6 +23,10 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   now takes over from ~800–1300 limbs — `Nat::mul`/`Nat::square` are 2–7x
   faster from 2k to 1M limbs and up to 13x on unbalanced operands; the
   transform-length limit rises from 2^32 to 2^42 points
+- *(nat)* NTT transform lengths `3·2^k` as well as `2^k` (one radix-3 stage;
+  the three primes have `3 | p − 1`), capping the zero-padding at a third
+  instead of a half: 12–19% faster products and squares at sizes just past a
+  power of two
 - add a `mul_bench` example for large `Nat` multiplication and squaring
 
 ## [0.2.5](https://github.com/KarpelesLab/puremp/compare/v0.2.4...v0.2.5) - 2026-09-27

@@ -98,6 +98,8 @@ mod limb;
 #[cfg(feature = "int")]
 pub mod int;
 #[cfg(feature = "int")]
+mod int_multiplicative;
+#[cfg(feature = "int")]
 pub mod nat;
 
 #[cfg(feature = "int")]

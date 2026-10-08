@@ -1157,6 +1157,36 @@ impl Float {
         Float::ziv(precision, mode, catalan_at)
     }
 
+    /// γ through the original term-by-term Brent–McMillan loop at every
+    /// precision. Differential reference and benchmark baseline for the
+    /// binary-split path that [`euler_gamma`](Self::euler_gamma) dispatches to.
+    #[doc(hidden)]
+    pub fn euler_gamma_series_reference(precision: u64, mode: RoundingMode) -> Float {
+        Float::ziv(precision, mode, gamma_series_at)
+    }
+
+    /// γ through the binary-split refined Brent–McMillan sums at every
+    /// precision (ignoring the dispatch threshold). Differential/bench hook.
+    #[doc(hidden)]
+    pub fn euler_gamma_bsplit(precision: u64, mode: RoundingMode) -> Float {
+        Float::ziv(precision, mode, gamma_bsplit_at)
+    }
+
+    /// Catalan's constant through the original Ramanujan series (term by term,
+    /// plus π, √3 and a logarithm) at every precision. Differential reference
+    /// and benchmark baseline for the binary-split path.
+    #[doc(hidden)]
+    pub fn catalan_series_reference(precision: u64, mode: RoundingMode) -> Float {
+        Float::ziv(precision, mode, catalan_series_at)
+    }
+
+    /// Catalan's constant through the binary-split Pilehrood series at every
+    /// precision (ignoring the dispatch threshold). Differential/bench hook.
+    #[doc(hidden)]
+    pub fn catalan_bsplit(precision: u64, mode: RoundingMode) -> Float {
+        Float::ziv(precision, mode, catalan_bsplit_at)
+    }
+
     // --- functions ---
 
     /// Returns `e^self`, correctly rounded. `exp(±∞)`/`exp(0)` handled per IEEE.
@@ -2061,8 +2091,10 @@ pub(crate) fn round_const_bits(sig: &[u64], total_bits: u64, w: u64) -> Float {
 /// Euler–Mascheroni constant γ via the Brent–McMillan formula
 /// `γ = A(N)/B(N) − ln N`, where `B = Σ (Nᵏ/k!)²` and `A = Σ (Nᵏ/k!)²·Hₖ` with
 /// `Hₖ` the k-th harmonic number. The truncation error is `O(e^{-4N})`, so
-/// `N = ⌈0.18·n⌉` (with `4N > n·ln2`) drives it below `2⁻ⁿ`.
-fn gamma_at(w: u64) -> Float {
+/// `N = ⌈0.18·n⌉` (with `4N > n·ln2`) drives it below `2⁻ⁿ`. Term by term,
+/// `O(n·M(n))`: used below [`GAMMA_BSPLIT_THRESHOLD`] and as the differential
+/// reference for [`gamma_bsplit_at`].
+fn gamma_series_at(w: u64) -> Float {
     let n = w + 32;
     let bign = (n as i64) * 185 / 1024 + 8; // ≈ 0.18·n, so 4N > n·ln2
     let scale = Int::ONE.mul_2k(n as u32); // 2ⁿ
@@ -2092,7 +2124,8 @@ fn gamma_at(w: u64) -> Float {
 
 /// Catalan's constant `G = (π/8)·ln(2+√3) + (3/8)·Σ_{k≥0} 1/((2k+1)²·C(2k,k))`.
 /// The sum converges geometrically (`C(2k,k) ~ 4ᵏ`), so `~n/2` terms suffice.
-fn catalan_at(w: u64) -> Float {
+/// Superseded by [`catalan_bsplit_at`]; kept as its differential reference.
+fn catalan_series_at(w: u64) -> Float {
     let n = w + 32;
     let mut term = Int::ONE.mul_2k(n as u32); // k=0: 1·2ⁿ
     let mut sum = term.clone();
@@ -2119,6 +2152,175 @@ fn catalan_at(w: u64) -> Float {
         .mul(&Float::from_int(&Int::from_i64(3), n, NEAR), n, NEAR)
         .div(&eight, n, NEAR);
     term1.add(&term2, w, NEAR)
+}
+
+/// Binary-splitting node for a positive hypergeometric-type sum
+/// `Σ_{j=a}^{b-1} c(j)·Π_{i=a}^{j} p(i)/q(i)`: returns `(P, Q, T)` with
+/// `P = Π p(i)`, `Q = Π q(i)` over the range and the partial sum equal to `T/Q`
+/// (Haible–Papanikolaou's `P, Q, T` recursion with `a(n) = c(n)`, `b(n) = 1`).
+///
+/// Merging `[a,m)` and `[m,b)` uses `T = T₁·Q₂ + P₁·T₂`, so every product is
+/// balanced and the whole sum costs `O(M(n)·log² n)`. `P` of the rightmost node
+/// is never needed by the caller; computing it anyway keeps the code simple.
+fn split_pqt<FP, FQ, FC>(a: u64, b: u64, p: &FP, q: &FQ, c: &FC) -> (Nat, Nat, Nat)
+where
+    FP: Fn(u64) -> Nat,
+    FQ: Fn(u64) -> Nat,
+    FC: Fn(u64) -> Nat,
+{
+    if b - a == 1 {
+        let pa = p(a);
+        let t = pa.mul(&c(a));
+        return (pa, q(a), t);
+    }
+    let m = a + (b - a) / 2;
+    let (p1, q1, t1) = split_pqt(a, m, p, q, c);
+    let (p2, q2, t2) = split_pqt(m, b, p, q, c);
+    let t = t1.mul(&q2).add(&p1.mul(&t2));
+    (p1.mul(&p2), q1.mul(&q2), t)
+}
+
+/// Working precisions at or above this evaluate γ with the binary-split refined
+/// Brent–McMillan sums ([`gamma_bsplit_at`]); below it the original term-by-term
+/// loop ([`gamma_series_at`]) is used. Measured with `examples/const_bench.rs`:
+/// the binary-split path is ~0.9× at 112 working bits (public 64), ~1.1× from
+/// 144 (public 96), 2.4× at public 1 kbit, 25× at 16 kbit and 85× at 64 kbit.
+const GAMMA_BSPLIT_THRESHOLD: u64 = 144;
+
+/// Catalan's constant. The binary-split Pilehrood series ([`catalan_bsplit_at`])
+/// beat the original Ramanujan-series code ([`catalan_series_at`]) at every
+/// measured precision (≈4.4× from 32 bits up, 7.4× at 64 kbit; see
+/// `examples/const_bench.rs`), so there is no crossover.
+fn catalan_at(w: u64) -> Float {
+    catalan_bsplit_at(w)
+}
+
+fn gamma_at(w: u64) -> Float {
+    if w >= GAMMA_BSPLIT_THRESHOLD {
+        gamma_bsplit_at(w)
+    } else {
+        gamma_series_at(w)
+    }
+}
+
+/// Catalan's constant from the Pilehrood (Gosper) series
+/// `G = (1/64)·Σ_{k≥1} 256ᵏ·(580k² − 184k + 15) / (k³·(2k−1)·C(6k,3k)·C(6k,4k)·C(4k,2k))`
+/// (K. & T. Hessami Pilehrood, *Series acceleration formulas for beta values*,
+/// DMTCS 2010), evaluated exactly by binary splitting — no π, √3 or ln needed.
+///
+/// With `j = k − 1 ≥ 0` the summand is `c(j)·Π_{i=0}^{j} p(i)/q(i)` where
+/// `c(j) = 580j² + 976j + 411`, `p(0) = 32`, `p(i) = 32·i³·(2i−1)`,
+/// `q(i) = 9·(6i+1)²·(6i+5)²` (from `C(6k,3k)·C(6k,4k)·C(4k,2k) =
+/// (6k)!²/((3k)!²·(2k)!³)`). Every ratio `p(i)/q(i)` is below `1/182 < 2^-7.5`,
+/// so `n/7 + 4` terms push the (positive, geometrically decaying) tail far below
+/// `2^-n` relative to `G`.
+fn catalan_bsplit_at(w: u64) -> Float {
+    let n = w + 32;
+    let k = n / 7 + 4;
+    let p = |i: u64| -> Nat {
+        if i == 0 {
+            Nat::from_u64(32)
+        } else {
+            let i = i as u128;
+            Nat::from_u128(32 * i * i * i * (2 * i - 1))
+        }
+    };
+    let q = |i: u64| -> Nat {
+        let i = i as u128;
+        let a = (6 * i + 1) * (6 * i + 5);
+        Nat::from_u128(9 * a * a)
+    };
+    let c = |j: u64| -> Nat {
+        let j = j as u128;
+        Nat::from_u128(580 * j * j + 976 * j + 411)
+    };
+    assert!(
+        k < (1 << 24),
+        "Catalan precision beyond the u128 leaf bounds"
+    );
+    let (_, qq, t) = split_pqt(0, k, &p, &q, &c);
+    // G = T / (64·Q).
+    let g = t.shl(n).div_rem(&qq).expect("denominator > 0").0;
+    Float::round_raw(false, g, -(n as i64) - 6, w, NEAR).0
+}
+
+/// Binary-splitting node for the Brent–McMillan sums over `k ∈ [a, b)`, with
+/// relative terms `r(k) = Π_{j=a}^{k} N²/j²` and relative harmonic sums
+/// `h(k) = Σ_{j=a}^{k} 1/j`. Returns `(P, D, T, C, V)` where `P = N^{2(b−a)}`,
+/// `D = Π j`, `Q = D²` (implicit), `Σ r(k) = T/Q`, `Σ 1/j = C/D` and
+/// `Σ r(k)·h(k) = V/(Q·D)`.
+///
+/// Merging uses `T = T₁Q₂ + P₁T₂`, `C = C₁D₂ + C₂D₁` and
+/// `V = V₁Q₂D₂ + P₁(V₂D₁ + C₁D₂T₂)` (from `r = R₁·r₂`, `h = H₁ + h₂` on the right
+/// half).
+fn split_bm(a: u64, b: u64, n2: &Nat) -> (Nat, Nat, Nat, Nat, Nat) {
+    if b - a == 1 {
+        // r = N²/a², h = 1/a: T = N², C = 1, V = N².
+        return (
+            n2.clone(),
+            Nat::from_u64(a),
+            n2.clone(),
+            Nat::from_u64(1),
+            n2.clone(),
+        );
+    }
+    let m = a + (b - a) / 2;
+    let (p1, d1, t1, c1, v1) = split_bm(a, m, n2);
+    let (p2, d2, t2, c2, v2) = split_bm(m, b, n2);
+    let q2 = d2.square();
+    let c1d2 = c1.mul(&d2);
+    let t = t1.mul(&q2).add(&p1.mul(&t2));
+    let v = v1
+        .mul(&q2.mul(&d2))
+        .add(&p1.mul(&v2.mul(&d1).add(&c1d2.mul(&t2))));
+    let c = c1d2.add(&c2.mul(&d1));
+    (p1.mul(&p2), d1.mul(&d2), t, c, v)
+}
+
+/// Euler–Mascheroni γ via the refined Brent–McMillan formula (Brent & McMillan
+/// 1980, algorithm B3)
+/// `γ = A/B − W/B² − ln N + O(e^{−8N})`, with `B = Σ_{k≥0} (Nᵏ/k!)²`,
+/// `A = Σ_{k≥0} (Nᵏ/k!)²·Hₖ` and `W = (1/(4N))·Σ_{k=0}^{2N} (2k)!³/(k!⁴·(16N)^{2k})`,
+/// all three sums evaluated exactly by binary splitting.
+///
+/// `N = ⌈(n+8)·ln2/8⌉ + 1` makes `e^{−8N} < 2^{−n−8}` (the refined error was
+/// measured below `e^{−8N}` for N = 10…80). The `A`, `B` terms relative to `B`
+/// are `≈ e^{−2N(α ln α − α + 1)}` at `k = αN`; `α = 5` gives `e^{−8.09N}`, and
+/// the 16 extra terms (each ≤ 1/25 of the previous) cover the `Hₖ` factor.
+fn gamma_bsplit_at(w: u64) -> Float {
+    let n = w + 32;
+    let bign = ((n + 8) * 710).div_ceil(8192) + 1; // 710/8192 > ln2/8
+    let kmax = 5 * bign + 16;
+    let n2 = Nat::from_u64(bign).square();
+    // A/B = V/(D·(Q+T)) over k = 1..kmax (the k = 0 term is B's leading 1).
+    let (_, d, t, _, v) = split_bm(1, kmax + 1, &n2);
+    let q = d.square();
+    let qt = q.add(&t);
+    let wp = n + 16;
+    // The exact integers run to several times `n` bits; round each to `wp`
+    // bits before combining (a handful of half-ulp errors at `wp = n + 16`).
+    let fl = |x: &Nat| Float::from_int(&Int::from(x.clone()), wp, NEAR);
+    let qf = fl(&q);
+    let qtf = fl(&qt);
+    let a_over_b = fl(&v).div(&fl(&d).mul(&qtf, wp, NEAR), wp, NEAR);
+    // W·4N = 1 + Σ_{k=1}^{2N} Π (2j−1)³/(32N²j)  →  (Qw + Tw)/Qw.
+    let n2x32 = n2.shl(5);
+    let (_, qw, tw) = split_pqt(
+        1,
+        2 * bign + 1,
+        &|j: u64| Nat::from_u64(2 * j - 1).pow(3),
+        &|j: u64| n2x32.mul(&Nat::from_u64(j)),
+        &|_| Nat::from_u64(1),
+    );
+    // W/B² = (Qw + Tw)/(4N·Qw) · Q²/(Q+T)².
+    let binv = qf.div(&qtf, wp, NEAR); // 1/B
+    let wv = fl(&qw.add(&tw)).div(&fl(&qw.mul(&Nat::from_u64(4 * bign))), wp, NEAR);
+    let corr = wv.mul(&binv.mul(&binv, wp, NEAR), wp, NEAR);
+    let lnn = Float::from_int(&Int::from_u64(bign), wp, NEAR).ln(wp, NEAR);
+    a_over_b
+        .sub(&corr, wp, NEAR)
+        .sub(&lnn, wp, NEAR)
+        .round(w, NEAR)
 }
 
 fn pi_at(w: u64) -> Float {

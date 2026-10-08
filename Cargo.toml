@@ -170,6 +170,10 @@ name = "mul_bench"
 required-features = ["std", "int"]
 
 [[example]]
+name = "const_bench"
+required-features = ["std", "float"]
+
+[[example]]
 name = "bench"
 required-features = ["std", "float"]
 

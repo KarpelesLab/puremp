@@ -38,6 +38,8 @@
 //!   general real algebraic numbers (`algebraic`).
 //! - [`EllipticCurve`] / [`Point`] — elliptic curves `y² = x³ + a·x + b` over
 //!   `GF(p)` or `ℚ`, with the chord-and-tangent group law (`elliptic`).
+//! - [`TwoIsogenyCurve`] — certified Mordell–Weil ranks over `ℚ` for curves
+//!   with a rational 2-torsion point, by 2-isogeny descent (`elliptic`).
 //!
 //! `Int`/`Rational` also carry a number-theory toolkit (factorization,
 //! `sqrt_mod`, Jacobi/Legendre, CRT, `random_prime`, combinatorics,
@@ -177,6 +179,9 @@ mod modular_poly;
 #[cfg(feature = "elliptic")]
 pub mod elliptic;
 
+#[cfg(feature = "elliptic")]
+pub mod elliptic_descent;
+
 #[cfg(feature = "numberfield")]
 pub mod numberfield;
 
@@ -283,6 +288,8 @@ pub use quadratic::Quadratic;
 
 #[cfg(feature = "elliptic")]
 pub use elliptic::{EllipticCurve, Point};
+#[cfg(feature = "elliptic")]
+pub use elliptic_descent::{RankCertificate, RankMethod, TwoIsogenyCurve};
 
 #[cfg(feature = "numberfield")]
 pub use numberfield::{NumberField, NumberFieldElement};

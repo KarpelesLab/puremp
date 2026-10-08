@@ -7,7 +7,8 @@
 //!    that carries the hard limb-level algorithms (multiplication, division,
 //!    GCD, modular arithmetic, …). Enabled by the `int` feature.
 //! 2. **Rationals** — [`Rational`], exact `p/q` fractions kept in lowest terms;
-//!    plus [`InfRational`], the same extended with `±∞`/`NaN`. `rational` feature.
+//!    plus [`InfRational`], the same extended with `±∞`/`NaN`, and Egyptian-fraction
+//!    expansions ([`EgyptianExpansion`]). `rational` feature.
 //! 3. **Dyadics** — [`Dyadic`], exact `n·2^-k` binary fractions. `dyadic` feature.
 //! 4. **Floats** — [`Float`], binary floating-point with a caller-chosen
 //!    precision and directed [`RoundingMode`], aiming at MPFR-class correct
@@ -121,6 +122,9 @@ pub mod rational;
 
 #[cfg(feature = "rational")]
 pub mod inf_rational;
+
+#[cfg(feature = "rational")]
+pub mod egyptian;
 
 #[cfg(feature = "int")]
 pub mod mod_int;
@@ -240,6 +244,8 @@ pub use nat::{Nat, Reciprocal, u_gcd, u64_gcd};
 #[cfg(feature = "int")]
 pub use random::{RandomSource, SeedRng};
 
+#[cfg(feature = "rational")]
+pub use egyptian::{EgyptianExpansion, ShortestEgyptian};
 #[cfg(feature = "rational")]
 pub use inf_rational::InfRational;
 #[cfg(feature = "rational")]

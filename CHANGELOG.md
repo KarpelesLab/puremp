@@ -7,6 +7,27 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/KarpelesLab/puremp/compare/v0.2.5...v0.2.6) - 2026-10-08
+
+### Added
+
+- *(int)* Jacobsthal function
+- *(elliptic)* rational point search and sums of two rational cubes
+- *(rational)* Egyptian fraction expansions (greedy, divisor method, shortest)
+- *(elliptic)* certified rank via 2-isogeny descent
+- *(int)* multiplicative order, Carmichael λ, primitive roots, inverse totient
+
+### Fixed
+
+- *(nat)* cap the Goldilocks NTT at its 2^32 transform-length limit
+
+### Other
+
+- *(float)* binary-split Catalan and Euler–Mascheroni constants
+- *(nat)* parallel twiddle chains and iterator-based inverse butterflies
+- *(nat)* 3*2^k NTT lengths via a radix-3 outer stage
+- *(nat)* three-prime NTT multiplication with full 64-bit limb coefficients
+
 ### Fixed
 
 - *(nat)* the Goldilocks NTT multiply no longer picks an unsupported transform

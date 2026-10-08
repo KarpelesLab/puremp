@@ -103,15 +103,26 @@ pub(crate) const HGCD_MODINV_THRESHOLD: usize = 32;
 /// tail well below the recursion base, so recursing further pays.
 const HGCD_EXTGCD_FLOOR: usize = 8;
 
+/// Base-2 logarithm of the longest power-of-two transform the Goldilocks field
+/// supports: `p − 1 = 2^32·(2^32 − 1)`, so primitive `2^k`-th roots of unity
+/// exist only for `k ≤ 32`.
+const NTT_MAX_LOG2: u32 = 32;
+
 /// The digit width (bytes) and transform length [`mul_ntt`] uses for a product
-/// totalling `total_bytes` of operand, or `None` if even 1-byte digits would
-/// overflow the coefficient bound `n·2^(16·bpd) < p` (operands beyond ~2^51
-/// bits). Wider digits shorten the transform, so try 3-byte digits first.
+/// totalling `total_bytes` of operand, or `None` if no digit width satisfies
+/// both the coefficient bound `n·2^(16·bpd) < p` and the transform-length limit
+/// `n ≤ 2^32`. Wider digits shorten the transform, so try 3-byte digits first.
+/// In practice 2-byte digits cover everything up to `n = 2^31` (about 4 GiB of
+/// combined operand bytes); past that the 1-byte transform would need
+/// `n ≥ 2^33`, which the field cannot provide, so the answer is `None` and the
+/// caller falls back to Toom-4.
 fn ntt_shape(total_bytes: usize) -> Option<(usize, usize)> {
     for bpd in (1usize..=3).rev() {
         let need = total_bytes.div_ceil(bpd) + 2;
-        let n = need.next_power_of_two();
-        if (n as u128) << (16 * bpd as u32) < GOLDILOCKS as u128 {
+        let n = need.checked_next_power_of_two()?;
+        if (n as u64) <= 1u64 << NTT_MAX_LOG2
+            && (n as u128) << (16 * bpd as u32) < GOLDILOCKS as u128
+        {
             return Some((bpd, n));
         }
     }
@@ -141,9 +152,8 @@ fn ntt_worthwhile(la: usize, lb: usize, square: bool) -> bool {
             let fill_pct = need * 100 / n;
             min >= if square { 7000 } else { 8000 } && fill_pct >= if square { 72 } else { 88 }
         }
-        // 8-bit digits (astronomical operands): deep Toom recursion has long
-        // lost to the transform by then.
-        _ => true,
+        // 8-bit digits: never produced (see `ntt_shape`), kept for safety.
+        _ => false,
     }
 }
 
@@ -219,9 +229,12 @@ fn gf_pow(mut base: u64, mut exp: u64) -> u64 {
     r
 }
 
-/// In-place iterative NTT (or its inverse) over the Goldilocks field.
+/// In-place iterative NTT (or its inverse) over the Goldilocks field. The
+/// length must be a power of two no larger than `2^32` (see [`NTT_MAX_LOG2`]),
+/// or `(p − 1)/len` below is inexact and the root is not primitive.
 fn ntt(a: &mut [u64], inverse: bool) {
     let n = a.len();
+    debug_assert!(n.is_power_of_two() && (n as u64) <= 1u64 << NTT_MAX_LOG2);
     // Bit-reversal permutation.
     let mut j = 0;
     for i in 1..n {
@@ -291,12 +304,11 @@ fn to_digits(x: &Nat, bpd: usize) -> Vec<u64> {
 /// NTT-based multiplication over a single Goldilocks prime.
 ///
 /// The digit width adapts to the operand size so the convolution coefficients
-/// (`≈ n · 2^(16·bpd)`) always stay below the prime: 2 bytes/digit for typical
-/// inputs, shrinking to 1 (then falling back to Toom-4 only for astronomically
-/// large operands), so no multi-prime CRT is needed in practice.
+/// (`≈ n · 2^(16·bpd)`) always stay below the prime: 3 bytes/digit for short
+/// transforms, 2 bytes/digit up to the field's `2^32` transform-length limit
+/// (about 4 GiB of combined operand bytes), and a Toom-4 fallback beyond.
 fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
-    // Fall back only if even 1-byte digits would overflow (operands beyond
-    // ~2^51 bits).
+    // Fall back once no digit width fits the field (see `ntt_shape`).
     let total_bytes = (a.limbs.len() + b.limbs.len()) * 8;
     let Some((bpd, n)) = ntt_shape(total_bytes) else {
         return a.mul_toom4(b);
@@ -3947,6 +3959,33 @@ mod tests {
             // Reconstruction and range.
             assert_eq!(q.mul(&b).add(&r), a);
             assert!(r.cmp_ref(&b) == Ordering::Less);
+        }
+    }
+
+    #[test]
+    fn ntt_shape_respects_field_limits() {
+        // Small products use 3-byte digits while `n·2^48 < p` (n ≤ 2^15).
+        assert_eq!(ntt_shape(16), Some((3, 8)));
+        let three_max = (1usize << 15) - 2; // need = 2^15 exactly at 3 bytes/digit
+        assert_eq!(ntt_shape(three_max * 3), Some((3, 1 << 15)));
+        assert_eq!(ntt_shape(three_max * 3 + 3).map(|s| s.0), Some(2));
+        // Every shape stays inside both field limits.
+        for &tb in &[1usize, 1000, 98_298, 98_304, 1 << 20, 1 << 26] {
+            let (bpd, n) = ntt_shape(tb).unwrap();
+            assert!(n.is_power_of_two() && (n as u64) <= 1 << NTT_MAX_LOG2);
+            assert!((n as u128) << (16 * bpd as u32) < GOLDILOCKS as u128);
+            assert!(n >= tb.div_ceil(bpd) + 2);
+        }
+        #[cfg(target_pointer_width = "64")]
+        {
+            // 2-byte digits reach the field's 2^31 bound (`n·2^32 < p`); past it
+            // the 1-byte transform would need n ≥ 2^33 > 2^32, which has no
+            // primitive root, so the shape must be refused (Toom-4 fallback).
+            let two_max = ((1usize << 31) - 2) * 2;
+            assert_eq!(ntt_shape(two_max), Some((2, 1 << 31)));
+            assert_eq!(ntt_shape(two_max + 8), None);
+            assert_eq!(ntt_shape(1 << 40), None);
+            assert!(!ntt_worthwhile(1 << 29, 1 << 29, false));
         }
     }
 

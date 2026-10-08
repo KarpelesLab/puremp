@@ -7,6 +7,13 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+### Fixed
+
+- *(nat)* the Goldilocks NTT multiply no longer picks an unsupported transform
+  length: past ~4 GiB of combined operand bytes it previously chose 1-byte
+  digits with a length ≥ 2^33 (the field only has 2^k-th roots of unity for
+  k ≤ 32), silently producing wrong products; such sizes now fall back to Toom-4
+
 ## [0.2.5](https://github.com/KarpelesLab/puremp/compare/v0.2.4...v0.2.5) - 2026-09-27
 
 ### Added

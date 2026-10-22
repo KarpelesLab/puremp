@@ -7,6 +7,17 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/KarpelesLab/puremp/compare/v0.3.1...v0.4.0) - 2026-10-22
+
+### Added
+
+- *(random)* GMP-compatible bounded random integers
+- *(random)* GMP-compatible Mersenne Twister seeding
+
+### Other
+
+- [**breaking**] bump MSRV to Rust 1.95
+
 ### Added
 
 - *(random)* `MersenneTwister::gmp_seeded`: GMP's `gmp_randseed` seed

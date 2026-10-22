@@ -3508,33 +3508,21 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
         (d as usize, p)
     };
 
-    // Validate and collect the digit values (big-endian).
-    let digits: Vec<u32> = s
-        .chars()
-        .map(|c| digit_value(c, radix).ok_or(Error::Parse))
-        .collect::<Result<_>>()?;
-
+    // Validate and pack `chunk` digits at a time into base-`B` limbs in one
+    // pass, least-significant first (`rchunks` walks from the end). Digits are
+    // ASCII, so any byte of a multi-byte character is rejected.
+    let pack = |digits: &[u8]| -> Result<u64> {
+        digits.iter().try_fold(0u64, |val, &b| {
+            let dg = digit_value(b as char, radix).ok_or(Error::Parse)?;
+            Ok(val * radix as u64 + dg as u64)
+        })
+    };
+    let bytes = s.as_bytes();
     // Fast path for small inputs: a single base-`B` limb.
-    if digits.len() <= chunk {
-        let mut val: u64 = 0;
-        for &dg in &digits {
-            val = val * radix as u64 + dg as u64;
-        }
-        return Ok(Nat::from_u64(val));
+    if bytes.len() <= chunk {
+        return Ok(Nat::from_u64(pack(bytes)?));
     }
-
-    // Pack `chunk` digits at a time into base-`B` limbs, least-significant first.
-    let mut level: Vec<Limb> = Vec::with_capacity(digits.len() / chunk + 1);
-    let mut end = digits.len();
-    while end > 0 {
-        let start = end.saturating_sub(chunk);
-        let mut val: u64 = 0;
-        for &dg in &digits[start..end] {
-            val = val * radix as u64 + dg as u64;
-        }
-        level.push(val);
-        end = start;
-    }
+    let level: Vec<Limb> = bytes.rchunks(chunk).map(pack).collect::<Result<_>>()?;
     Ok(nat_from_base_chunks(&level, base))
 }
 

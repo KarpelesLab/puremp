@@ -108,6 +108,9 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 - *(nat)* radix parsing evaluates the packed `radix^chunk` limbs by in-place
   Horner (up to 512 chunks) under a shared power ladder instead of a tree of
   per-chunk `Nat`s: 1.3–2.2x faster decimal parsing
+- *(nat)* radix parsing validates and packs digits in a single pass over the
+  input bytes instead of collecting a `Vec<u32>` first: a further 2–4.5x on
+  small decimal inputs (2–128 limbs), now 1.5–2x ahead of num-bigint there
 - *(nat)* subtractive Karatsuba (`|a0 − a1|·|b0 − b1|`, so every recursive
   product is exactly half size) with the general product's crossovers
   retuned on random operands — Karatsuba from 32 limbs (was 128; squaring

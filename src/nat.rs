@@ -2651,76 +2651,41 @@ impl Nat {
             let (q, r) = self.divmod_small(rhs.limbs[0]);
             return Some((q, Nat::from_u64(r)));
         }
-        if rhs.limbs.len() >= BZ_THRESHOLD {
+        // Burnikel–Ziegler only pays off when both the divisor and the
+        // quotient are long: schoolbook costs `O(n·m)` for an `m`-limb
+        // quotient, which beats any recursion when `m` is small.
+        let quot_limbs = self.limbs.len() - rhs.limbs.len();
+        if rhs.limbs.len() >= BZ_THRESHOLD && quot_limbs >= BZ_THRESHOLD {
             return Some(bz_div_rem(self, rhs));
         }
         Some(self.div_rem_knuth(rhs))
     }
 
-    /// Knuth Algorithm D: schoolbook long division in base `2^64`, with a
-    /// normalized divisor and the 2-by-1 limb quotient estimate. Precondition:
-    /// `rhs` has ≥ 2 limbs and `self > rhs`.
+    /// Knuth Algorithm D: schoolbook long division in base `2^64` (the inner
+    /// loop is [`div_schoolbook_normalized`]). Precondition: `rhs` has ≥ 2
+    /// limbs and `self > rhs`.
     fn div_rem_knuth(&self, rhs: &Nat) -> (Nat, Nat) {
-        const B: u128 = 1 << LIMB_BITS;
         let n = rhs.limbs.len();
         let m = self.limbs.len() - n;
 
-        // Normalize so the divisor's top limb has its high bit set.
+        // Normalize so the divisor's top limb has its high bit set; the
+        // dividend gets one extra top limb to catch the shifted-out bits.
         let shift = rhs.limbs[n - 1].leading_zeros();
-        let vn = rhs.shl(shift as u64);
-        let vv = &vn.limbs;
-        debug_assert_eq!(vv.len(), n);
-        let un = self.shl(shift as u64);
-        let mut u = un.limbs; // move: `un` is a fresh local used only here
-        u.resize(self.limbs.len() + 1, 0); // exactly m + n + 1 limbs
-
-        let (b1, b2) = (vv[n - 1] as u128, vv[n - 2] as u128);
+        let mut d = alloc::vec![0 as Limb; n];
+        shl_limbs_into(&rhs.limbs, shift, &mut d);
+        let mut u = alloc::vec![0 as Limb; self.limbs.len() + 1];
+        shl_limbs_into(&self.limbs, shift, &mut u);
         let mut q = alloc::vec![0 as Limb; m + 1];
-
-        for j in (0..=m).rev() {
-            // Estimate the quotient limb from the top two dividend limbs.
-            let num = ((u[j + n] as u128) << LIMB_BITS) | u[j + n - 1] as u128;
-            let mut qhat = num / b1;
-            let mut rhat = num % b1;
-            while qhat >= B || qhat * b2 > ((rhat << LIMB_BITS) | u[j + n - 2] as u128) {
-                qhat -= 1;
-                rhat += b1;
-                if rhat >= B {
-                    break;
-                }
-            }
-
-            // Multiply and subtract: u[j..=j+n] -= qhat · vv.
-            let mut carry: u128 = 0;
-            let mut borrow: i64 = 0;
-            for i in 0..n {
-                let p = qhat * vv[i] as u128 + carry;
-                carry = p >> LIMB_BITS;
-                let d = (u[j + i] as i128) - ((p as u64) as i128) - (borrow as i128);
-                u[j + i] = d as u64;
-                borrow = if d < 0 { 1 } else { 0 };
-            }
-            let d = (u[j + n] as i128) - (carry as i128) - (borrow as i128);
-            u[j + n] = d as u64;
-
-            q[j] = qhat as Limb;
-            if d < 0 {
-                // qhat was one too large: add the divisor back.
-                q[j] -= 1;
-                let mut add_carry: u128 = 0;
-                for i in 0..n {
-                    let s = u[j + i] as u128 + vv[i] as u128 + add_carry;
-                    u[j + i] = s as u64;
-                    add_carry = s >> LIMB_BITS;
-                }
-                u[j + n] = (u[j + n] as u128 + add_carry) as u64;
-            }
-        }
+        div_schoolbook_normalized(&mut u, &d, &mut q);
 
         let mut quotient = Nat { limbs: q };
         quotient.normalize();
-        // Denormalize the remainder (the low n limbs of u), undoing the shift.
-        let remainder = Nat::from_limbs(&u[..n]).shr(shift as u64);
+        // Denormalize the remainder (the low n limbs of u), undoing the shift;
+        // `u`'s buffer is reused for it.
+        u.truncate(n);
+        shr_limbs_in_place(&mut u, shift);
+        let mut remainder = Nat { limbs: u };
+        remainder.normalize();
         (quotient, remainder)
     }
 
@@ -2881,6 +2846,173 @@ fn div_2by1(hi: Limb, lo: Limb, d: Limb, v: Limb) -> (Limb, Limb) {
         r -= d;
     }
     (q1, r)
+}
+
+/// Möller–Granlund 3-by-2 reciprocal of the normalized two-limb divisor
+/// `(d1, d0)` (`d1`'s top bit set): `v = ⌊(β³ − 1)/(d1·β + d0)⌋ − β` with
+/// `β = 2^64` (their Algorithm 6, refining the 2-by-1 reciprocal of `d1`).
+#[inline]
+fn recip_3by2(d1: Limb, d0: Limb) -> Limb {
+    let mut v = recip_2by1(d1);
+    let mut p = d1.wrapping_mul(v).wrapping_add(d0);
+    if p < d0 {
+        v = v.wrapping_sub(1);
+        if p >= d1 {
+            v = v.wrapping_sub(1);
+            p = p.wrapping_sub(d1);
+        }
+        p = p.wrapping_sub(d1);
+    }
+    let t = d0 as u128 * v as u128;
+    let (t1, t0) = ((t >> LIMB_BITS) as Limb, t as Limb);
+    p = p.wrapping_add(t1);
+    if p < t1 {
+        v = v.wrapping_sub(1);
+        if p > d1 || (p == d1 && t0 >= d0) {
+            v = v.wrapping_sub(1);
+        }
+    }
+    v
+}
+
+/// Divides the three-limb `(u2, u1, u0)` by the normalized `(d1, d0)` given
+/// its [`recip_3by2`] reciprocal `v`, returning the one-limb quotient and the
+/// two-limb remainder `(r1, r0)` packed in a `u128`. Requires
+/// `(u2, u1) < (d1, d0)` (Möller–Granlund Algorithm 5): two multiplications
+/// and no hardware division, with a final correction that almost never runs.
+#[inline]
+fn div_3by2(u2: Limb, u1: Limb, u0: Limb, d1: Limb, d0: Limb, v: Limb) -> (Limb, u128) {
+    let d = ((d1 as u128) << LIMB_BITS) | d0 as u128;
+    let q = (v as u128) * (u2 as u128) + (((u2 as u128) << LIMB_BITS) | u1 as u128);
+    let mut q1 = (q >> LIMB_BITS) as Limb;
+    let q0 = q as Limb;
+    let r1 = u1.wrapping_sub(q1.wrapping_mul(d1));
+    let mut r = (((r1 as u128) << LIMB_BITS) | u0 as u128)
+        .wrapping_sub(d0 as u128 * q1 as u128)
+        .wrapping_sub(d);
+    q1 = q1.wrapping_add(1);
+    if (r >> LIMB_BITS) as Limb >= q0 {
+        q1 = q1.wrapping_sub(1);
+        r = r.wrapping_add(d);
+    }
+    if r >= d {
+        q1 = q1.wrapping_add(1);
+        r -= d;
+    }
+    (q1, r)
+}
+
+/// `r -= q·a` over `r.len() == a.len()` limbs, returning the borrow limb out
+/// of the top (the high part of the product plus the subtraction borrow).
+#[inline]
+fn submul_1(r: &mut [Limb], a: &[Limb], q: Limb) -> Limb {
+    debug_assert_eq!(r.len(), a.len());
+    let mut carry: Limb = 0;
+    for (ri, &ai) in r.iter_mut().zip(a) {
+        // q·aᵢ + carry ≤ 2^128 − 2^64, so the high limb plus the borrow fits.
+        let p = ai as u128 * q as u128 + carry as u128;
+        let (s, b) = ri.overflowing_sub(p as Limb);
+        *ri = s;
+        carry = (p >> LIMB_BITS) as Limb + b as Limb;
+    }
+    carry
+}
+
+/// `r += a` over `r.len() == a.len()` limbs, returning the carry out.
+#[inline]
+fn add_n_in_place(r: &mut [Limb], a: &[Limb]) -> Limb {
+    debug_assert_eq!(r.len(), a.len());
+    let mut carry = 0;
+    for (ri, &ai) in r.iter_mut().zip(a) {
+        let (s, c) = adc(*ri, ai, carry);
+        *ri = s;
+        carry = c;
+    }
+    carry
+}
+
+/// Writes `src << shift` (`shift < 64`) into the zeroed `dst`; a limb shifted
+/// out of the top lands in `dst[src.len()]` when `dst` is longer than `src`.
+fn shl_limbs_into(src: &[Limb], shift: u32, dst: &mut [Limb]) {
+    debug_assert!(shift < LIMB_BITS && dst.len() >= src.len());
+    if shift == 0 {
+        dst[..src.len()].copy_from_slice(src);
+        return;
+    }
+    let mut carry: Limb = 0;
+    for (o, &x) in dst.iter_mut().zip(src) {
+        *o = (x << shift) | carry;
+        carry = x >> (LIMB_BITS - shift);
+    }
+    if dst.len() > src.len() {
+        dst[src.len()] = carry;
+    } else {
+        debug_assert_eq!(carry, 0, "shl_limbs_into dropped bits");
+    }
+}
+
+/// Shifts the limb slice `x` right by `shift < 64` bits in place.
+fn shr_limbs_in_place(x: &mut [Limb], shift: u32) {
+    debug_assert!(shift < LIMB_BITS);
+    if shift == 0 || x.is_empty() {
+        return;
+    }
+    for i in 0..x.len() - 1 {
+        x[i] = (x[i] >> shift) | (x[i + 1] << (LIMB_BITS - shift));
+    }
+    let last = x.len() - 1;
+    x[last] >>= shift;
+}
+
+/// Schoolbook division core (Knuth Algorithm D with the 3-by-2 quotient
+/// estimate of Möller–Granlund, "Improved division by invariant integers",
+/// §5–6): divides `u` in place by the normalized (top bit set) divisor `d`
+/// of `n ≥ 2` limbs, writing the `u.len() − n` quotient limbs to `q` and
+/// leaving the remainder in `u[..n]` (the limbs above are zeroed).
+///
+/// Precondition: the top `n` limbs of `u` are `< d`, so every quotient limb
+/// fits. Each limb of the quotient comes from one 3-by-2 reciprocal division
+/// of the window's top three limbs by `d`'s top two — exact except for a
+/// rare one-too-large case, caught by the borrow out of the fused
+/// multiply-subtract over the remaining `n − 2` limbs and fixed by adding `d`
+/// back once.
+fn div_schoolbook_normalized(u: &mut [Limb], d: &[Limb], q: &mut [Limb]) {
+    let n = d.len();
+    debug_assert!(n >= 2 && d[n - 1] >> (LIMB_BITS - 1) == 1);
+    debug_assert_eq!(q.len() + n, u.len());
+    let (d1, d0) = (d[n - 1], d[n - 2]);
+    let v = recip_3by2(d1, d0);
+    let dlo = &d[..n - 2];
+    for j in (0..q.len()).rev() {
+        let w = &mut u[j..j + n + 1];
+        let (n2, n1, n0) = (w[n], w[n - 1], w[n - 2]);
+        let qj = if n2 == d1 && n1 == d0 {
+            // The 3-by-2 quotient would be β; since the window is < β·d the
+            // true quotient limb is exactly β − 1, and the subtraction leaves
+            // the top limb zero.
+            let borrow = submul_1(&mut w[..n], d, Limb::MAX);
+            w[n] = n2.wrapping_sub(borrow);
+            debug_assert_eq!(w[n], 0);
+            Limb::MAX
+        } else {
+            let (mut qh, r) = div_3by2(n2, n1, n0, d1, d0, v);
+            let cy = submul_1(&mut w[..n - 2], dlo, qh);
+            // Fold the borrow into the 3-by-2 remainder's two limbs.
+            let (r0, b0) = (r as Limb).overflowing_sub(cy);
+            let (r1, b1) = ((r >> LIMB_BITS) as Limb).overflowing_sub(b0 as Limb);
+            w[n - 2] = r0;
+            w[n - 1] = r1;
+            w[n] = 0;
+            if b1 {
+                // qh was one too large: add the divisor back (the carry out
+                // cancels the borrow).
+                qh = qh.wrapping_sub(1);
+                add_n_in_place(&mut w[..n], d);
+            }
+            qh
+        };
+        q[j] = qj;
+    }
 }
 
 impl Nat {
@@ -5973,6 +6105,82 @@ mod tests {
                     check(&m);
                 }
             }
+        }
+    }
+
+    /// Limb generator skewed towards the edge values (0, 1, 2^63, 2^64 − 1)
+    /// that exercise the rare quotient-correction branches.
+    fn edgy_limbs(state: &mut u64, cnt: usize) -> Vec<Limb> {
+        let mut next = || {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        };
+        (0..cnt)
+            .map(|_| match next() % 8 {
+                0 => 0,
+                1 => Limb::MAX,
+                2 => 1 << 63,
+                3 => Limb::MAX - 1,
+                4 => 1,
+                _ => next(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn schoolbook_division_differential() {
+        // The 3-by-2 reciprocal schoolbook division against the bitwise
+        // reference (small sizes) and the exact identity a = q·b + r, r < b
+        // (all sizes, including both sides of the BZ dispatch), over random
+        // and edge-heavy limbs.
+        let mut state = 0x0bad_5eed_1234_5678u64;
+        for round in 0..3000 {
+            let nb = 2 + (round % 37);
+            let na = nb + (round * 7 % 45);
+            let mut bl = edgy_limbs(&mut state, nb);
+            if bl[nb - 1] == 0 {
+                bl[nb - 1] = 1 + (round as Limb);
+            }
+            let b = Nat::from_limbs(&bl);
+            let a = Nat::from_limbs(&edgy_limbs(&mut state, na));
+            let (q, r) = a.div_rem(&b).unwrap();
+            assert!(r.cmp_ref(&b) == Ordering::Less, "r >= b at {na}/{nb}");
+            assert_eq!(q.mul(&b).add(&r), a, "identity at {na}/{nb}");
+            if na <= 5 {
+                assert_eq!((q, r), div_rem_binary(&a, &b));
+            }
+        }
+        // Divisors of the form (d1, d0) = top limbs of the window, which hit
+        // the q = β − 1 shortcut: a = b·(β^k − 1) + small.
+        for nb in 2..12 {
+            let b = Nat::from_limbs(&edgy_limbs(&mut state, nb)).add(&Nat::one().shl(64 * nb as u64 - 1));
+            for k in 1..6u64 {
+                let a = b.mul(&Nat::one().shl(64 * k).checked_sub(&Nat::one()).unwrap()).add(&Nat::from_u64(k));
+                let (q, r) = a.div_rem(&b).unwrap();
+                assert_eq!(q.mul(&b).add(&r), a);
+                assert!(r.cmp_ref(&b) == Ordering::Less);
+            }
+        }
+        // 3-by-2 primitive against u128 arithmetic on a reduced range.
+        for _ in 0..20000 {
+            let l = edgy_limbs(&mut state, 5);
+            let d1 = l[0] | (1 << 63);
+            let d0 = l[1];
+            let v = recip_3by2(d1, d0);
+            let d = ((d1 as u128) << 64) | d0 as u128;
+            // (u2, u1) < (d1, d0).
+            let top = (((l[2] as u128) << 64) | l[3] as u128) % d;
+            let (u2, u1, u0) = ((top >> 64) as Limb, top as Limb, l[4]);
+            let (q, r) = div_3by2(u2, u1, u0, d1, d0, v);
+            // Check q·d + r == (u2, u1, u0) as a 192-bit value, r < d.
+            assert!(r < d);
+            let lo = (q as u128) * (d0 as u128) + (r as u64) as u128;
+            let mid = (q as u128) * (d1 as u128) + (lo >> 64) + (r >> 64);
+            assert_eq!(lo as Limb, u0);
+            assert_eq!(mid as Limb, u1);
+            assert_eq!((mid >> 64) as Limb, u2);
         }
     }
 

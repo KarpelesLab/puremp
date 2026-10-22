@@ -93,9 +93,9 @@ pub(crate) fn exp_mp(x: &Float, precision: u64, mode: RoundingMode) -> Option<Fl
     let (mut num, mut den) = (Int::ONE, Int::ONE);
     for (j, &ej) in e.iter().enumerate().skip(1) {
         if ej > 0 {
-            num = num.mul(&Int::from_u64(PRIMES[j]).pow(ej as u32));
+            num = num.mul(&Int::from_u64(PRIMES[j]).pow(ej as u64));
         } else if ej < 0 {
-            den = den.mul(&Int::from_u64(PRIMES[j]).pow((-ej) as u32));
+            den = den.mul(&Int::from_u64(PRIMES[j]).pow((-ej) as u64));
         }
     }
     // value = (num/den)·(expt/2ⁿ)·2^{k+e₀}. Assemble num/den·sum then adjust 2^exp.
@@ -155,13 +155,13 @@ fn babai_f64(r_scaled: &Int) -> Option<[i64; 12]> {
 
 /// `exp(T/2ⁿ)·2ⁿ` (T/2ⁿ tiny) as a scaled integer, plus the number of terms.
 fn exp_series(big_t: &Int, n: u64) -> (Int, u64) {
-    let mut sum = Int::ONE.mul_2k(n as u32);
+    let mut sum = Int::ONE.mul_2k(n);
     let mut term = sum.clone();
     let mut kk = 1i64;
     loop {
         term = term
             .mul(big_t)
-            .div_2k_trunc(n as u32)
+            .div_2k_trunc(n)
             .div_trunc(&Int::from_i64(kk));
         if term.is_zero() {
             break;
@@ -187,7 +187,7 @@ fn round_scaled(f: &Float, s: u64) -> Int {
 }
 
 fn round_scaled_rat(r: &Rational, s: u64) -> Int {
-    let num = r.numerator().mul_2k(s as u32);
+    let num = r.numerator().mul_2k(s);
     let den = r.denominator();
     let two = Int::from_i64(2);
     num.mul(&two).add(den).div_floor(&den.mul(&two))
@@ -198,9 +198,9 @@ fn scaled_trunc(f: &Float, m: i64) -> Int {
         Some(r) => {
             let (num, den) = (r.numerator(), r.denominator());
             if m >= 0 {
-                num.mul_2k(m as u32).div_trunc(den)
+                num.mul_2k(m as u64).div_trunc(den)
             } else {
-                num.div_trunc(&den.mul_2k((-m) as u32))
+                num.div_trunc(&den.mul_2k((-m) as u64))
             }
         }
         None => Int::ZERO,

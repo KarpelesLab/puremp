@@ -278,7 +278,7 @@ fn affine_scalar_mul<F: puremp::ring::Field>(p: &Point<F>, k: &Int) -> Point<F> 
     while i > 0 {
         i -= 1;
         result = result.double();
-        if mag.bit(i) {
+        if mag.bit(u64::from(i)) {
             result = result.add(p);
         }
     }

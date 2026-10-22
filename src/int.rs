@@ -322,7 +322,7 @@ impl Int {
     }
 
     /// Returns `self` raised to `exp` (`self^0 == 1`), by square-and-multiply.
-    pub fn pow(&self, exp: u32) -> Int {
+    pub fn pow(&self, exp: u64) -> Int {
         let mut result = Int::ONE;
         let mut base = self.clone();
         let mut e = exp;
@@ -581,7 +581,7 @@ impl Int {
         }
         let mut phi = Int::ONE;
         for (p, e) in self.factor_exponents() {
-            phi = phi.mul(&p.pow(e - 1)).mul(&p.sub(&Int::ONE));
+            phi = phi.mul(&p.pow(u64::from(e - 1))).mul(&p.sub(&Int::ONE));
         }
         phi
     }
@@ -632,8 +632,8 @@ impl Int {
         let mut sigma = Int::ONE;
         for (p, e) in self.factor_exponents() {
             // Σ_{j=0}^{e} p^{jk} = (p^{k(e+1)} − 1) / (p^k − 1).
-            let pk = p.pow(k);
-            let num = pk.pow(e + 1).sub(&Int::ONE);
+            let pk = p.pow(u64::from(k));
+            let num = pk.pow(u64::from(e + 1)).sub(&Int::ONE);
             sigma = sigma.mul(&num.div_trunc(&pk.sub(&Int::ONE)));
         }
         sigma
@@ -672,8 +672,8 @@ impl Int {
     /// verified with Baillie–PSW.
     pub fn random_prime(bits: u32, rng: &mut impl crate::random::RandomSource) -> Int {
         assert!(bits >= 2, "random_prime: need at least 2 bits");
-        let high = Int::ONE.mul_2k(bits - 1); // top bit set
-        let limit = Int::ONE.mul_2k(bits);
+        let high = Int::ONE.mul_2k(u64::from(bits - 1)); // top bit set
+        let limit = Int::ONE.mul_2k(u64::from(bits));
         loop {
             // Random odd candidate with the high bit set.
             let base = Int::from(Nat::random_bits(bits as u64, rng))
@@ -769,24 +769,24 @@ impl Int {
     // --- power-of-two & bit access ---
 
     /// Returns `self << k` (multiply by `2^k`).
-    pub fn mul_2k(&self, k: u32) -> Int {
+    pub fn mul_2k(&self, k: u64) -> Int {
         let (s, m) = self.to_sign_mag();
-        Int::from_sign_magnitude(s, m.shl(k as u64))
+        Int::from_sign_magnitude(s, m.shl(k))
     }
 
     /// Returns the truncated `self / 2^k` (rounds toward zero).
-    pub fn div_2k_trunc(&self, k: u32) -> Int {
+    pub fn div_2k_trunc(&self, k: u64) -> Int {
         let (s, m) = self.to_sign_mag();
-        Int::from_sign_magnitude(s, m.shr(k as u64))
+        Int::from_sign_magnitude(s, m.shr(k))
     }
 
     /// Returns `self mod 2^k`, the non-negative value in `[0, 2^k)` (the low `k`
     /// bits, Euclidean).
-    pub fn mod_2k(&self, k: u32) -> Int {
+    pub fn mod_2k(&self, k: u64) -> Int {
         let (s, m) = self.to_sign_mag();
-        let r = m.low_bits(k as u64);
+        let r = m.low_bits(k);
         if s == Sign::Negative && !r.is_zero() {
-            let modulus = Nat::one().shl(k as u64);
+            let modulus = Nat::one().shl(k);
             Int::from(modulus.checked_sub(&r).expect("2^k > low_bits"))
         } else {
             Int::from(r)
@@ -848,10 +848,10 @@ impl Int {
     }
 
     /// Returns bit `i` of `|self|` (little-endian; `false` past the top bit).
-    pub fn bit(&self, i: u32) -> bool {
+    pub fn bit(&self, i: u64) -> bool {
         match &self.0 {
-            Repr::Small { mag, .. } => i < u64::BITS && (mag >> i) & 1 == 1,
-            Repr::Large { mag, .. } => mag.bit(i as u64),
+            Repr::Small { mag, .. } => i < u64::BITS as u64 && (mag >> i) & 1 == 1,
+            Repr::Large { mag, .. } => mag.bit(i),
         }
     }
 

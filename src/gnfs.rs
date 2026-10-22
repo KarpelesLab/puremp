@@ -203,7 +203,7 @@ fn ff_pow(a: &[Int], e: &Int, f: &[Int], d: usize, p: &Int) -> Vec<Int> {
     let mut base = a.to_vec();
     let bits = e.bit_len();
     for i in 0..bits {
-        if e.bit(i) {
+        if e.bit(u64::from(i)) {
             result = ff_mul(&result, &base, f, d, p);
         }
         if i + 1 < bits {
@@ -223,7 +223,7 @@ fn ff_sqrt(a: &[Int], f: &[Int], d: usize, p: &Int) -> Option<Vec<Int>> {
         v
     };
     // q = p^d
-    let q = p.pow(d as u32);
+    let q = p.pow(d as u64);
     let q_minus_1 = q.sub(&Int::one());
     // Legendre: a^{(q-1)/2}
     let half = q_minus_1.div_exact(&Int::from_i64(2));
@@ -717,7 +717,7 @@ fn algebraic_sqrt(gamma: &[Int], f: &[Int], d: usize) -> Option<Vec<Int>> {
         // seed inverse s0 = (2*beta0)^{-1} in the field, via Fermat.
         let two = el_const(2, d, Some(&p));
         let twobeta = ff_mul(&two, &beta0, f, d, &p);
-        let q = p.pow(d as u32);
+        let q = p.pow(d as u64);
         let qm2 = q.sub(&Int::from_i64(2));
         let s0 = ff_pow(&twobeta, &qm2, f, d, &p);
 

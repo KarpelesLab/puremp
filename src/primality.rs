@@ -448,7 +448,7 @@ fn peel_smooth(m: &Int) -> (Vec<(Int, u32)>, Int) {
 fn product_pow(primes: &[(Int, u32)]) -> Int {
     let mut f = Int::ONE;
     for (p, e) in primes {
-        f = f.mul(&p.pow(*e));
+        f = f.mul(&p.pow(u64::from(*e)));
     }
     f
 }
@@ -457,7 +457,7 @@ fn product_pow(primes: &[(Int, u32)]) -> Int {
 fn product_pow_from(factors: &[FactorWitness]) -> Int {
     let mut f = Int::ONE;
     for fw in factors {
-        f = f.mul(&fw.prime.pow(fw.exp));
+        f = f.mul(&fw.prime.pow(u64::from(fw.exp)));
     }
     f
 }
@@ -567,7 +567,7 @@ fn verify_n_minus_1(n: &Int, factors: &[FactorWitness], cofactor: &Int, bound: B
             }
         }
         // q^exp must actually divide n − 1 to the claimed multiplicity.
-        let qe = fw.prime.pow(fw.exp);
+        let qe = fw.prime.pow(u64::from(fw.exp));
         if !qe.divides(&m) {
             return false;
         }

@@ -54,7 +54,7 @@ impl Dyadic {
         if t > 0 {
             // n = m·2^t (m odd): n·2^-k = m·2^-(k - t).
             Dyadic {
-                numerator: n.div_2k_trunc(t),
+                numerator: n.div_2k_trunc(u64::from(t)),
                 scale: k - t as i64,
             }
         } else {
@@ -134,8 +134,8 @@ impl Dyadic {
     /// at that scale and the scale.
     fn aligned(&self, other: &Dyadic) -> (Int, Int, i64) {
         let smax = self.scale.max(other.scale);
-        let a = self.numerator.mul_2k((smax - self.scale) as u32);
-        let b = other.numerator.mul_2k((smax - other.scale) as u32);
+        let a = self.numerator.mul_2k((smax - self.scale) as u64);
+        let b = other.numerator.mul_2k((smax - other.scale) as u64);
         (a, b, smax)
     }
 
@@ -166,25 +166,25 @@ impl Dyadic {
         if exp == 0 {
             return Dyadic::one();
         }
-        Dyadic::new(self.numerator.pow(exp), self.scale * exp as i64)
+        Dyadic::new(self.numerator.pow(u64::from(exp)), self.scale * exp as i64)
     }
 
     /// Returns the greatest integer `<= self`.
     pub fn floor(&self) -> Int {
         if self.scale <= 0 {
-            self.numerator.mul_2k((-self.scale) as u32)
+            self.numerator.mul_2k((-self.scale) as u64)
         } else {
             self.numerator
-                .div_floor(&Int::ONE.mul_2k(self.scale as u32))
+                .div_floor(&Int::ONE.mul_2k(self.scale as u64))
         }
     }
 
     /// Returns `self` truncated toward zero as an integer.
     pub fn trunc(&self) -> Int {
         if self.scale <= 0 {
-            self.numerator.mul_2k((-self.scale) as u32)
+            self.numerator.mul_2k((-self.scale) as u64)
         } else {
-            self.numerator.div_2k_trunc(self.scale as u32)
+            self.numerator.div_2k_trunc(self.scale as u64)
         }
     }
 }
@@ -310,9 +310,9 @@ impl Dyadic {
     pub fn to_rational(&self) -> crate::rational::Rational {
         use crate::rational::Rational;
         if self.scale <= 0 {
-            Rational::from_integer(self.numerator.mul_2k((-self.scale) as u32))
+            Rational::from_integer(self.numerator.mul_2k((-self.scale) as u64))
         } else {
-            Rational::new(self.numerator.clone(), Int::ONE.mul_2k(self.scale as u32))
+            Rational::new(self.numerator.clone(), Int::ONE.mul_2k(self.scale as u64))
         }
     }
 

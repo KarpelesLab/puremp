@@ -94,13 +94,13 @@ impl Rational {
     pub fn power_of_two(k: i32) -> Rational {
         if k >= 0 {
             Rational {
-                num: Int::ONE.mul_2k(k as u32),
+                num: Int::ONE.mul_2k(k as u64),
                 den: Int::ONE,
             }
         } else {
             Rational {
                 num: Int::ONE,
-                den: Int::ONE.mul_2k((-(k as i64)) as u32),
+                den: Int::ONE.mul_2k((-(k as i64)) as u64),
             }
         }
     }
@@ -313,11 +313,11 @@ impl Rational {
     /// `0` to a negative power.
     pub fn pow(&self, n: i32) -> Rational {
         if n >= 0 {
-            Rational::normalize(self.num.pow(n as u32), self.den.pow(n as u32))
+            Rational::normalize(self.num.pow(n as u64), self.den.pow(n as u64))
         } else {
             assert!(!self.is_zero(), "Rational::pow: zero to a negative power");
             let m = n.unsigned_abs();
-            Rational::normalize(self.den.pow(m), self.num.pow(m))
+            Rational::normalize(self.den.pow(u64::from(m)), self.num.pow(u64::from(m)))
         }
     }
 

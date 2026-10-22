@@ -619,7 +619,7 @@ impl Float {
                     Rational::from_integer(Int::from_sign_magnitude(sign, sig.shl(*exp as u64)))
                 } else {
                     let num = Int::from_sign_magnitude(sign, sig.clone());
-                    let den = Int::ONE.mul_2k((-exp) as u32);
+                    let den = Int::ONE.mul_2k((-exp) as u64);
                     Rational::new(num, den)
                 })
             }
@@ -690,7 +690,7 @@ impl Float {
         // Try 1, 2, 3, … significant digits until the string round-trips.
         let max_digits = (self.precision as usize) / 3 + 4;
         for d in 1..=max_digits {
-            let scale = Rational::from(Int::from_i64(10).pow((d - 1) as u32));
+            let scale = Rational::from(Int::from_i64(10).pow((d - 1) as u64));
             let scaled = v.mul(&scale);
             // Round half-up to the nearest integer.
             let m = scaled.add(&Rational::power_of_two(-1)).floor();
@@ -2075,7 +2075,7 @@ pub(crate) fn ln2_embedded(w: u64) -> Option<Float> {
 /// for the multi-prime `exp` fast path's inner rounding.
 pub(crate) fn round_ratio(num: &Int, den: &Int, exp2: i64, w: u64, mode: RoundingMode) -> Float {
     let g = w as i64 + 32; // guard bits below the rounding position
-    let q = num.mul_2k(g as u32).div_floor(den).magnitude();
+    let q = num.mul_2k(g as u64).div_floor(den).magnitude();
     Float::round_raw(false, q, exp2 - g, w, mode).0
 }
 
@@ -2097,7 +2097,7 @@ pub(crate) fn round_const_bits(sig: &[u64], total_bits: u64, w: u64) -> Float {
 fn gamma_series_at(w: u64) -> Float {
     let n = w + 32;
     let bign = (n as i64) * 185 / 1024 + 8; // ≈ 0.18·n, so 4N > n·ln2
-    let scale = Int::ONE.mul_2k(n as u32); // 2ⁿ
+    let scale = Int::ONE.mul_2k(n); // 2ⁿ
     let n2 = Int::from_i64(bign * bign);
     let mut t = scale.clone(); // T₀ = (N⁰/0!)²·2ⁿ = 2ⁿ
     let mut b = t.clone(); // B·2ⁿ
@@ -2113,7 +2113,7 @@ fn gamma_series_at(w: u64) -> Float {
         hs = hs.add(&scale.div_trunc(&Int::from_i64(k)));
         b = b.add(&t);
         // A·2ⁿ += Tₖ·Hₖ = (Tₖ·2ⁿ)·(Hₖ·2ⁿ)/2ⁿ / 2ⁿ.
-        a = a.add(&t.mul(&hs).div_2k_trunc(n as u32));
+        a = a.add(&t.mul(&hs).div_2k_trunc(n));
         k += 1;
     }
     let af = Float::round_raw(false, a.magnitude(), -(n as i64), n, NEAR).0;
@@ -2127,7 +2127,7 @@ fn gamma_series_at(w: u64) -> Float {
 /// Superseded by [`catalan_bsplit_at`]; kept as its differential reference.
 fn catalan_series_at(w: u64) -> Float {
     let n = w + 32;
-    let mut term = Int::ONE.mul_2k(n as u32); // k=0: 1·2ⁿ
+    let mut term = Int::ONE.mul_2k(n); // k=0: 1·2ⁿ
     let mut sum = term.clone();
     let mut k = 1i64;
     loop {
@@ -2495,14 +2495,11 @@ const EXP_RECT_THRESHOLD: u64 = 1536;
 /// `exp(R/2^n) · 2^n` as a scaled integer, term by term: per term one small
 /// multiplication and one single-limb division. `R = rs` may be negative.
 fn exp_taylor_sum_simple(rs: &Int, n: u64) -> Int {
-    let mut sum = Int::ONE.mul_2k(n as u32);
+    let mut sum = Int::ONE.mul_2k(n);
     let mut term = sum.clone();
     let mut kk: i64 = 1;
     loop {
-        term = term
-            .mul(rs)
-            .div_2k_trunc(n as u32)
-            .div_trunc(&Int::from_i64(kk));
+        term = term.mul(rs).div_2k_trunc(n).div_trunc(&Int::from_i64(kk));
         if term.is_zero() {
             break;
         }
@@ -2518,7 +2515,7 @@ fn exp_taylor_sum_simple(rs: &Int, n: u64) -> Int {
 fn exp_taylor_sum_rect(rs: &Int, n: u64) -> Int {
     let zmag = rs.magnitude();
     if zmag.is_zero() {
-        return Int::ONE.mul_2k(n as u32); // exp(0) = 1
+        return Int::ONE.mul_2k(n); // exp(0) = 1
     }
     let t = series_term_count(&zmag, n, |_| 1, |k| k);
     let c = rect_block_width(t);
@@ -2560,7 +2557,7 @@ fn exp_at(x: &Float, w: u64) -> Float {
     // Undo the argument halvings: exp(r) = exp(r/2^j)^(2^j). The sum stays
     // near 2^n (r is tiny), so each squaring is one n-bit multiply.
     for _ in 0..j {
-        sum = sum.square().div_2k_trunc(n as u32);
+        sum = sum.square().div_2k_trunc(n);
     }
     debug_assert!(sum.is_positive(), "exp series sum must stay positive");
     Float::round_raw(false, sum.magnitude(), -(n as i64), n, NEAR)
@@ -3367,7 +3364,7 @@ fn bessel_series_at(n: u64, x: &Float, w: u64, alternating: bool) -> Float {
     // h2 = (x/2)² scaled by 2^{ns} (always non-negative).
     let half = x.scale_pow2(-1);
     let hs = scaled_int(&half, ns as i64);
-    let h2 = hs.square().div_2k_trunc(ns as u32); // (x/2)² · 2^{ns}
+    let h2 = hs.square().div_2k_trunc(ns); // (x/2)² · 2^{ns}
     // U = Σ_{m≥0} (∓1)ᵐ cₘ, c₀ = 1, cₘ = cₘ₋₁·(x/2)²/(m(m+n)), scaled by 2^{ns}.
     // High precision evaluates the bracket by O(√T) rectangular splitting; the
     // cheap term-by-term recurrence wins below the crossover.
@@ -3387,14 +3384,14 @@ fn bessel_series_at(n: u64, x: &Float, w: u64, alternating: bool) -> Float {
 /// carried in the signed [`Int`] accumulator (`sub` on odd `m` for the `J` case),
 /// so the partial sums may go negative — hence [`Int`], not [`Nat`].
 fn bessel_bracket_simple(n: u64, h2: &Int, ns: u64, alternating: bool) -> Int {
-    let scale = Int::ONE.mul_2k(ns as u32);
+    let scale = Int::ONE.mul_2k(ns);
     let mut c = scale.clone();
     let mut sum = scale.clone();
     let mut m = 1u64;
     loop {
         // divisor = m·(m+n).
         let divisor = Int::from_u128(m as u128 * (m as u128 + n as u128));
-        c = c.mul(h2).div_2k_trunc(ns as u32).div_trunc(&divisor);
+        c = c.mul(h2).div_2k_trunc(ns).div_trunc(&divisor);
         if c.is_zero() {
             break;
         }
@@ -3420,7 +3417,7 @@ fn bessel_bracket_rect(n: u64, h2: &Int, ns: u64, alternating: bool) -> Int {
     let z = h2.magnitude();
     if z.is_zero() {
         // (x/2)² underflowed the working scale: U collapses to its first term, 1.
-        return Int::ONE.mul_2k(ns as u32);
+        return Int::ONE.mul_2k(ns);
     }
     // q(j) = j(j+n), computed in u128 and saturated so an astronomically large
     // (never-reached) index cannot overflow; the term is long dead by then.
@@ -4339,7 +4336,7 @@ mod transc_rect_tests {
             let ns = w + x_guard + 64;
             let half = x.scale_pow2(-1);
             let hs = scaled_int(&half, ns as i64);
-            let h2 = hs.square().div_2k_trunc(ns as u32);
+            let h2 = hs.square().div_2k_trunc(ns);
             let sum = if rect {
                 bessel_bracket_rect(order, &h2, ns, alternating)
             } else {
@@ -4632,9 +4629,7 @@ mod transc_rect_tests {
                 let ns = w + ax + 64;
                 let x = iflt(xi, ns);
                 let half = x.scale_pow2(-1);
-                let h2 = scaled_int(&half, ns as i64)
-                    .square()
-                    .div_2k_trunc(ns as u32);
+                let h2 = scaled_int(&half, ns as i64).square().div_2k_trunc(ns);
                 let ts = t(iters, || {
                     std::hint::black_box(bessel_bracket_simple(order, &h2, ns, alternating));
                 });

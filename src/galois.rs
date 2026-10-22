@@ -160,7 +160,7 @@ fn poly_powmod(base: &[Int], e: &Int, modulus: &[Int], p: &Int) -> Vec<Int> {
     let mut result = poly_rem(&[Int::ONE], modulus, p);
     let mut b = poly_rem(base, modulus, p);
     for i in 0..e.bit_len() {
-        if e.bit(i) {
+        if e.bit(u64::from(i)) {
             result = poly_rem(&poly_mul(&result, &b, p), modulus, p);
         }
         b = poly_rem(&poly_mul(&b, &b, p), modulus, p);
@@ -461,7 +461,7 @@ impl GaloisField {
     /// The field order `pᵏ` (the number of elements).
     #[inline]
     pub fn order(&self) -> Int {
-        self.data.p.pow(self.data.k as u32)
+        self.data.p.pow(self.data.k as u64)
     }
 
     /// The modulus polynomial coefficients, low-to-high (length `k+1`, monic).
@@ -668,7 +668,7 @@ impl GfElement {
         };
         let mut base = self.clone();
         for i in 0..exp.bit_len() {
-            if exp.bit(i) {
+            if exp.bit(u64::from(i)) {
                 result = result.mul(&base);
             }
             base = base.mul(&base);

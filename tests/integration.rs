@@ -467,9 +467,9 @@ fn power_of_two_ops() {
     // mod_2k == rem_euclid(2^k), always non-negative
     for k in 0u32..12 {
         let m = Int::from_i64(1i64 << k);
-        assert_eq!(x.mod_2k(k), x.rem_euclid(&m), "mod_2k {k}");
+        assert_eq!(x.mod_2k(u64::from(k)), x.rem_euclid(&m), "mod_2k {k}");
         assert_eq!(
-            int("-12345").mod_2k(k),
+            int("-12345").mod_2k(u64::from(k)),
             int("-12345").rem_euclid(&m),
             "neg mod_2k {k}"
         );
@@ -703,7 +703,9 @@ fn square_matches_mul() {
     // Squaring must agree with the general multiply across sizes (schoolbook and
     // Karatsuba squaring paths), including a value that crosses the threshold.
     for e in [1u32, 5, 50, 400, 900] {
-        let x = Int::from_i64(7).pow(e).add(&Int::from_i64(123456789));
+        let x = Int::from_i64(7)
+            .pow(u64::from(e))
+            .add(&Int::from_i64(123456789));
         assert_eq!(x.square(), x.mul(&x), "7^{e}+c squared");
         let nx = x.neg();
         assert_eq!(nx.square(), nx.mul(&nx), "negative squared is positive");
@@ -1290,8 +1292,8 @@ fn division_large_divisors_padded_bz() {
     // including odd limb counts (which drive the power-of-two block padding).
     // Verify q·b + r == a and r < b against an independent construction.
     for bits in [17000u32, 20000, 24000, 30000, 40000, 64000] {
-        let b = int("7").pow(bits / 3).add(&int("1")); // irregular, ~bits/3·2.8 bits
-        let q_ref = int("11").pow(bits / 4).add(&int("999999"));
+        let b = int("7").pow(u64::from(bits / 3)).add(&int("1")); // irregular, ~bits/3·2.8 bits
+        let q_ref = int("11").pow(u64::from(bits / 4)).add(&int("999999"));
         let r_ref = int("123456789012345678901234567890"); // < b for these sizes
         let a = q_ref.mul(&b).add(&r_ref);
         let (q, r) = a.div_rem(&b).unwrap();
@@ -1340,7 +1342,7 @@ fn modpow_windowed_vs_reference() {
     // Exponents of every bit length 1..80 (window-boundary stress).
     let (b, m) = (int("6"), int("1000000007"));
     for k in 1..80u32 {
-        let e = int("2").pow(k).sub(&int("1")); // k ones
+        let e = int("2").pow(u64::from(k)).sub(&int("1")); // k ones
         assert_eq!(
             b.modpow(&e, &m),
             ref_modpow(b.clone(), &e, &m),
@@ -1354,7 +1356,7 @@ fn square_matches_mul_across_ladder() {
     // square() must equal mul-by-self at every size that crosses a ladder tier
     // (schoolbook / Karatsuba / Toom-3 / Toom-4).
     for limbs in [1usize, 40, 160, 260, 460, 900, 2000] {
-        let x = int("7").pow((limbs * 64 / 3) as u32).magnitude();
+        let x = int("7").pow((limbs * 64 / 3) as u64).magnitude();
         let y = x.add(&Nat::zero()); // distinct object, equal value
         // mul(&y) still routes to square via the limbs== check, so cross-check
         // against a genuinely different multiply: x*(x-1)+x == x*x.

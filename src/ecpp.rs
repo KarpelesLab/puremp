@@ -193,7 +193,7 @@ fn ec_mul(a: &ModInt, p: &Pt, scalar: &Int) -> EcResult {
     while i > 0 {
         i -= 1;
         acc = ec_double(a, &acc)?;
-        if scalar.bit(i) {
+        if scalar.bit(u64::from(i)) {
             acc = ec_add(a, &acc, p)?;
         }
     }
@@ -376,7 +376,7 @@ fn poly_powmod(
     let mut i = 0u32;
     let bits = e.bit_len();
     while i < bits {
-        if e.bit(i) {
+        if e.bit(u64::from(i)) {
             result = result.mul(&b).rem(modulus);
         }
         i += 1;

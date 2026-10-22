@@ -292,7 +292,7 @@ fn squarefree_decompose(m: &Int) -> (Int, Int) {
             d = d.mul(&p);
         }
         if e / 2 > 0 {
-            f = f.mul(&p.pow(e / 2));
+            f = f.mul(&p.pow(u64::from(e / 2)));
         }
     }
     (d, f)

@@ -782,7 +782,7 @@ impl Order {
             let mut result = one_b.clone();
             let mut base = x.to_vec();
             for i in 0..e.bit_len() {
-                if e.bit(i) {
+                if e.bit(u64::from(i)) {
                     result = bmul(&result, &base);
                 }
                 base = bmul(&base, &base);
@@ -1262,7 +1262,7 @@ impl PrimeIdeal {
 
     /// The norm `N(𝔭) = p^f`.
     pub fn norm(&self) -> Int {
-        self.p.pow(self.f as u32)
+        self.p.pow(self.f as u64)
     }
 }
 
@@ -1427,9 +1427,9 @@ mod tests {
         // ∏ N(𝔭ᵢ)^{eᵢ} = pⁿ.
         let mut prod = Int::ONE;
         for (pr, e) in &facs {
-            prod = prod.mul(&pr.norm().pow(*e as u32));
+            prod = prod.mul(&pr.norm().pow(*e as u64));
         }
-        assert_eq!(prod, p.pow(n as u32), "∏ N(𝔭)^e = pⁿ for p={p}");
+        assert_eq!(prod, p.pow(n as u64), "∏ N(𝔭)^e = pⁿ for p={p}");
         // Each 𝔭ᵢ has norm p^{fᵢ}.
         for (pr, _) in &facs {
             assert_eq!(pr.ideal().norm(), pr.norm());

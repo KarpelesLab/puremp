@@ -676,7 +676,7 @@ fn bz_div_3n_2n(a: &Nat, b: &Nat, half: usize) -> (Nat, Nat) {
 
     // R = R·2^(64·half) + A3 − q·B2, corrected to be non-negative.
     let mut r_int = r_pre
-        .mul_2k(hbits as u32)
+        .mul_2k(hbits)
         .add(&Int::from(a3))
         .sub(&Int::from(q_nat.mul(&b2)));
     let mut q_int = Int::from(q_nat);
@@ -1540,8 +1540,8 @@ fn hgcd_base(m: &Nat, n: &Nat, h: u64) -> (HgcdMat, Nat, Nat) {
 /// computed, halving the multiplication size versus a full matrix–vector apply.
 fn hgcd_apply_split(child: &HgcdMat, px: &Nat, py: &Nat, xl: &Int, yl: &Int, k: u64) -> (Int, Int) {
     let (lo0, lo1) = child.mul_vec(xl, yl);
-    let hi0 = Int::from(px.clone()).mul_2k(k as u32);
-    let hi1 = Int::from(py.clone()).mul_2k(k as u32);
+    let hi0 = Int::from(px.clone()).mul_2k(k);
+    let hi1 = Int::from(py.clone()).mul_2k(k);
     (hi0.add(&lo0), hi1.add(&lo1))
 }
 

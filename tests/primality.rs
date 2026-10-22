@@ -21,7 +21,7 @@ fn n(s: &str) -> Int {
 
 /// `2^k − 1`.
 fn mersenne(k: u32) -> Int {
-    Int::from(2).pow(k).sub(&Int::ONE)
+    Int::from(2).pow(u64::from(k)).sub(&Int::ONE)
 }
 
 /// Assert `x` is proved prime and its certificate re-verifies.

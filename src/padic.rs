@@ -120,7 +120,7 @@ impl Padic {
             return Padic::zero_with(p, precision);
         }
         let (v, cof) = split_val(n, &p);
-        let modulus = p.pow(precision as u32);
+        let modulus = p.pow(precision as u64);
         let unit = cof.rem_euclid(&modulus);
         Padic {
             p,
@@ -146,7 +146,7 @@ impl Padic {
         let (va, ac) = split_val(r.numerator().clone(), &p);
         let (vb, bc) = split_val(r.denominator().clone(), &p);
         let v = va - vb;
-        let modulus = p.pow(precision as u32);
+        let modulus = p.pow(precision as u64);
         let binv = bc
             .rem_euclid(&modulus)
             .modinv(&modulus)
@@ -201,9 +201,9 @@ impl Padic {
             return Rational::ZERO;
         }
         if self.val >= 0 {
-            Rational::new(Int::ONE, self.p.pow(self.val as u32))
+            Rational::new(Int::ONE, self.p.pow(self.val as u64))
         } else {
-            Rational::from_integer(self.p.pow((-self.val) as u32))
+            Rational::from_integer(self.p.pow((-self.val) as u64))
         }
     }
 
@@ -239,7 +239,7 @@ impl Padic {
         if rel <= 0 {
             return Padic::zero_with(self.p.clone(), a);
         }
-        let modulus = self.p.pow(rel as u32);
+        let modulus = self.p.pow(rel as u64);
         Padic {
             p: self.p.clone(),
             val: self.val,
@@ -255,7 +255,7 @@ impl Padic {
         if rel <= 0 {
             return Padic::zero_with(p, aprec);
         }
-        let modulus = p.pow(rel as u32);
+        let modulus = p.pow(rel as u64);
         let cr = c.rem_euclid(&modulus);
         if cr.is_zero() {
             return Padic::zero_with(p, aprec);
@@ -263,7 +263,7 @@ impl Padic {
         let (t, unit_full) = split_val(cr, &p);
         // unit_full is coprime to p and already in [0, p^rel); reduce to the
         // now-shorter unit window for good measure.
-        let unit_mod = p.pow((rel - t) as u32);
+        let unit_mod = p.pow((rel - t) as u64);
         let unit = unit_full.rem_euclid(&unit_mod);
         Padic {
             p,
@@ -284,7 +284,7 @@ impl Padic {
             return self.clone();
         }
         let rel = self.abs_prec - self.val;
-        let modulus = self.p.pow(rel as u32);
+        let modulus = self.p.pow(rel as u64);
         Padic {
             p: self.p.clone(),
             val: self.val,
@@ -304,8 +304,8 @@ impl Padic {
             return self.reduce_to_abs(a);
         }
         let vmin = self.val.min(rhs.val);
-        let c1 = self.unit.mul(&self.p.pow((self.val - vmin) as u32));
-        let c2 = rhs.unit.mul(&rhs.p.pow((rhs.val - vmin) as u32));
+        let c1 = self.unit.mul(&self.p.pow((self.val - vmin) as u64));
+        let c2 = rhs.unit.mul(&rhs.p.pow((rhs.val - vmin) as u64));
         Padic::normalize(self.p.clone(), vmin, c1.add(&c2), a)
     }
 
@@ -325,7 +325,7 @@ impl Padic {
         }
         let v = self.val + rhs.val;
         let rel = (self.abs_prec - self.val).min(rhs.abs_prec - rhs.val);
-        let modulus = self.p.pow(rel as u32);
+        let modulus = self.p.pow(rel as u64);
         let unit = self.unit.mul(&rhs.unit).rem_euclid(&modulus);
         Padic {
             p: self.p.clone(),
@@ -347,7 +347,7 @@ impl Padic {
         }
         let v = self.val - rhs.val;
         let rel = (self.abs_prec - self.val).min(rhs.abs_prec - rhs.val);
-        let modulus = self.p.pow(rel as u32);
+        let modulus = self.p.pow(rel as u64);
         let inv = rhs
             .unit
             .modinv(&modulus)
@@ -377,9 +377,9 @@ impl Padic {
             return Rational::ZERO;
         }
         if self.val >= 0 {
-            Rational::from_integer(self.unit.mul(&self.p.pow(self.val as u32)))
+            Rational::from_integer(self.unit.mul(&self.p.pow(self.val as u64)))
         } else {
-            Rational::new(self.unit.clone(), self.p.pow((-self.val) as u32))
+            Rational::new(self.unit.clone(), self.p.pow((-self.val) as u64))
         }
     }
 
@@ -422,7 +422,7 @@ fn sqrt_unit_odd(p: &Int, u: &Int, rel: i64) -> Option<Int> {
     let mut k = 1i64;
     while k < rel {
         let k2 = (2 * k).min(rel);
-        let modulus = p.pow(k2 as u32);
+        let modulus = p.pow(k2 as u64);
         // Newton step: r ← r - (r² - u)·(2r)⁻¹  (mod p^{k2}).
         let two_r = r.add(&r).rem_euclid(&modulus);
         let inv = two_r
@@ -432,7 +432,7 @@ fn sqrt_unit_odd(p: &Int, u: &Int, rel: i64) -> Option<Int> {
         r = r.sub(&f.mul(&inv)).rem_euclid(&modulus);
         k = k2;
     }
-    let modulus = p.pow(rel as u32);
+    let modulus = p.pow(rel as u64);
     Some(r.rem_euclid(&modulus))
 }
 
@@ -443,15 +443,15 @@ fn sqrt_unit_2adic(u: &Int, rel: i64) -> Option<Int> {
     // Seed at k = min(rel, 3): every square unit is ≡ 1 (mod 8), so r = 1 works
     // provided u already matches to that depth.
     let m0 = rel.min(3);
-    let seed_mod = two.pow(m0 as u32);
+    let seed_mod = two.pow(m0 as u64);
     if !u.sub(&Int::ONE).rem_euclid(&seed_mod).is_zero() {
         return None; // u ≢ 1 (mod 2^m0): not a square this far.
     }
     let mut r = Int::ONE;
     let mut k = m0;
     while k < rel {
-        let mod_next = two.pow((k + 1) as u32);
-        let bit = two.pow((k - 1) as u32);
+        let mod_next = two.pow((k + 1) as u64);
+        let bit = two.pow((k - 1) as u64);
         // Try r and r + 2^{k-1}; keep whichever squares to u mod 2^{k+1}.
         let cand2 = r.add(&bit);
         if r.mul(&r).sub(u).rem_euclid(&mod_next).is_zero() {
@@ -463,7 +463,7 @@ fn sqrt_unit_2adic(u: &Int, rel: i64) -> Option<Int> {
         }
         k += 1;
     }
-    let modulus = two.pow(rel as u32);
+    let modulus = two.pow(rel as u64);
     Some(r.rem_euclid(&modulus))
 }
 

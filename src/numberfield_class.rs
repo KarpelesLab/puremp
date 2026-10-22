@@ -178,7 +178,7 @@ fn minkowski_bound(order: &Order) -> Int {
 
     // n!/nⁿ: numerator up, denominator down.
     let nfact = Float::from_int(&Int::factorial(n as u64), PREC, up);
-    let nn = Float::from_int(&Int::from_i64(n as i64).pow(n as u32), PREC, down);
+    let nn = Float::from_int(&Int::from_i64(n as i64).pow(n as u64), PREC, down);
     let ratio = nfact.div(&nn, PREC, up);
 
     // √|d_K|, rounded up.
@@ -259,7 +259,7 @@ fn factor_over_fb(
             let v = ideal_valuation(order, ideal, pi.ideal(), bound);
             if v > 0 {
                 rel[i] = Int::from_i64(v as i64);
-                check = check.mul(&q.pow((f * v) as u32));
+                check = check.mul(&q.pow((f * v) as u64));
             }
         }
     }
@@ -308,7 +308,7 @@ impl Embedder {
                 cplx_idx.push(i);
             }
         }
-        let scale_int = Int::from_i64(2).pow(SCALE);
+        let scale_int = Int::from_i64(2).pow(u64::from(SCALE));
         let scale = Float::from_int(&scale_int, PREC, RoundingMode::Nearest);
         let sqrt2 = Float::from_int(&Int::from_i64(2), PREC, RoundingMode::Nearest)
             .sqrt(PREC, RoundingMode::Nearest);

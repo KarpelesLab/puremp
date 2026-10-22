@@ -37,8 +37,8 @@ fn main() {
     // ---- integer multiplication at a range of sizes ----
     println!("== multiplication ==");
     for &bits in &[1_000u32, 10_000, 100_000] {
-        let a = Int::from_i64(7).pow(bits / 3);
-        let b = Int::from_i64(5).pow(bits / 3);
+        let a = Int::from_i64(7).pow(u64::from(bits / 3));
+        let b = Int::from_i64(5).pow(u64::from(bits / 3));
         let iters = if bits <= 10_000 { 500 } else { 20 };
         bench(&format!("mul ~{}k-bit", bits / 1000), iters, || a.mul(&b));
     }
@@ -46,9 +46,9 @@ fn main() {
     // ---- division at a range of sizes (2n / n) ----
     println!("== division (Knuth-D / Burnikel–Ziegler) ==");
     for &bits in &[1_000u32, 10_000, 100_000] {
-        let d = Int::from_i64(7).pow(bits / 3);
+        let d = Int::from_i64(7).pow(u64::from(bits / 3));
         let num = d
-            .mul(&Int::from_i64(5).pow(bits / 3))
+            .mul(&Int::from_i64(5).pow(u64::from(bits / 3)))
             .add(&Int::from_i64(123));
         let iters = if bits <= 10_000 { 300 } else { 10 };
         bench(

@@ -7,6 +7,12 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+### Changed
+
+- **breaking** *(int)* `Int::pow`, `Int::mul_2k`, `Int::div_2k_trunc`,
+  `Int::mod_2k` and `Int::bit` take a `u64` (was `u32`), matching `Nat`'s
+  bit-index and shift widths
+
 ### Fixed
 
 - *(nat)* the Goldilocks NTT multiply no longer picks an unsupported transform

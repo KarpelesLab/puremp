@@ -47,7 +47,7 @@ pub struct Decimal {
 
 /// Returns `10^n` as an [`Int`].
 fn pow10(n: u32) -> Int {
-    Int::from_i64(10).pow(n)
+    Int::from_i64(10).pow(u64::from(n))
 }
 
 /// `10^e` as an `f64` by repeated squaring (no `powi`, so it works in `no_std`).

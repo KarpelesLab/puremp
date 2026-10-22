@@ -78,10 +78,10 @@ impl Int {
                 match e {
                     1 => Int::ONE,
                     2 => Int::from(2),
-                    _ => Int::ONE.mul_2k(e - 2),
+                    _ => Int::ONE.mul_2k(u64::from(e - 2)),
                 }
             } else {
-                p.pow(e - 1).mul(&p.sub(&Int::ONE))
+                p.pow(u64::from(e - 1)).mul(&p.sub(&Int::ONE))
             };
             lambda = lambda.lcm(&l);
         }
@@ -208,7 +208,7 @@ fn least_primitive_root(n: &Int) -> Option<(Int, Int)> {
     };
     // φ(pᵉ) = φ(2pᵉ) = pᵉ⁻¹·(p−1): its primes are those of p−1, plus p if e ≥ 2.
     let pm1 = p.sub(&Int::ONE);
-    let phi = p.pow(e - 1).mul(&pm1);
+    let phi = p.pow(u64::from(e - 1)).mul(&pm1);
     let mut qs: Vec<Int> = pm1.factor_exponents().into_iter().map(|(q, _)| q).collect();
     if e >= 2 {
         qs.push(p);
@@ -274,7 +274,7 @@ impl TotientTable {
                 let a = (rest % (*e as usize + 1)) as u32;
                 rest /= *e as usize + 1;
                 vecv[t] = a;
-                d = d.mul(&q.pow(a));
+                d = d.mul(&q.pow(u64::from(a)));
             }
             let p = d.add(&Int::ONE);
             if !p.is_prime_bpsw() {
@@ -353,7 +353,7 @@ impl TotientTable {
                 }
                 let rest = idx - off;
                 if self.reachable(i, rest) {
-                    let next = acc.mul(&c.p.pow(*k));
+                    let next = acc.mul(&c.p.pow(u64::from(*k)));
                     self.enumerate(rest, i, &next, out);
                 }
             }

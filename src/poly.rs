@@ -698,7 +698,7 @@ pub(crate) fn kronecker_pack(coeffs: &[Int], k: u32) -> Int {
                 .checked_mul(mid as u64)
                 .and_then(|s| u32::try_from(s).ok())
                 .expect("kronecker_pack: shift exceeds 2³² bits");
-            lo.add(&hi.mul_2k(shift))
+            lo.add(&hi.mul_2k(u64::from(shift)))
         }
     }
 }
@@ -715,8 +715,8 @@ pub(crate) fn kronecker_unpack(n: &Int, k: u32, num: usize) -> Vec<Int> {
         .checked_mul(mid as u64)
         .and_then(|s| u32::try_from(s).ok())
         .expect("kronecker_unpack: shift exceeds 2³² bits");
-    let lo = n.mod_2k(bits);
-    let hi = n.div_2k_trunc(bits);
+    let lo = n.mod_2k(u64::from(bits));
+    let hi = n.div_2k_trunc(u64::from(bits));
     let mut out = kronecker_unpack(&lo, k, mid);
     out.extend(kronecker_unpack(&hi, k, num - mid));
     out
@@ -746,9 +746,9 @@ fn kronecker_convolve(a: &[Int], b: &[Int]) -> Vec<Int> {
     // Bias by `B` per slot: `D = B · (1 + 2ᵏ + … + 2^{k(num−1)})`, so `prod + D`
     // has every digit in `(0, 2ᵏ)` and is non-negative.
     let repunit = kronecker_pack(&alloc::vec![Int::ONE; num], k);
-    let bias = repunit.mul_2k(k - 1); // ·B
+    let bias = repunit.mul_2k(u64::from(k - 1)); // ·B
     let shifted = prod.add(&bias);
-    let b_off = Int::ONE.mul_2k(k - 1); // = B
+    let b_off = Int::ONE.mul_2k(u64::from(k - 1)); // = B
     kronecker_unpack(&shifted, k, num)
         .into_iter()
         .map(|d| d.sub(&b_off))
@@ -1144,7 +1144,7 @@ fn ip_sturm_chain(
         };
         let flip = -pow_sign < 0; // true ⇒ negate to get the positive multiple
         // Subresultant magnitude denominator g·h^δ (exact divisor of praw).
-        let denom = g.mul(&h.pow(e as u32));
+        let denom = g.mul(&h.pow(e as u64));
         let mut next: alloc::vec::Vec<Int> = praw.iter().map(|c| c.div_exact(&denom)).collect();
         if flip {
             for c in next.iter_mut() {
@@ -1157,7 +1157,7 @@ fn ip_sturm_chain(
         h = if e == 0 {
             h
         } else {
-            new_g.pow(e as u32).div_exact(&h.pow((e - 1) as u32))
+            new_g.pow(e as u64).div_exact(&h.pow((e - 1) as u64))
         };
         g = new_g;
         chain.push(ip_trim(next));
@@ -1195,14 +1195,14 @@ fn ip_subresultant_gcd(
             Some(0) => return alloc::vec![Int::ONE], // constant remainder: coprime
             Some(_) => {}
         }
-        let denom = g.mul(&h.pow(e as u32));
+        let denom = g.mul(&h.pow(e as u64));
         let next: alloc::vec::Vec<Int> = r.iter().map(|c| c.div_exact(&denom)).collect();
         // Cohen 3.3.1: after A←B, g ← lc(A) = lc(old divisor b).
         let new_g = ip_lead(&b).clone();
         h = if e == 0 {
             h
         } else {
-            new_g.pow(e as u32).div_exact(&h.pow((e - 1) as u32))
+            new_g.pow(e as u64).div_exact(&h.pow((e - 1) as u64))
         };
         g = new_g;
         a = b;

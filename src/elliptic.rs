@@ -537,7 +537,7 @@ impl<F: Field> Point<F> {
             while i > 0 {
                 i -= 1;
                 acc = acc.double();
-                if mag.bit(i) {
+                if mag.bit(u64::from(i)) {
                     acc = acc.add(&base);
                 }
             }
@@ -554,7 +554,7 @@ impl<F: Field> Point<F> {
             while i > 0 {
                 i -= 1;
                 acc = self.curve.jac_double(&acc);
-                if mag.bit(i) {
+                if mag.bit(u64::from(i)) {
                     acc = self.curve.jac_add(&acc, &base);
                 }
             }
@@ -815,7 +815,7 @@ fn poly_powmod(base: &Poly<ModInt>, exp: &Int, h: &Poly<ModInt>, one: &ModInt) -
     let mut b = base.rem(h);
     let bits = exp.bit_len();
     for i in 0..bits {
-        if exp.bit(i) {
+        if exp.bit(u64::from(i)) {
             result = poly_mulmod(&result, &b, h);
         }
         if i + 1 < bits {

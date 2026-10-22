@@ -54,7 +54,7 @@ fn assert_tiny(a: &[Int], xs: &[Float], tol: u64) {
         acc = acc.add(&Float::from_int(ai, PREC, M).mul(xi, PREC, M), PREC, M);
     }
     let bound = Float::from_int(&Int::ONE, PREC, M).div(
-        &Float::from_int(&Int::ONE.mul_2k(tol as u32), PREC, M),
+        &Float::from_int(&Int::ONE.mul_2k(tol), PREC, M),
         PREC,
         M,
     );

@@ -159,7 +159,7 @@ pub unsafe extern "C" fn puremp_int_pow(base: *const PurempInt, exp: u64) -> *mu
     };
     let r = catch_unwind(AssertUnwindSafe(|| {
         let x = unsafe { &(*base).0 };
-        to_handle(x.pow(exp))
+        to_handle(x.pow(u64::from(exp)))
     }));
     r.unwrap_or(ptr::null_mut())
 }

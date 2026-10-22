@@ -74,7 +74,7 @@ fn main() {
     println!("== Int: sweep entry size (n = 48) ==");
     println!("  showing the crossover; `mul` engages Strassen only ≥ ~1024 bits");
     for &digits in &[60u32, 150, 300, 600, 1200] {
-        let big = Int::from(10).pow(digits);
+        let big = Int::from(10).pow(u64::from(digits));
         let n = 48;
         let a = Matrix::new(n, n, (0..n * n).map(|_| rand_int(&mut r, &big)).collect());
         let b = Matrix::new(n, n, (0..n * n).map(|_| rand_int(&mut r, &big)).collect());

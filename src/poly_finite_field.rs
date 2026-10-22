@@ -50,7 +50,7 @@ fn field_pow<T: Ring>(base: &T, e: &Int) -> T {
     let mut result = base.one();
     let mut b = base.clone();
     for i in 0..e.bit_len() {
-        if e.bit(i) {
+        if e.bit(u64::from(i)) {
             result = result * b.clone();
         }
         let sq = b.clone() * b.clone();
@@ -68,7 +68,7 @@ fn poly_powmod<T: FiniteField>(base: &Poly<T>, e: &Int, modulus: &Poly<T>) -> Po
     let mut result = Poly::constant(one);
     let mut b = base.rem(modulus);
     for i in 0..e.bit_len() {
-        if e.bit(i) {
+        if e.bit(u64::from(i)) {
             result = result.mul(&b).rem(modulus);
         }
         b = b.mul(&b).rem(modulus);
@@ -233,7 +233,7 @@ fn equal_degree<T: FiniteField>(f: &Poly<T>, d: usize) -> Vec<Poly<T>> {
     let (exp_odd, trace_len) = if is_char2 {
         (Int::ZERO, log_p(&q, &p) * d)
     } else {
-        let half = q.pow(d as u32).sub(&Int::ONE).div_exact(&Int::from_u64(2));
+        let half = q.pow(d as u64).sub(&Int::ONE).div_exact(&Int::from_u64(2));
         (half, 0)
     };
 

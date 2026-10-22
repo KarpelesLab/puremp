@@ -238,7 +238,7 @@ mod relations {
         }
         // Lattice rows: row i = eᵢ (weight 1, keeps coefficients small) augmented
         // with round(2^scale · xᵢ) (weight 2^scale, drives the combination to 0).
-        let pow2 = Rational::from_integer(Int::ONE.mul_2k(scale_bits as u32));
+        let pow2 = Rational::from_integer(Int::ONE.mul_2k(scale_bits));
         let mut basis: Vec<Vec<Int>> = Vec::with_capacity(n);
         for (i, x) in xs.iter().enumerate() {
             let r = x.to_rational()?; // non-finite input → give up
@@ -436,10 +436,7 @@ mod relations {
 
         // Detection threshold ε = 2^-detect_bits.
         let eps = Float::from_rational(
-            &Rational::new(
-                Int::ONE,
-                Int::ONE.mul_2k(detect_bits.min(u32::MAX as u64) as u32),
-            ),
+            &Rational::new(Int::ONE, Int::ONE.mul_2k(detect_bits)),
             wp,
             m,
         );
@@ -734,7 +731,7 @@ mod tests {
     /// A "hard" basis whose exact-rational Gram–Schmidt coefficients explode:
     /// a knapsack-style lattice [ I | w·aᵢ ] with a large multiplier column.
     fn knapsack_basis(rng: &mut Rng, n: usize, weight_bits: u32) -> Vec<Vec<Int>> {
-        let w = Int::ONE.mul_2k(weight_bits);
+        let w = Int::ONE.mul_2k(u64::from(weight_bits));
         (0..n)
             .map(|i| {
                 let mut row = vec![Int::ZERO; n + 1];

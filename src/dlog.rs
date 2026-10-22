@@ -530,7 +530,7 @@ pub fn pohlig_hellman(base: &Int, target: &Int, modulus: &Int, order: &Int) -> O
         for j in 0..*e {
             // β_j = (h · g^{-xi})^{order / p^{j+1}} = γ^{a_j} lives in ⟨γ⟩.
             let stripped = mul_mod(&h, &g_inv.modpow(&xi, &m), &m);
-            let beta = stripped.modpow(&order.div_exact(&p.pow(j + 1)), &m);
+            let beta = stripped.modpow(&order.div_exact(&p.pow(u64::from(j + 1))), &m);
             // Solve the order-`p` sub-instance for the j-th digit a_j ∈ [0, p).
             let digit = discrete_log(&gamma, &beta, &m, p)?;
             xi = xi.add(&digit.mul(&pj));
@@ -776,7 +776,7 @@ mod bench {
     fn bench_bsgs_scalar_vs_mont() {
         let g = Int::from(2u64);
         for order_bits in [20u32, 30, 40] {
-            let order = Int::from(2u64).pow(order_bits);
+            let order = Int::from(2u64).pow(u64::from(order_bits));
             let m_steps = isqrt_ceil(&order.magnitude()).to_u64().unwrap();
             let m_step_int = Int::from(m_steps);
             for (name, p) in primes() {
@@ -809,7 +809,7 @@ mod bench {
     fn bench_rho_scalar_vs_mont() {
         let g = Int::from(2u64);
         for order_bits in [24u32, 30, 36] {
-            let order = Int::from(2u64).pow(order_bits);
+            let order = Int::from(2u64).pow(u64::from(order_bits));
             for (name, p) in primes() {
                 let x = Int::from(1234567u64).rem_euclid(&order);
                 let g_r = reduce(&g, &p);

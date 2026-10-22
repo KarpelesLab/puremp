@@ -373,7 +373,7 @@ fn form_square_search(coeffs: &[Int], u_max: u64, vs: &[u64]) -> Vec<(i64, u64, 
                     let ui = Int::from(u);
                     let mut acc = Int::ZERO;
                     for i in (0..=d).rev() {
-                        acc = acc.mul(&ui).add(&coeffs[i].mul(&v_int.pow((d - i) as u32)));
+                        acc = acc.mul(&ui).add(&coeffs[i].mul(&v_int.pow((d - i) as u64)));
                     }
                     acc.sqrt_exact()
                 };
@@ -644,9 +644,9 @@ fn cube_free_part(n: &Int) -> (Int, Int, Vec<(Int, u32)>) {
             e += 1;
             i += 1;
         }
-        m = m.mul(&p.pow(e / 3));
+        m = m.mul(&p.pow(u64::from(e / 3)));
         if !e.is_multiple_of(3) {
-            core = core.mul(&p.pow(e % 3));
+            core = core.mul(&p.pow(u64::from(e % 3)));
             primes.push((p, e % 3));
         }
     }
@@ -708,14 +708,14 @@ fn coverings(n: &Int, primes: &[(Int, u32)], max_primes: usize) -> Vec<Covering>
         let val = |ev: &[u32]| -> Int {
             ps.iter()
                 .zip(ev)
-                .fold(Int::ONE, |acc, ((p, _), &e)| acc.mul(&p.pow(e)))
+                .fold(Int::ONE, |acc, ((p, _), &e)| acc.mul(&p.pow(u64::from(e))))
         };
         let mut coeffs: [Int; 3] = core::array::from_fn(|j| val(&best[j]));
         coeffs.sort();
         // k³ = abc / n.
         let k = (0..ps.len()).fold(Int::ONE, |acc, i| {
             let s = best[0][i] + best[1][i] + best[2][i];
-            acc.mul(&ps[i].0.pow((s - n_exp[i]) / 3))
+            acc.mul(&ps[i].0.pow(u64::from((s - n_exp[i]) / 3)))
         });
         let [a, b, c] = coeffs;
         let direct = a.is_one() && b.is_one() && &c == n;
@@ -920,7 +920,7 @@ fn eisenstein_twists(primes: &[(Int, u32)], max_primes: usize) -> Vec<EisTwist> 
                     nexp += e;
                     has_three = true;
                 }
-                d = d.mul(&p.pow((a + 3 - nexp % 3) % 3));
+                d = d.mul(&p.pow(u64::from((a + 3 - nexp % 3) % 3)));
             }
             if !has_three && e == 1 {
                 d = d.mul(&three.square());

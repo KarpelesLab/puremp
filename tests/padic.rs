@@ -93,7 +93,7 @@ fn valuation_of_p_power_times_unit() {
     let n = 10;
     // v_p(p^k · unit) == k, for a unit coprime to p.
     for k in 0..5u32 {
-        let value = p(7).pow(k).mul(&p(6)); // 6 is a unit mod 7
+        let value = p(7).pow(u64::from(k)).mul(&p(6)); // 6 is a unit mod 7
         let x = Padic::from_int(p(7), n, value);
         assert_eq!(x.valuation(), Some(k as i64));
     }

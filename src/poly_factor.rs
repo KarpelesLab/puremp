@@ -558,13 +558,13 @@ fn factor_monic_squarefree(f: &[Int]) -> Vec<Vec<Int>> {
     // separates the true factors (m ≳ (2n·Rᵐᵗ·2^{r+mt})² with mt = r traces).
     let norm1 = f.iter().fold(Int::ZERO, |a, c| a.add(&c.abs()));
     #[cfg_attr(not(feature = "lattice"), allow(unused_mut))]
-    let mut bound = Int::ONE.mul_2k(n as u32 + 1).mul(&norm1);
+    let mut bound = Int::ONE.mul_2k(u64::from(n as u32 + 1)).mul(&norm1);
     #[cfg(feature = "lattice")]
     {
         let rb = root_bound(f);
         let inner = Int::from_u64(2 * n as u64)
-            .mul(&rb.pow(r as u32))
-            .mul(&Int::ONE.mul_2k(2 * r as u32));
+            .mul(&rb.pow(r as u64))
+            .mul(&Int::ONE.mul_2k(u64::from(2 * r as u32)));
         let sq = inner.mul(&inner);
         let b_vh = sq.mul(&sq); // 4th power → a clear trace/residue gap for LLL
         if b_vh.cmp(&bound) == core::cmp::Ordering::Greater {
@@ -610,7 +610,7 @@ fn factor_primitive_squarefree(f: &[Int]) -> Vec<Vec<Int>> {
     let mut bigf = alloc::vec![Int::ZERO; n + 1];
     bigf[n] = Int::ONE;
     for (k, slot) in bigf.iter_mut().enumerate().take(n) {
-        *slot = f[k].mul(&l.pow((n - 1 - k) as u32));
+        *slot = f[k].mul(&l.pow((n - 1 - k) as u64));
     }
     factor_monic_squarefree(&bigf)
         .iter()
@@ -619,7 +619,7 @@ fn factor_primitive_squarefree(f: &[Int]) -> Vec<Vec<Int>> {
             let sub: Vec<Int> = g
                 .iter()
                 .enumerate()
-                .map(|(i, c)| c.mul(&l.pow(i as u32)))
+                .map(|(i, c)| c.mul(&l.pow(i as u64)))
                 .collect();
             ip_primitive(&ip_trim(sub))
         })
@@ -946,8 +946,8 @@ mod vh_tests {
             let r = modfacs.len();
             let rb = root_bound(f);
             let inner = Int::from_u64(2 * n as u64)
-                .mul(&rb.pow(r as u32))
-                .mul(&Int::ONE.mul_2k(2 * r as u32));
+                .mul(&rb.pow(r as u64))
+                .mul(&Int::ONE.mul_2k(u64::from(2 * r as u32)));
             let sq = inner.mul(&inner);
             let bound = sq.mul(&sq);
             let mut m = Int::from_u64(p);

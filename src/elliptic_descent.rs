@@ -717,14 +717,14 @@ fn zp_square_value(g: &[Int; 5], p: &Int, x0: &Int, n: u32, cap: u32) -> Option<
             return Some(true);
         }
     }
-    let pn = p.pow(n);
+    let pn = p.pow(u64::from(n));
     if p == &Int::from(2) {
         let m = (1..5)
             .filter(|&i| !t[i].is_zero())
             .map(|i| val(&t[i], p) + i as u32 * n)
             .min();
         if m.is_none_or(|m| m >= v + 3) {
-            let unit = t[0].div_2k_trunc(v);
+            let unit = t[0].div_2k_trunc(u64::from(v));
             return Some(v.is_multiple_of(2) && unit.rem_euclid(&Int::from(8)).is_one());
         }
         let mut unknown = false;
@@ -746,7 +746,7 @@ fn zp_square_value(g: &[Int; 5], p: &Int, x0: &Int, n: u32, cap: u32) -> Option<
     let hbar: Vec<Int> = (0..5)
         .map(|i| match vals[i] {
             Some(vi) if vi == mu => {
-                let unit = t[i].div_exact(&p.pow(vi - i as u32 * n));
+                let unit = t[i].div_exact(&p.pow(u64::from(vi - i as u32 * n)));
                 unit.rem_euclid(p)
             }
             _ => Int::ZERO,
@@ -890,7 +890,7 @@ fn ppowmod(base: &[Int], e: &Int, m: &[Int], p: &Int) -> Vec<Int> {
     let base = prem(base, m, p);
     for i in (0..e.bit_len()).rev() {
         result = pmulmod(&result, &result, m, p);
-        if e.bit(i) {
+        if e.bit(u64::from(i)) {
             result = pmulmod(&result, &base, m, p);
         }
     }

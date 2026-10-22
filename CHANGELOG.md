@@ -7,6 +7,17 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/KarpelesLab/puremp/compare/v0.3.0...v0.3.1) - 2026-10-22
+
+### Other
+
+- *(changelog)* file the post-0.3.0 perf notes under Unreleased
+- *(nat)* single-pass digit validation and packing in parse_radix
+- *(changelog)* note the division, radix conversion and multiplication speedups
+- *(nat)* subtractive Karatsuba and retuned multiplication crossovers
+- *(nat)* single-buffer radix output and Horner-based radix parsing
+- *(nat)* 3-by-2 reciprocal schoolbook division, skip BZ for short quotients
+
 ### Other
 
 - *(nat)* schoolbook division estimates each quotient limb with the

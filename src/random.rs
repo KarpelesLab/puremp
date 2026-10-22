@@ -69,8 +69,8 @@ impl RandomSource for SeedRng {
 /// Seeding follows the reference implementation (`init_genrand` for a 32-bit
 /// seed, `init_by_array` for a key), so streams match other faithful MT19937
 /// implementations such as C++'s `std::mt19937` or Python's `random` module.
-/// They do *not* match GMP's `gmp_randinit_mt`, whose seeding is
-/// GMP-specific. Combine it with [`Nat::random_bits`]/[`Int::random_bits`]
+/// For GMP's `gmp_randinit_mt` streams use [`MersenneTwister::gmp_seeded`]
+/// instead. Combine it with [`Nat::random_bits`]/[`Int::random_bits`]
 /// (`mpz_urandomb`-like) and [`Nat::random_below`]/[`Int::random_below`]
 /// (`mpz_urandomm`-like).
 #[derive(Clone)]
@@ -143,6 +143,65 @@ impl MersenneTwister {
             .collect();
         let used = key.iter().rposition(|&w| w != 0).map_or(0, |p| p + 1);
         MersenneTwister::from_key(&key[..used])
+    }
+
+    /// Creates a generator seeded the way GMP's `gmp_randseed` seeds
+    /// `gmp_randinit_mt`, so its outputs, and [`Nat::random_bits`] /
+    /// [`Int::random_bits`] drawn from it, reproduce `mpz_urandomb` for the
+    /// same sequence of request sizes. (Bounded draws such as `mpz_urandomm`
+    /// use their own selection algorithm and are not reproduced.)
+    ///
+    /// The seed is expanded to `(seed mod (2^19937 − 20027) + 2)^0x40118124`
+    /// with a folding reduction modulo `2^19937 − 20023`; bit 19936 goes to the
+    /// top of state word 0 and bits 0–19935 fill words 1–623. Three twists and
+    /// a start index of 128 then stand in for GMP's 2000-output warm-up.
+    ///
+    /// An unseeded `gmp_randinit_mt` starts in the state of seed `5489`.
+    ///
+    /// This follows GMP's observed behaviour, not a documented GMP guarantee.
+    pub fn gmp_seeded(seed: &Int) -> MersenneTwister {
+        const BITS: u64 = 19937;
+        let modulus = Int::ONE.mul_2k(BITS).sub(&Int::from_u64(20027));
+        let base = seed
+            .rem_euclid(&modulus)
+            .add(&Int::from_u64(2))
+            .into_magnitude();
+        // Fold `r` below 2^19937 via 2^19937 ≡ 20023, with no final
+        // subtraction of the modulus (the representative matters).
+        let fold = |mut r: Nat| {
+            while r.bit_len() > BITS {
+                r = r
+                    .low_bits(BITS)
+                    .add(&r.shr(BITS).mul(&Nat::from_u64(20023)));
+            }
+            r
+        };
+        // Left-to-right square-and-multiply, skipping the leading one bit.
+        let exp: u32 = 0x4011_8124;
+        let mut r = base.clone();
+        for i in (0..exp.ilog2()).rev() {
+            r = fold(r.square());
+            if (exp >> i) & 1 == 1 {
+                r = fold(r.mul(&base));
+            }
+        }
+        let mut state = [0u32; MT_N];
+        if r.bit(BITS - 1) {
+            state[0] = 0x8000_0000;
+        }
+        let low = r.low_bits(BITS - 1);
+        for (i, &limb) in low.as_limbs().iter().enumerate() {
+            state[1 + 2 * i] = limb as u32;
+            if 2 + 2 * i < MT_N {
+                state[2 + 2 * i] = (limb >> 32) as u32;
+            }
+        }
+        let mut mt = MersenneTwister { state, index: 0 };
+        for _ in 0..3 {
+            mt.twist();
+        }
+        mt.index = 128;
+        mt
     }
 
     /// Regenerates the whole state block (the "twist").

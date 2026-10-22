@@ -7,6 +7,13 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+### Added
+
+- *(random)* `MersenneTwister::gmp_seeded`: GMP's `gmp_randseed` seed
+  expansion for `gmp_randinit_mt`, so `Nat`/`Int::random_bits` reproduce
+  `mpz_urandomb` streams bit-for-bit for the same request sizes (verified
+  against libgmp; seed `5489` is the unseeded default)
+
 ## [0.3.1](https://github.com/KarpelesLab/puremp/compare/v0.3.0...v0.3.1) - 2026-10-22
 
 ### Other

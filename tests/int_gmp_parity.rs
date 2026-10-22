@@ -314,3 +314,75 @@ fn mersenne_twister_reference_streams() {
         assert!(!r.is_negative() && r < bound);
     }
 }
+
+#[test]
+fn mersenne_twister_gmp_seeding() {
+    use puremp::MersenneTwister;
+    // `mpz_urandomb` request sequences observed from GMP 6: seeded through
+    // `gmp_randseed`, and (seed 5489) an unseeded `gmp_randinit_mt`.
+    for (seed, want, nth) in [
+        (
+            "5489",
+            [
+                "968665204",
+                "1490187595",
+                "11567",
+                "62403",
+                "1096904973926824930696315518408",
+                "0",
+                "99",
+            ],
+            2011339640,
+        ),
+        (
+            "12345",
+            [
+                "4239593463",
+                "3179460376",
+                "5840",
+                "32854",
+                "328329684707142779870883755138",
+                "0",
+                "108",
+            ],
+            2726340516,
+        ),
+        (
+            "-98765432109876543210",
+            [
+                "3671402544",
+                "970948138",
+                "58725",
+                "57512",
+                "842703645622114313430616283195",
+                "0",
+                "81",
+            ],
+            1420354290,
+        ),
+        (
+            "0",
+            [
+                "1823441003",
+                "3558641944",
+                "26433",
+                "35955",
+                "249407599312337939642398084807",
+                "0",
+                "124",
+            ],
+            1676504353,
+        ),
+    ] {
+        let mut mt = MersenneTwister::gmp_seeded(&int(seed));
+        let got: Vec<String> = [32, 32, 16, 16, 100, 0, 7]
+            .iter()
+            .map(|&n| Int::random_bits(n, &mut mt).to_string())
+            .collect();
+        assert_eq!(got, want, "seed {seed}");
+        for _ in 0..2000 {
+            Int::random_bits(32, &mut mt);
+        }
+        assert_eq!(mt.next_u32(), nth, "seed {seed}");
+    }
+}

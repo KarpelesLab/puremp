@@ -7,6 +7,32 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+### Other
+
+- *(nat)* schoolbook division estimates each quotient limb with the
+  Möller–Granlund 3-by-2 reciprocal (no 128-by-64 hardware/libcall divide)
+  and a fused multiply-subtract with a single rare add-back; long divisors
+  with short quotients stay on the `O(n·m)` schoolbook path instead of
+  padding into Burnikel–Ziegler: `Nat::div_rem` is 1.6–2.7x faster below
+  128 limbs, 1.25–1.4x faster in the Burnikel–Ziegler range (faster base
+  case), and 3.6–4.8x faster for `(n+2)/n`-limb divisions from 256 limbs
+- *(nat)* radix output appends every recursion level into one byte buffer
+  and the base case divides a stack copy of the limbs in place by
+  `radix^chunk` with a precomputed reciprocal and const-specialized digit
+  extraction for radix 10/16: decimal `Display`/`write_radix` is 2.2–3x
+  faster up to 128 limbs and 1.4–1.9x faster above
+- *(nat)* radix parsing evaluates the packed `radix^chunk` limbs by in-place
+  Horner (up to 512 chunks) under a shared power ladder instead of a tree of
+  per-chunk `Nat`s: 1.3–2.2x faster decimal parsing
+- *(nat)* radix parsing validates and packs digits in a single pass over the
+  input bytes instead of collecting a `Vec<u32>` first: a further 2–4.5x on
+  small decimal inputs (2–128 limbs), now 1.5–2x ahead of num-bigint there
+- *(nat)* subtractive Karatsuba (`|a0 − a1|·|b0 − b1|`, so every recursive
+  product is exactly half size) with the general product's crossovers
+  retuned on random operands — Karatsuba from 32 limbs (was 128; squaring
+  keeps 128) and Toom-3 from 640 (was 1400): `Nat::mul` is 1.15–1.7x
+  faster from 32 to 1024 limbs
+
 ## [0.3.0](https://github.com/KarpelesLab/puremp/compare/v0.2.5...v0.3.0) - 2026-10-22
 
 ### Added
@@ -93,29 +119,6 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   one latency-bound chain, and a bounds-check-free inverse butterfly loop:
   a further 6–20% on NTT-sized products and squares
 - add a `mul_bench` example for large `Nat` multiplication and squaring
-- *(nat)* schoolbook division estimates each quotient limb with the
-  Möller–Granlund 3-by-2 reciprocal (no 128-by-64 hardware/libcall divide)
-  and a fused multiply-subtract with a single rare add-back; long divisors
-  with short quotients stay on the `O(n·m)` schoolbook path instead of
-  padding into Burnikel–Ziegler: `Nat::div_rem` is 1.6–2.7x faster below
-  128 limbs, 1.25–1.4x faster in the Burnikel–Ziegler range (faster base
-  case), and 3.6–4.8x faster for `(n+2)/n`-limb divisions from 256 limbs
-- *(nat)* radix output appends every recursion level into one byte buffer
-  and the base case divides a stack copy of the limbs in place by
-  `radix^chunk` with a precomputed reciprocal and const-specialized digit
-  extraction for radix 10/16: decimal `Display`/`write_radix` is 2.2–3x
-  faster up to 128 limbs and 1.4–1.9x faster above
-- *(nat)* radix parsing evaluates the packed `radix^chunk` limbs by in-place
-  Horner (up to 512 chunks) under a shared power ladder instead of a tree of
-  per-chunk `Nat`s: 1.3–2.2x faster decimal parsing
-- *(nat)* radix parsing validates and packs digits in a single pass over the
-  input bytes instead of collecting a `Vec<u32>` first: a further 2–4.5x on
-  small decimal inputs (2–128 limbs), now 1.5–2x ahead of num-bigint there
-- *(nat)* subtractive Karatsuba (`|a0 − a1|·|b0 − b1|`, so every recursive
-  product is exactly half size) with the general product's crossovers
-  retuned on random operands — Karatsuba from 32 limbs (was 128; squaring
-  keeps 128) and Toom-3 from 640 (was 1400): `Nat::mul` is 1.15–1.7x
-  faster from 32 to 1024 limbs
 
 ## [0.2.5](https://github.com/KarpelesLab/puremp/compare/v0.2.4...v0.2.5) - 2026-09-27
 

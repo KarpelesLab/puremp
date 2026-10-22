@@ -62,6 +62,132 @@ impl RandomSource for SeedRng {
     }
 }
 
+/// The 32-bit Mersenne Twister MT19937 (Matsumoto & Nishimura, 1998),
+/// implementing [`RandomSource`]: a seedable, reproducible generator with
+/// period `2^19937 − 1`. **Not** cryptographically secure.
+///
+/// Seeding follows the reference implementation (`init_genrand` for a 32-bit
+/// seed, `init_by_array` for a key), so streams match other faithful MT19937
+/// implementations such as C++'s `std::mt19937` or Python's `random` module.
+/// They do *not* match GMP's `gmp_randinit_mt`, whose seeding is
+/// GMP-specific. Combine it with [`Nat::random_bits`]/[`Int::random_bits`]
+/// (`mpz_urandomb`-like) and [`Nat::random_below`]/[`Int::random_below`]
+/// (`mpz_urandomm`-like).
+#[derive(Clone)]
+pub struct MersenneTwister {
+    state: [u32; MT_N],
+    index: usize,
+}
+
+const MT_N: usize = 624;
+const MT_M: usize = 397;
+
+impl MersenneTwister {
+    /// Creates a generator from a 32-bit seed (the reference `init_genrand`).
+    pub fn new(seed: u32) -> MersenneTwister {
+        let mut state = [0u32; MT_N];
+        state[0] = seed;
+        for i in 1..MT_N {
+            let prev = state[i - 1];
+            state[i] = 1_812_433_253u32
+                .wrapping_mul(prev ^ (prev >> 30))
+                .wrapping_add(i as u32);
+        }
+        MersenneTwister { state, index: MT_N }
+    }
+
+    /// Creates a generator from a key of 32-bit words (the reference
+    /// `init_by_array`). An empty key is treated as `[0]`.
+    pub fn from_key(key: &[u32]) -> MersenneTwister {
+        let key = if key.is_empty() { &[0][..] } else { key };
+        let mut mt = MersenneTwister::new(19_650_218);
+        let s = &mut mt.state;
+        let (mut i, mut j) = (1usize, 0usize);
+        for _ in 0..MT_N.max(key.len()) {
+            let prev = s[i - 1];
+            s[i] = (s[i] ^ (prev ^ (prev >> 30)).wrapping_mul(1_664_525))
+                .wrapping_add(key[j])
+                .wrapping_add(j as u32);
+            i += 1;
+            j += 1;
+            if i >= MT_N {
+                s[0] = s[MT_N - 1];
+                i = 1;
+            }
+            if j >= key.len() {
+                j = 0;
+            }
+        }
+        for _ in 0..MT_N - 1 {
+            let prev = s[i - 1];
+            s[i] =
+                (s[i] ^ (prev ^ (prev >> 30)).wrapping_mul(1_566_083_941)).wrapping_sub(i as u32);
+            i += 1;
+            if i >= MT_N {
+                s[0] = s[MT_N - 1];
+                i = 1;
+            }
+        }
+        s[0] = 0x8000_0000; // guarantees a non-zero state
+        mt
+    }
+
+    /// Creates a generator keyed by an arbitrary-size seed: the 32-bit words
+    /// of `|seed|`, least significant first, through [`MersenneTwister::from_key`]
+    /// (zero becomes the key `[0]`).
+    pub fn from_seed(seed: &Int) -> MersenneTwister {
+        let key: alloc::vec::Vec<u32> = seed
+            .limbs()
+            .iter()
+            .flat_map(|&l| [l as u32, (l >> 32) as u32])
+            .collect();
+        let used = key.iter().rposition(|&w| w != 0).map_or(0, |p| p + 1);
+        MersenneTwister::from_key(&key[..used])
+    }
+
+    /// Regenerates the whole state block (the "twist").
+    fn twist(&mut self) {
+        let s = &mut self.state;
+        for i in 0..MT_N {
+            let y = (s[i] & 0x8000_0000) | (s[(i + 1) % MT_N] & 0x7fff_ffff);
+            let mag = if y & 1 == 1 { 0x9908_b0df } else { 0 };
+            s[i] = s[(i + MT_M) % MT_N] ^ (y >> 1) ^ mag;
+        }
+        self.index = 0;
+    }
+
+    /// Returns the next 32-bit output (the reference `genrand_int32`).
+    pub fn next_u32(&mut self) -> u32 {
+        if self.index >= MT_N {
+            self.twist();
+        }
+        let mut y = self.state[self.index];
+        self.index += 1;
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c_5680;
+        y ^= (y << 15) & 0xefc6_0000;
+        y ^ (y >> 18)
+    }
+}
+
+impl core::fmt::Debug for MersenneTwister {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MersenneTwister")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RandomSource for MersenneTwister {
+    /// Fills `dest` with successive 32-bit outputs in little-endian byte order.
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for chunk in dest.chunks_mut(4) {
+            let bytes = self.next_u32().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+}
+
 impl Nat {
     /// Generates a uniform random natural with at most `bits` bits (i.e. in
     /// `[0, 2^bits)`).
@@ -96,8 +222,14 @@ impl Nat {
 }
 
 impl Int {
-    /// Generates a uniform random non-negative integer in `[0, bound)`, or
-    /// `None` if `bound <= 0`.
+    /// Generates a uniform random non-negative integer in `[0, 2^bits)` (like
+    /// GMP's `mpz_urandomb`).
+    pub fn random_bits(bits: u64, src: &mut impl RandomSource) -> Int {
+        Int::from(Nat::random_bits(bits, src))
+    }
+
+    /// Generates a uniform random non-negative integer in `[0, bound)` (like
+    /// GMP's `mpz_urandomm`), or `None` if `bound <= 0`.
     pub fn random_below(bound: &Int, src: &mut impl RandomSource) -> Option<Int> {
         if !bound.is_positive() {
             return None;

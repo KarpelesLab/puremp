@@ -21,6 +21,10 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   `Int::{from,to}_signed_bytes_{be,le}`, `Nat::{from,to}_bytes_be`)
 - *(int)* `<<`/`>>` (`u64` shift, `>>` rounding toward −∞) and `&`/`|`/`^`
   operators for `Int`
+- *(random)* `MersenneTwister` (MT19937 with the reference `init_genrand`/
+  `init_by_array` seeding, stream-compatible with `std::mt19937` and Python's
+  `random`; not with GMP's `gmp_randinit_mt`) and `Int::random_bits`
+  (`mpz_urandomb`-like, next to the `mpz_urandomm`-like `random_below`)
 - *(nat)* radixes up to 62 in parsing and `write_radix` (GMP's `0-9A-Za-z`
   alphabet above 36; case-insensitive up to 36); the CLI's `:base` follows
 

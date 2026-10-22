@@ -265,3 +265,52 @@ fn magnitude_access_and_wide_pow() {
         Int::ONE.mul_2k(5_000_001).neg()
     );
 }
+
+#[test]
+fn mersenne_twister_reference_streams() {
+    use puremp::MersenneTwister;
+    // C++ requires the 10000th output of a default-seeded std::mt19937 to be
+    // 4123659995.
+    let mut mt = MersenneTwister::new(5489);
+    assert_eq!(mt.next_u32(), 3499211612);
+    for _ in 0..9998 {
+        mt.next_u32();
+    }
+    assert_eq!(mt.next_u32(), 4123659995);
+
+    // `from_seed` keys by the seed's 32-bit words, like Python's `random.seed`.
+    for (seed, first, nth) in [
+        ("0", [3626764237, 1654615998, 3255389356], 2846861434),
+        ("12345", [1789368711, 3146859322, 43676229], 556952727),
+        (
+            "1267650600228229401496703205383",
+            [1786885132, 353954449, 1403444918],
+            467335321,
+        ),
+        (
+            "18446744073709551616",
+            [4198958755, 3158798261, 1593907883],
+            3490021708,
+        ),
+    ] {
+        let mut mt = MersenneTwister::from_seed(&int(seed));
+        assert_eq!(
+            [mt.next_u32(), mt.next_u32(), mt.next_u32()],
+            first,
+            "{seed}"
+        );
+        for _ in 0..2000 {
+            mt.next_u32();
+        }
+        assert_eq!(mt.next_u32(), nth, "{seed}");
+    }
+
+    // urandomb / urandomm equivalents stay in range.
+    let mut mt = MersenneTwister::new(1);
+    let bound = int("1000000000000000000000000000");
+    for _ in 0..100 {
+        assert!(Int::random_bits(77, &mut mt).bit_len() <= 77);
+        let r = Int::random_below(&bound, &mut mt).unwrap();
+        assert!(!r.is_negative() && r < bound);
+    }
+}

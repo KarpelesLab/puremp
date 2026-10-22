@@ -254,7 +254,7 @@ pub use int::{Int, Sign};
 #[cfg(feature = "int")]
 pub use nat::{Nat, Reciprocal, u_gcd, u64_gcd};
 #[cfg(feature = "int")]
-pub use random::{RandomSource, SeedRng};
+pub use random::{MersenneTwister, RandomSource, SeedRng};
 
 #[cfg(feature = "rational")]
 pub use egyptian::{EgyptianExpansion, ShortestEgyptian};

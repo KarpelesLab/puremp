@@ -22,18 +22,26 @@ use crate::int::Int;
 use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 
 // Multiplication crossovers, tuned from `measure_mul_crossovers` (see the test
-// module) with the addmul_2 schoolbook loop. The faster basecase pushes every
-// crossover up: Karatsuba from ~128 limbs, Toom-3 from ~1.4k, Toom-4 from ~6k.
+// module) and a random-operand product benchmark, with the addmul_2 schoolbook
+// loop and the allocation-free subtractive Karatsuba: Karatsuba from ~32 limbs
+// (squaring, whose schoolbook does half the products, from ~128), Toom-3 from
+// ~640, Toom-4 from ~6k.
 // The NTT hand-off is decided per-shape by `ntt_worthwhile` rather than a
 // single size threshold (see `measure_ntt_paths`); in practice it takes over
 // from roughly 800–1300 limbs, so the Toom stages mostly serve as the fallback
 // for the shapes it declines. Re-measure per platform to retune.
 
 /// Operands with fewer than this many limbs use schoolbook multiplication.
-const KARATSUBA_THRESHOLD: usize = 128;
+const KARATSUBA_THRESHOLD: usize = 32;
+
+/// Squarings of fewer than this many limbs use the symmetric schoolbook
+/// square. It roughly halves the limb products, so it holds out against
+/// Karatsuba much longer than the general product does. Must stay
+/// `≥ KARATSUBA_THRESHOLD` (the shared scratch sizing assumes it).
+const KARATSUBA_SQR_THRESHOLD: usize = 128;
 
 /// Operands with at least this many limbs use Toom-3 (above Karatsuba).
-const TOOM3_THRESHOLD: usize = 1400;
+const TOOM3_THRESHOLD: usize = 640;
 
 /// Operands with at least this many limbs use Toom-4 (above Toom-3).
 const TOOM4_THRESHOLD: usize = 6000;
@@ -1094,7 +1102,7 @@ fn sqr_into(a: &[Limb], t: &mut [Limb]) {
 fn mont_sqr(a: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
     let s = m.len();
     let mut t = alloc::vec![0 as Limb; 2 * s + 2];
-    if a.limbs.len() < KARATSUBA_THRESHOLD {
+    if a.limbs.len() < KARATSUBA_SQR_THRESHOLD {
         sqr_into(&a.limbs, &mut t);
     } else {
         let sq = a.square();
@@ -2186,6 +2194,11 @@ fn sub_in_place(dst: &mut [Limb], src: &[Limb]) {
 /// (`out.len() == a.len() + b.len()`), using `scratch` for every intermediate —
 /// no per-node allocation. `z0` and `z2` land directly in the disjoint halves
 /// of `out`; only the middle term needs scratch space.
+///
+/// This is the subtractive form: the middle term is
+/// `z0 + z2 − (a0 − a1)·(b0 − b1)`, so the third product works on two
+/// `h`-limb differences (tracked with their signs) rather than on `h + 1`-limb
+/// sums, keeping every recursive product exactly half size.
 fn kara_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
     debug_assert_eq!(out.len(), a.len() + b.len());
     if a.len().min(b.len()) < KARATSUBA_THRESHOLD {
@@ -2202,23 +2215,53 @@ fn kara_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
     if have_z2 {
         kara_into(a1, b1, &mut out[2 * h..], scratch);
     }
-    // zm = (a0+a1)·(b0+b1) − z0 − z2, added at offset h.
-    let sa_len = a0.len().max(a1.len()) + 1;
-    let sb_len = b0.len().max(b1.len()) + 1;
-    let (sa, rest) = scratch.split_at_mut(sa_len);
-    let (sb, rest) = rest.split_at_mut(sb_len);
-    let (zm, rest) = rest.split_at_mut(sa_len + sb_len);
-    add_full(a0, a1, sa);
-    add_full(b0, b1, sb);
+    // da = |a0 − a1|, db = |b0 − b1|, zm = da·db.
+    let (da, rest) = scratch.split_at_mut(a0.len());
+    let (db, rest) = rest.split_at_mut(b0.len());
+    let neg = abs_diff_into(a0, a1, da) != abs_diff_into(b0, b1, db);
+    let (zm, rest) = rest.split_at_mut(z0_len);
+    let (t, rest) = rest.split_at_mut(z0_len + 1);
     zm.fill(0);
-    kara_into(sa, sb, zm, rest);
-    sub_in_place(zm, &out[..z0_len]);
-    if have_z2 {
-        sub_in_place(zm, &out[2 * h..]);
+    kara_into(da, db, zm, rest);
+    // t = z0 + z2 ∓ zm = a0·b1 + a1·b0 (non-negative, fits z0_len + 1 limbs).
+    let z2_len = if have_z2 { a1.len() + b1.len() } else { 0 };
+    add_full(&out[..z0_len], &out[2 * h..2 * h + z2_len], t);
+    if neg {
+        // (a0 − a1)·(b0 − b1) < 0: the middle term is z0 + z2 + |zm|.
+        add_at(t, 0, zm);
+    } else {
+        sub_in_place(t, zm);
     }
-    // Trim zm's zero top limbs: the value always fits, the buffer may not.
-    let zm_len = zm.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
-    add_at(out, h, &zm[..zm_len]);
+    // Trim t's zero top limbs: the value always fits, the buffer may not.
+    let t_len = t.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
+    add_at(out, h, &t[..t_len]);
+}
+
+/// Writes `|x − y|` into `out` (`out.len() == x.len() ≥ y.len()`), returning
+/// whether `x < y`.
+fn abs_diff_into(x: &[Limb], y: &[Limb], out: &mut [Limb]) -> bool {
+    debug_assert!(out.len() == x.len() && x.len() >= y.len());
+    // x < y only if x has nothing above y's length and loses at the highest
+    // differing limb.
+    let (xl, xh) = x.split_at(y.len());
+    let x_less = xh.iter().all(|&l| l == 0)
+        && xl
+            .iter()
+            .rev()
+            .zip(y.iter().rev())
+            .find(|(p, q)| p != q)
+            .is_some_and(|(p, q)| p < q);
+    let (big, small) = if x_less { (y, xl) } else { (x, y) };
+    let mut borrow = 0;
+    for (i, o) in out.iter_mut().enumerate() {
+        let bv = big.get(i).copied().unwrap_or(0);
+        let sv = small.get(i).copied().unwrap_or(0);
+        let (r, bo) = sbb(bv, sv, borrow);
+        *o = r;
+        borrow = bo;
+    }
+    debug_assert_eq!(borrow, 0);
+    x_less
 }
 
 /// Karatsuba squaring of `a` into the zeroed buffer `out`
@@ -2226,7 +2269,7 @@ fn kara_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
 /// [`kara_into`].
 fn kara_sqr_into(a: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
     debug_assert_eq!(out.len(), 2 * a.len());
-    if a.len() < KARATSUBA_THRESHOLD {
+    if a.len() < KARATSUBA_SQR_THRESHOLD {
         sqr_into(a, out);
         return;
     }
@@ -2246,13 +2289,13 @@ fn kara_sqr_into(a: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
 }
 
 /// Scratch size sufficient for [`kara_into`]/[`kara_sqr_into`] on operands of
-/// at most `n` limbs each: each level consumes `≤ 2n + 6` limbs and recurses on
+/// at most `n` limbs each: each level consumes `≤ 3n + 6` limbs and recurses on
 /// `≤ n/2 + 2`.
 fn kara_scratch_len(n: usize) -> usize {
     let mut need = 0;
     let mut m = n;
     while m >= KARATSUBA_THRESHOLD {
-        need += 2 * m + 6;
+        need += 3 * m + 6;
         m = m / 2 + 2;
     }
     need
@@ -2268,7 +2311,7 @@ impl Nat {
         if n == 0 {
             return Nat::zero();
         }
-        if n < KARATSUBA_THRESHOLD {
+        if n < KARATSUBA_SQR_THRESHOLD {
             self.square_schoolbook()
         } else if ntt_worthwhile(n, n, true) {
             mul_ntt(self, self)
@@ -2290,7 +2333,7 @@ impl Nat {
     /// into one output buffer with one shared scratch allocation.
     fn square_karatsuba(&self) -> Nat {
         let n = self.limbs.len();
-        if n < KARATSUBA_THRESHOLD {
+        if n < KARATSUBA_SQR_THRESHOLD {
             return self.square_schoolbook();
         }
         let mut out = alloc::vec![0 as Limb; 2 * n];
@@ -6170,6 +6213,27 @@ mod tests {
                 b.mul_schoolbook(&a),
                 "kara mul {y}x{x}"
             );
+        }
+        // Subtractive middle term: edge-heavy limbs make |a0 − a1| hit zero,
+        // equal halves and both sign combinations, over random shapes from
+        // the threshold up (including very unbalanced ones).
+        let mut state = 0x5eed_ca7a_0000_0042u64;
+        for round in 0..400usize {
+            let x = KARATSUBA_THRESHOLD + round * 13 % 170;
+            let y = KARATSUBA_THRESHOLD + round * 29 % 420;
+            let mut al = edgy_limbs(&mut state, x);
+            let mut bl = edgy_limbs(&mut state, y);
+            if round % 5 == 0 {
+                // Equal halves: a0 == a1 exactly.
+                let h = x / 2;
+                let (lo, hi) = al.split_at_mut(h);
+                hi[..h].copy_from_slice(lo);
+            }
+            if round % 7 == 0 {
+                bl.iter_mut().for_each(|l| *l = Limb::MAX);
+            }
+            let (a, b) = (Nat::from_limbs(&al), Nat::from_limbs(&bl));
+            assert_eq!(a.mul_karatsuba(&b), a.mul_schoolbook(&b), "edgy {x}x{y}");
         }
         for &limbs in &[128usize, 129, 255, 256, 300, 511] {
             let a = mk(limbs, limbs as u64 * 31 + 5);

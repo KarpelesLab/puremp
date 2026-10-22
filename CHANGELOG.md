@@ -7,6 +7,30 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/KarpelesLab/puremp/compare/v0.2.5...v0.3.0) - 2026-10-22
+
+### Added
+
+- *(random)* MT19937 generator and Int::random_bits
+- *(int)* GMP-parity bit ops, roots, Kronecker, radix 62, byte I/O; fix to_f64 rounding
+- *(int)* Jacobsthal function
+- *(elliptic)* rational point search and sums of two rational cubes
+- *(rational)* Egyptian fraction expansions (greedy, divisor method, shortest)
+- *(elliptic)* certified rank via 2-isogeny descent
+- *(int)* multiplicative order, Carmichael λ, primitive roots, inverse totient
+
+### Fixed
+
+- *(nat)* cap the Goldilocks NTT at its 2^32 transform-length limit
+
+### Other
+
+- *(int)* [**breaking**] widen pow, mul_2k, div_2k_trunc, mod_2k and bit to u64
+- *(float)* binary-split Catalan and Euler–Mascheroni constants
+- *(nat)* parallel twiddle chains and iterator-based inverse butterflies
+- *(nat)* 3*2^k NTT lengths via a radix-3 outer stage
+- *(nat)* three-prime NTT multiplication with full 64-bit limb coefficients
+
 ### Added
 
 - *(int)* GMP-parity integer operations, differentially tested against libgmp:

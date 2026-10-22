@@ -18,6 +18,10 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   then one subtraction), reproducing GMP's values and generator advancement
   with a `gmp_seeded` source
 
+### Changed
+
+- minimum supported Rust version raised to 1.95 (was 1.88)
+
 ## [0.3.1](https://github.com/KarpelesLab/puremp/compare/v0.3.0...v0.3.1) - 2026-10-22
 
 ### Other

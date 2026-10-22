@@ -386,3 +386,58 @@ fn mersenne_twister_gmp_seeding() {
         assert_eq!(mt.next_u32(), nth, "seed {seed}");
     }
 }
+
+#[test]
+fn random_below_gmp_matches_mpz_urandomm() {
+    use puremp::{MersenneTwister, RandomSource};
+    // Observed from GMP 6: mpz_urandomm with these bounds (then
+    // gmp_urandomm_ui(1000003) and mpz_urandomb(7)) after gmp_randseed(12345).
+    let mut mt = MersenneTwister::gmp_seeded(&int("12345"));
+    let bounds = [
+        "10",
+        "256",
+        "1",
+        "-4294967296",
+        "18446744073709551617",
+        "1267650600228229401496703205377",
+        "1000003",
+    ];
+    let got: Vec<String> = bounds
+        .iter()
+        .map(|b| Int::random_below_gmp(&int(b), &mut mt).unwrap().to_string())
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "7",
+            "24",
+            "0",
+            "814094032",
+            "9423277005366263894",
+            "601704412330400807050962541983",
+            "702377"
+        ]
+    );
+    assert_eq!(Int::random_bits(7, &mut mt), Int::from_i64(27));
+    assert_eq!(mt.next_u32(), 3729068448);
+    assert_eq!(Int::random_below_gmp(&Int::ZERO, &mut mt), None);
+
+    // The 80-candidate cap: an all-ones source rejects every 4-bit candidate
+    // (15 ≥ 10), so the 80th minus the bound is returned after 80 words.
+    struct Ones(usize);
+    impl RandomSource for Ones {
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.0 += 1;
+            dest.fill(0xff);
+        }
+    }
+    let mut ones = Ones(0);
+    assert_eq!(
+        Int::random_below_gmp(&Int::from_i64(10), &mut ones),
+        Some(Int::from_i64(5))
+    );
+    assert_eq!(ones.0, 80);
+    // A bound of 1 draws nothing.
+    assert_eq!(Int::random_below_gmp(&Int::ONE, &mut ones), Some(Int::ZERO));
+    assert_eq!(ones.0, 80);
+}

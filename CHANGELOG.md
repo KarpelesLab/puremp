@@ -13,6 +13,10 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   expansion for `gmp_randinit_mt`, so `Nat`/`Int::random_bits` reproduce
   `mpz_urandomb` streams bit-for-bit for the same request sizes (verified
   against libgmp; seed `5489` is the unseeded default)
+- *(random)* `Nat`/`Int::random_below_gmp`: GMP's `mpz_urandomm` /
+  `gmp_urandomm_ui` selection (`bit_len(N − 1)`-bit candidates, at most 80,
+  then one subtraction), reproducing GMP's values and generator advancement
+  with a `gmp_seeded` source
 
 ## [0.3.1](https://github.com/KarpelesLab/puremp/compare/v0.3.0...v0.3.1) - 2026-10-22
 

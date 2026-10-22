@@ -72,7 +72,7 @@ impl RandomSource for SeedRng {
 /// For GMP's `gmp_randinit_mt` streams use [`MersenneTwister::gmp_seeded`]
 /// instead. Combine it with [`Nat::random_bits`]/[`Int::random_bits`]
 /// (`mpz_urandomb`-like) and [`Nat::random_below`]/[`Int::random_below`]
-/// (`mpz_urandomm`-like).
+/// (`mpz_urandomm`-like; [`Int::random_below_gmp`] for GMP's exact stream).
 #[derive(Clone)]
 pub struct MersenneTwister {
     state: [u32; MT_N],
@@ -278,6 +278,36 @@ impl Nat {
             }
         }
     }
+
+    /// Generates a random natural in `[0, bound)` exactly as GMP's
+    /// `mpz_urandomm` does, or `None` if `bound` is zero. With a
+    /// [`MersenneTwister::gmp_seeded`] source this reproduces GMP's values
+    /// and generator advancement.
+    ///
+    /// Candidates have `k = bit_len(bound − 1)` bits (drawn as by
+    /// [`Nat::random_bits`]) and are rejected until one is below `bound`, but
+    /// at most 80 are drawn: if all are rejected, the last one minus `bound`
+    /// is returned, a deviation from uniformity of probability `< 2^-80`. A
+    /// bound of `1` returns `0` without drawing. See [`Nat::random_below`] for
+    /// exactly uniform sampling.
+    pub fn random_below_gmp(bound: &Nat, src: &mut impl RandomSource) -> Option<Nat> {
+        if bound.is_zero() {
+            return None;
+        }
+        if bound.is_one() {
+            return Some(Nat::zero());
+        }
+        let bits = bound.checked_sub(&Nat::one()).expect("bound ≥ 2").bit_len();
+        let mut candidate = Nat::zero();
+        for _ in 0..80 {
+            candidate = Nat::random_bits(bits, src);
+            if &candidate < bound {
+                return Some(candidate);
+            }
+        }
+        // candidate < 2^bits < 2·bound, so one subtraction lands in range.
+        Some(candidate.checked_sub(bound).expect("candidate ≥ bound"))
+    }
 }
 
 impl Int {
@@ -287,13 +317,21 @@ impl Int {
         Int::from(Nat::random_bits(bits, src))
     }
 
-    /// Generates a uniform random non-negative integer in `[0, bound)` (like
-    /// GMP's `mpz_urandomm`), or `None` if `bound <= 0`.
+    /// Generates a uniform random non-negative integer in `[0, bound)`, or
+    /// `None` if `bound <= 0`. (Same distribution as GMP's `mpz_urandomm`; see
+    /// [`Int::random_below_gmp`] for its exact stream.)
     pub fn random_below(bound: &Int, src: &mut impl RandomSource) -> Option<Int> {
         if !bound.is_positive() {
             return None;
         }
         let magnitude = bound.magnitude();
         Nat::random_below(&magnitude, src).map(Int::from)
+    }
+
+    /// Generates a random integer in `[0, |bound|)` exactly as GMP's
+    /// `mpz_urandomm` (and `gmp_urandomm_ui`) does, or `None` if `bound` is
+    /// zero. See [`Nat::random_below_gmp`].
+    pub fn random_below_gmp(bound: &Int, src: &mut impl RandomSource) -> Option<Int> {
+        Nat::random_below_gmp(&bound.magnitude_ref(), src).map(Int::from)
     }
 }

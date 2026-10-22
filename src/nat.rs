@@ -3212,38 +3212,46 @@ impl Nat {
     /// divide-and-conquer: split off a divisor `radix^len ≈ √self`, recurse on
     /// the quotient and remainder, and zero-pad the remainder to `len` digits.
     /// With sub-quadratic multiplication/division this is `O(M(n)·log n)`.
+    /// Every level appends straight into one output buffer.
     fn to_radix_string(&self, radix: u32) -> String {
+        // ~1 digit per log2(radix) bits; a cheap estimate is enough for the
+        // initial capacity (19.3 decimal digits per limb).
+        let mut out = Vec::with_capacity(self.limbs.len() * 20 + 1);
         // Base case: a few limbs go straight through single-limb division.
         if self.limbs.len() <= RADIX_RECURSION_LIMBS {
-            return simple_radix_string(self, radix);
-        }
-        // Build the ladder `[radix^1, radix^2, radix^4, …]` once (largest entry
-        // ≤ self), then share it across the whole recursion instead of
-        // re-squaring it at every node.
-        let mut powers = alloc::vec![Nat::from_u64(radix as u64)];
-        let bits = self.bit_len();
-        loop {
-            let last = powers.last().unwrap();
-            // `bit_len(x²) ≥ 2·bit_len(x) − 1`: skip the (large, discarded)
-            // final squaring when it certainly exceeds `self`.
-            if 2 * last.bit_len() - 1 > bits {
-                break;
+            simple_radix_string(&self.limbs, radix, 0, &mut out);
+        } else {
+            // Build the ladder `[radix^1, radix^2, radix^4, …]` once (largest
+            // entry ≤ self), then share it across the whole recursion instead
+            // of re-squaring it at every node.
+            let mut powers = alloc::vec![Nat::from_u64(radix as u64)];
+            let bits = self.bit_len();
+            loop {
+                let last = powers.last().unwrap();
+                // `bit_len(x²) ≥ 2·bit_len(x) − 1`: skip the (large, discarded)
+                // final squaring when it certainly exceeds `self`.
+                if 2 * last.bit_len() - 1 > bits {
+                    break;
+                }
+                let sq = last.square();
+                if sq.cmp_ref(self) == Ordering::Greater {
+                    break;
+                }
+                powers.push(sq);
             }
-            let sq = last.square();
-            if sq.cmp_ref(self) == Ordering::Greater {
-                break;
-            }
-            powers.push(sq);
+            to_radix_recursive(self, &powers, radix, 0, &mut out);
         }
-        to_radix_recursive(self, &powers, radix)
+        String::from_utf8(out).unwrap_or_default()
     }
 }
 
 /// Recursive base-`radix` conversion sharing a precomputed power ladder
-/// (`powers[k] == radix^(2^k)`, ascending).
-fn to_radix_recursive(v: &Nat, powers: &[Nat], radix: u32) -> String {
+/// (`powers[k] == radix^(2^k)`, ascending): appends the digits of `v` to `out`,
+/// left-padded with zeros to at least `width` digits (`0` = minimal).
+fn to_radix_recursive(v: &Nat, powers: &[Nat], radix: u32, width: usize, out: &mut Vec<u8>) {
     if v.limbs.len() <= RADIX_RECURSION_LIMBS {
-        return simple_radix_string(v, radix);
+        simple_radix_string(&v.limbs, radix, width, out);
+        return;
     }
     // Split by the largest ladder entry `p = radix^(2^k) ≤ v`.
     let k = powers
@@ -3252,66 +3260,135 @@ fn to_radix_recursive(v: &Nat, powers: &[Nat], radix: u32) -> String {
         .expect("v is large, so radix <= v");
     let len = 1usize << k;
     let (q, r) = v.div_rem(&powers[k]).expect("p is non-zero");
-    let mut s = to_radix_recursive(&q, powers, radix);
-    let r_str = if r.is_zero() {
-        String::new()
-    } else {
-        to_radix_recursive(&r, powers, radix)
-    };
-    // Zero-pad the low part to exactly `len` digits.
-    for _ in 0..len - r_str.len() {
-        s.push('0');
-    }
-    s.push_str(&r_str);
-    s
+    // The high part fills whatever the padding leaves above the low `len`
+    // digits; the low part is zero-padded to exactly `len`.
+    to_radix_recursive(&q, powers, radix, width.saturating_sub(len), out);
+    to_radix_recursive(&r, powers, radix, len, out);
 }
 
 /// Number of limbs at or below which radix conversion uses the simple
 /// single-limb-division loop rather than recursing.
-const RADIX_RECURSION_LIMBS: usize = 10;
+const RADIX_RECURSION_LIMBS: usize = 16;
 
-/// Minimal base-`radix` digit string via repeated single-limb division (for
-/// small values / the recursion base case). Each multi-limb division peels a
-/// whole limb's worth of digits (`radix^chunk`, the largest power fitting a
-/// `u64`), which are then split out with cheap machine-word arithmetic.
-fn simple_radix_string(n: &Nat, radix: u32) -> String {
-    if n.is_zero() {
-        return String::new();
-    }
+/// Appends the base-`radix` digits of the little-endian `limbs` (at most
+/// [`RADIX_RECURSION_LIMBS`]) to `out`, left-padded with zeros to at least
+/// `width` digits (a zero value with `width == 0` appends nothing). For small
+/// values / the recursion base case.
+///
+/// Each pass divides the whole number, in place on the stack, by
+/// `radix^chunk` (the largest power fitting a `u64`) with a precomputed
+/// reciprocal, peeling a whole limb's worth of digits that are then split out
+/// with machine-word arithmetic.
+fn simple_radix_string(limbs: &[Limb], radix: u32, width: usize, out: &mut Vec<u8>) {
+    debug_assert!(limbs.len() <= RADIX_RECURSION_LIMBS);
     // Largest `chunk` with `radix^chunk` fitting a u64, and that power itself.
     let (chunk, base) = {
-        let (mut d, mut p) = (0u32, 1u64);
+        let (mut d, mut p) = (0usize, 1u64);
         while let Some(next) = p.checked_mul(radix as u64) {
             p = next;
             d += 1;
         }
         (d, p)
     };
-    let mut n = n.clone();
-    let mut buf = Vec::new();
-    while !n.is_zero() {
-        let (q, mut r) = n.divmod_small(base);
-        n = q;
-        if n.is_zero() {
-            // Most significant chunk: stop at its leading digit.
-            while r != 0 {
-                buf.push(digit_char((r % radix as u64) as u32, radix));
-                r /= radix as u64;
-            }
-        } else {
-            for _ in 0..chunk {
-                buf.push(digit_char((r % radix as u64) as u32, radix));
-                r /= radix as u64;
+    // The base exceeds 2^32 for every radix, so each limb yields < 2 chunks.
+    let mut x = [0 as Limb; RADIX_RECURSION_LIMBS];
+    let mut len = limbs.len();
+    x[..len].copy_from_slice(limbs);
+    while len > 0 && x[len - 1] == 0 {
+        len -= 1;
+    }
+    let mut chunks = [0 as Limb; 2 * RADIX_RECURSION_LIMBS + 1];
+    let mut nchunks = 0;
+    if len == 1 && x[0] < base {
+        chunks[0] = x[0];
+        nchunks = 1;
+    } else if len > 0 {
+        let s = base.leading_zeros();
+        let dn = base << s;
+        let v = recip_2by1(dn);
+        while len > 0 {
+            chunks[nchunks] = divrem_1_normalized_in_place(&mut x[..len], dn, s, v);
+            nchunks += 1;
+            if x[len - 1] == 0 {
+                len -= 1;
             }
         }
     }
-    buf.reverse();
-    String::from_utf8(buf).unwrap_or_default()
+    // Digits of the leading chunk, then `chunk` per remaining chunk.
+    let top = if nchunks == 0 { 0 } else { chunks[nchunks - 1] };
+    let top_digits = {
+        let (mut t, mut c) = (top, 0usize);
+        while t != 0 {
+            t /= radix as u64;
+            c += 1;
+        }
+        c
+    };
+    let total = top_digits + nchunks.saturating_sub(1) * chunk;
+    out.resize(out.len() + width.saturating_sub(total), b'0');
+    let at = out.len();
+    out.resize(at + total, 0);
+    let dst = &mut out[at..];
+    // Fill each chunk's digits right to left; the specialized arms let the
+    // compiler turn the per-digit division into a multiplication.
+    let fill = |dst: &mut [u8], r: Limb| match radix {
+        10 => fill_digits::<10>(dst, r),
+        16 => fill_digits::<16>(dst, r),
+        _ => fill_digits_dyn(dst, r, radix as u64),
+    };
+    fill(&mut dst[..top_digits], top);
+    for (i, slot) in dst[top_digits..].chunks_exact_mut(chunk).enumerate() {
+        fill(slot, chunks[nchunks - 2 - i]);
+    }
+}
+
+/// Writes the low `dst.len()` base-`R` digits of `r` into `dst`, most
+/// significant first.
+#[inline]
+fn fill_digits<const R: u64>(dst: &mut [u8], mut r: Limb) {
+    for b in dst.iter_mut().rev() {
+        *b = digit_char((r % R) as u32, R as u32);
+        r /= R;
+    }
+}
+
+/// [`fill_digits`] for a radix only known at run time.
+fn fill_digits_dyn(dst: &mut [u8], mut r: Limb, radix: u64) {
+    for b in dst.iter_mut().rev() {
+        *b = digit_char((r % radix) as u32, radix as u32);
+        r /= radix;
+    }
+}
+
+/// Divides the limbs `x` in place by `d = dn >> s` (`dn` normalized, `v` its
+/// [`recip_2by1`] reciprocal), returning the remainder. The dividend is scaled
+/// by `2^s` on the fly, which scales the remainder and leaves the quotient
+/// unchanged.
+fn divrem_1_normalized_in_place(x: &mut [Limb], dn: Limb, s: u32, v: Limb) -> Limb {
+    let n = x.len();
+    let mut rem: Limb = if s == 0 {
+        0
+    } else {
+        x[n - 1] >> (LIMB_BITS - s)
+    };
+    for i in (0..n).rev() {
+        let lo = if s == 0 || i == 0 {
+            0
+        } else {
+            x[i - 1] >> (LIMB_BITS - s)
+        };
+        let cur = (x[i] << s) | lo;
+        let (qi, r) = div_2by1(rem, cur, dn, v);
+        x[i] = qi;
+        rem = r;
+    }
+    rem >> s
 }
 
 /// Converts normalized little-endian limbs to `f64`, rounding to nearest-even
-/// (`round`) or truncating toward zero; `+∞` past the `f64` range. Only the top 64 bits plus a sticky bit
-/// are inspected, so this is `O(1)` past the sticky scan.
+/// (`round`) or truncating toward zero; `+∞` past the `f64` range. Only the
+/// top 64 bits plus a sticky bit are inspected, so this is `O(1)` past the
+/// sticky scan.
 pub(crate) fn limbs_to_f64(limbs: &[Limb], round: bool) -> f64 {
     let Some(&hi) = limbs.last() else {
         return 0.0;
@@ -3404,7 +3481,7 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
     }
 
     // Pack `chunk` digits at a time into base-`B` limbs, least-significant first.
-    let mut level: Vec<Nat> = Vec::with_capacity(digits.len() / chunk + 1);
+    let mut level: Vec<Limb> = Vec::with_capacity(digits.len() / chunk + 1);
     let mut end = digits.len();
     while end > 0 {
         let start = end.saturating_sub(chunk);
@@ -3412,30 +3489,66 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
         for &dg in &digits[start..end] {
             val = val * radix as u64 + dg as u64;
         }
-        level.push(Nat::from_u64(val));
+        level.push(val);
         end = start;
     }
+    Ok(nat_from_base_chunks(&level, base))
+}
 
-    // Merge adjacent limbs up a balanced tree: `pair.0 + pair.1 · B^(2^k)`.
-    // `power` starts at `B` and squares each level, so the work is
-    // `O(M(n)·log n)` with sub-quadratic multiplication.
-    let mut power = Nat::from_u64(base);
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        for pair in level.chunks(2) {
-            if pair.len() == 2 {
-                next.push(pair[0].add(&pair[1].mul(&power)));
-            } else {
-                next.push(pair[0].clone());
-            }
+/// Number of base-`B` chunks at or below which [`nat_from_base_chunks`] uses
+/// in-place Horner evaluation rather than recursing.
+const PARSE_RECURSION_CHUNKS: usize = 512;
+
+/// Evaluates `Σ chunks[i]·B^i` (`chunks` least-significant first, each
+/// `< B`). Short inputs use Horner's rule in place on one limb buffer (one
+/// fused multiply-add pass per chunk); long ones split into a low half of
+/// `2^k` chunks and the rest, `high·B^(2^k) + low`, sharing a ladder of
+/// `B^(2^k)` powers, which is `O(M(n)·log n)` with sub-quadratic
+/// multiplication.
+fn nat_from_base_chunks(chunks: &[Limb], base: Limb) -> Nat {
+    if chunks.len() <= PARSE_RECURSION_CHUNKS {
+        return horner_base_chunks(chunks, base);
+    }
+    // powers[k] = B^(2^k) for every 2^k < chunks.len().
+    let mut powers = alloc::vec![Nat::from_u64(base)];
+    while 2usize << (powers.len() - 1) < chunks.len() {
+        let sq = powers.last().unwrap().square();
+        powers.push(sq);
+    }
+    chunks_recursive(chunks, &powers, base)
+}
+
+/// Recursive step of [`nat_from_base_chunks`] (`powers[k] == B^(2^k)`).
+fn chunks_recursive(chunks: &[Limb], powers: &[Nat], base: Limb) -> Nat {
+    if chunks.len() <= PARSE_RECURSION_CHUNKS {
+        return horner_base_chunks(chunks, base);
+    }
+    // Largest 2^k strictly below the length, so both halves are non-empty.
+    let k = (usize::BITS - 1 - (chunks.len() - 1).leading_zeros()) as usize;
+    let (low, high) = chunks.split_at(1 << k);
+    let hi = chunks_recursive(high, powers, base);
+    let lo = chunks_recursive(low, powers, base);
+    hi.mul(&powers[k]).add(&lo)
+}
+
+/// Horner evaluation of `Σ chunks[i]·B^i` in one growing limb buffer.
+fn horner_base_chunks(chunks: &[Limb], base: Limb) -> Nat {
+    let mut acc: Vec<Limb> = Vec::with_capacity(chunks.len() + 1);
+    for &c in chunks.iter().rev() {
+        // acc = acc·B + c.
+        let mut carry = c;
+        for l in acc.iter_mut() {
+            let (lo, hi) = mac(0, *l, base, carry);
+            *l = lo;
+            carry = hi;
         }
-        level = next;
-        if level.len() > 1 {
-            // The last level's power is never used: skip that (full-size) square.
-            power = power.mul(&power);
+        if carry != 0 {
+            acc.push(carry);
         }
     }
-    Ok(level.pop().unwrap_or_else(Nat::zero))
+    let mut n = Nat { limbs: acc };
+    n.normalize();
+    n
 }
 
 impl Nat {
@@ -6155,9 +6268,12 @@ mod tests {
         // Divisors of the form (d1, d0) = top limbs of the window, which hit
         // the q = β − 1 shortcut: a = b·(β^k − 1) + small.
         for nb in 2..12 {
-            let b = Nat::from_limbs(&edgy_limbs(&mut state, nb)).add(&Nat::one().shl(64 * nb as u64 - 1));
+            let b = Nat::from_limbs(&edgy_limbs(&mut state, nb))
+                .add(&Nat::one().shl(64 * nb as u64 - 1));
             for k in 1..6u64 {
-                let a = b.mul(&Nat::one().shl(64 * k).checked_sub(&Nat::one()).unwrap()).add(&Nat::from_u64(k));
+                let a = b
+                    .mul(&Nat::one().shl(64 * k).checked_sub(&Nat::one()).unwrap())
+                    .add(&Nat::from_u64(k));
                 let (q, r) = a.div_rem(&b).unwrap();
                 assert_eq!(q.mul(&b).add(&r), a);
                 assert!(r.cmp_ref(&b) == Ordering::Less);
@@ -6181,6 +6297,70 @@ mod tests {
             assert_eq!(lo as Limb, u0);
             assert_eq!(mid as Limb, u1);
             assert_eq!((mid >> 64) as Limb, u2);
+        }
+    }
+
+    #[test]
+    fn radix_string_differential() {
+        // The chunked / divide-and-conquer radix output against a naive
+        // digit-at-a-time conversion, for every radix and sizes across the
+        // recursion threshold (edge-heavy limbs give long zero/max runs).
+        let naive = |x: &Nat, radix: u32| -> String {
+            let mut x = x.clone();
+            let mut d = Vec::new();
+            while !x.is_zero() {
+                let (q, r) = x.divmod_small(radix as Limb);
+                d.push(digit_char(r as u32, radix));
+                x = q;
+            }
+            d.reverse();
+            String::from_utf8(d).unwrap()
+        };
+        let mut state = 0x7ad1_c0de_0000_0001u64;
+        for radix in 2..=36u32 {
+            for cnt in (0..4 * RADIX_RECURSION_LIMBS + 3).step_by(if radix == 10 { 1 } else { 5 }) {
+                let x = Nat::from_limbs(&edgy_limbs(&mut state, cnt));
+                let mut s = String::new();
+                x.write_radix(&mut s, radix).unwrap();
+                let want = naive(&x, radix);
+                assert_eq!(
+                    s,
+                    if want.is_empty() { "0".into() } else { want },
+                    "radix {radix}"
+                );
+            }
+        }
+        // Parsing round-trips across the Horner/recursive split (512 chunks
+        // ≈ 9.7k decimal digits), with and without leading zeros.
+        for (radix, cnt) in [
+            (10u32, 3usize),
+            (10, 600),
+            (10, 1100),
+            (10, 2300),
+            (7, 700),
+            (36, 900),
+            (62, 900),
+        ] {
+            let x = Nat::from_limbs(&edgy_limbs(&mut state, cnt));
+            let s = x.to_radix_string(radix);
+            assert_eq!(
+                parse_radix(&s, radix).unwrap(),
+                x,
+                "radix {radix} cnt {cnt}"
+            );
+            let padded = alloc::format!("0000000000000000000000{s}");
+            assert_eq!(parse_radix(&padded, radix).unwrap(), x);
+        }
+        // Powers of the radix (and their neighbours) stress the zero padding.
+        for k in [19u32, 38, 190, 400, 1000] {
+            let p = Nat::from_u64(10).pow(k);
+            for x in [
+                p.checked_sub(&Nat::one()).unwrap(),
+                p.clone(),
+                p.add(&Nat::one()),
+            ] {
+                assert_eq!(x.to_radix_string(10), naive(&x, 10));
+            }
         }
     }
 

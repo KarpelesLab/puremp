@@ -91,8 +91,8 @@ fn handle_command(cmd: &str, env: &Env, base: &mut u32) -> Command {
         other => {
             if let Some(arg) = other.strip_prefix("base").map(str::trim) {
                 match arg.parse::<u32>() {
-                    Ok(b) if (2..=36).contains(&b) => *base = b,
-                    _ => println!("usage: :base <radix 2..=36>"),
+                    Ok(b) if (2..=62).contains(&b) => *base = b,
+                    _ => println!("usage: :base <radix 2..=62>"),
                 }
             } else {
                 println!("unknown command `:{other}` (try `:help`)");
@@ -121,7 +121,7 @@ fn print_help() {
     println!("  <name> = <expr>   bind a variable");
     println!("  functions         gcd lcm abs floor ceil num den isqrt fact");
     println!("  literals          decimal, 0x.. 0b.. 0o.., and decimals like 1.5");
-    println!("  :base <n>         set the integer output radix (2..=36)");
+    println!("  :base <n>         set the integer output radix (2..=62)");
     println!("  :vars             list bound variables");
     println!("  :help             show this help");
     println!("  :quit             exit");

@@ -18,6 +18,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::str::FromStr;
 
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
@@ -205,9 +206,30 @@ impl Int {
     }
 
     /// Returns the unsigned magnitude `|self|`.
+    ///
+    /// This always clones; see [`Int::magnitude_ref`] to borrow it and
+    /// [`Int::into_magnitude`] to take it, and [`Int::limbs`] for its limbs.
     #[inline]
     pub fn magnitude(&self) -> Nat {
         self.to_sign_mag().1
+    }
+
+    /// Returns the unsigned magnitude `|self|`, borrowed when it is heap-backed
+    /// (more than one limb) and only materialized for single-limb values.
+    pub fn magnitude_ref(&self) -> Cow<'_, Nat> {
+        match &self.0 {
+            Repr::Small { mag, .. } => Cow::Owned(Nat::from_u64(*mag)),
+            Repr::Large { mag, .. } => Cow::Borrowed(mag),
+        }
+    }
+
+    /// Consumes `self` and returns its unsigned magnitude `|self|` without
+    /// copying the limbs.
+    pub fn into_magnitude(self) -> Nat {
+        match self.0 {
+            Repr::Small { mag, .. } => Nat::from_u64(mag),
+            Repr::Large { mag, .. } => mag,
+        }
     }
 
     /// Returns `true` if this value is zero.
@@ -322,7 +344,22 @@ impl Int {
     }
 
     /// Returns `self` raised to `exp` (`self^0 == 1`), by square-and-multiply.
+    ///
+    /// Bases `0`, `±1` and `±2^k` are answered directly, so their exponent may
+    /// be any `u64` (as long as the result fits in memory).
     pub fn pow(&self, exp: u64) -> Int {
+        let odd_neg = self.is_negative() && exp & 1 == 1;
+        if exp == 0 {
+            return Int::ONE;
+        }
+        if self.is_zero() {
+            return Int::ZERO;
+        }
+        if let Some(k) = self.is_power_of_two() {
+            let shift = (k as u64).checked_mul(exp).expect("pow: result too large");
+            let r = Int::ONE.mul_2k(shift);
+            return if odd_neg { r.neg() } else { r };
+        }
         let mut result = Int::ONE;
         let mut base = self.clone();
         let mut e = exp;
@@ -716,7 +753,14 @@ impl Int {
     /// matters and which uses the subquadratic Half-GCD driver above a size
     /// threshold — this stays Euclidean. It also serves as the reference the
     /// Half-GCD path is differentially tested against.
+    ///
+    /// The cofactors follow GMP's `mpz_gcdext` normalization: `|s| < |b|/(2g)`
+    /// and `|t| < |a|/(2g)`, with `s = 0, t = sgn(b)` when `|a| == |b|`, and
+    /// `(0, 0, 0)` for `a = b = 0`.
     pub fn extended_gcd(&self, b: &Int) -> (Int, Int, Int) {
+        if self.is_zero() && b.is_zero() {
+            return (Int::ZERO, Int::ZERO, Int::ZERO);
+        }
         let (mut old_r, mut r) = (self.clone(), b.clone());
         let (mut old_s, mut s) = (Int::ONE, Int::ZERO);
         let (mut old_t, mut t) = (Int::ZERO, Int::ONE);
@@ -988,15 +1032,18 @@ impl Int {
         }
     }
 
-    /// Returns the value as the nearest `f64` (best-effort; may be `±inf` on
-    /// overflow).
+    /// Returns the nearest `f64` (ties to even), or `±∞` when `|self|` rounds
+    /// past `f64::MAX`.
     pub fn to_f64(&self) -> f64 {
-        let (sign, mag) = self.to_sign_mag();
-        let mut f = 0.0f64;
-        for &limb in mag.as_limbs().iter().rev() {
-            f = f * 18446744073709551616.0 /* 2^64 */ + limb as f64;
-        }
-        if sign == Sign::Negative { -f } else { f }
+        let f = crate::nat::limbs_to_f64(self.limbs(), true);
+        if self.is_negative() { -f } else { f }
+    }
+
+    /// Returns the `f64` obtained by truncating toward zero, like GMP's
+    /// `mpz_get_d`; `±∞` when `|self| ≥ 2^1024`.
+    pub fn to_f64_trunc(&self) -> f64 {
+        let f = crate::nat::limbs_to_f64(self.limbs(), false);
+        if self.is_negative() { -f } else { f }
     }
 }
 
@@ -1182,6 +1229,18 @@ fn product_range(lo: u64, hi: u64) -> Int {
     }
 }
 
+/// `top·(top-1)·…·(top-count+1)` for `count ≥ 1`, as a balanced product tree.
+fn falling_product(top: &Int, count: u64) -> Int {
+    if count == 1 {
+        return top.clone();
+    }
+    let half = count / 2;
+    falling_product(top, half).mul(&falling_product(
+        &top.sub(&Int::from_u64(half)),
+        count - half,
+    ))
+}
+
 impl Int {
     /// Returns `n!` (`0! == 1! == 1`).
     ///
@@ -1213,6 +1272,25 @@ impl Int {
         num.div_exact(&den)
     }
 
+    /// Returns the binomial coefficient `C(n, k)` for an arbitrary integer `n`
+    /// (GMP's `mpz_bin_ui`): the falling product `n·(n-1)·…·(n-k+1) / k!`,
+    /// so `C(n, k) = (-1)^k·C(k-n-1, k)` for negative `n`, and `0` for
+    /// `0 ≤ n < k`.
+    pub fn binomial_int(n: &Int, k: u64) -> Int {
+        if let Some(n) = n.to_u64() {
+            return Int::binomial(n, k);
+        }
+        if k == 0 {
+            return Int::ONE;
+        }
+        if n.is_negative() {
+            let r = Int::binomial_int(&Int::from_u64(k).sub(n).sub(&Int::ONE), k);
+            return if k & 1 == 1 { r.neg() } else { r };
+        }
+        // n > u64::MAX ≥ k: every factor of the falling product is positive.
+        falling_product(n, k).div_exact(&product_range(1, k))
+    }
+
     /// Returns the multinomial coefficient `(Σkᵢ)! / ∏(kᵢ!)`.
     pub fn multinomial(ks: &[u64]) -> Int {
         let mut total = 0u64;
@@ -1236,13 +1314,50 @@ impl Int {
         f_n1.mul_2k(1).sub(&f_n) // L(n) = 2·F(n+1) − F(n)
     }
 
-    /// Returns the Jacobi symbol `(self / n)` for odd `n > 0` (`-1`, `0`, `1`).
+    /// Returns the Jacobi symbol `(self / n)` (`-1`, `0`, `1`).
+    ///
+    /// Defined for odd `n > 0`; any other `n` is answered by the Kronecker
+    /// extension (see [`Int::kronecker`]), as GMP's `mpz_jacobi` does.
+    #[inline]
     pub fn jacobi(&self, n: &Int) -> i32 {
-        assert!(
-            n.is_positive() && n.is_odd(),
-            "jacobi: n must be odd and > 0"
-        );
-        crate::nat::jacobi(self, &n.magnitude())
+        self.kronecker(n)
+    }
+
+    /// Returns the Kronecker symbol `(self / n)` (`-1`, `0`, `1`) for any `n`:
+    /// the Jacobi symbol extended by `(a/2) = 0` for even `a`, `1` for
+    /// `a ≡ ±1 (mod 8)`, `-1` for `a ≡ ±3 (mod 8)`; `(a/-1) = sgn(a)` (with
+    /// `(0/-1) = 1`); and `(a/0) = 1` iff `a = ±1`, else `0`.
+    pub fn kronecker(&self, n: &Int) -> i32 {
+        if n.is_zero() {
+            return i32::from(self.magnitude_ref().is_one());
+        }
+        let mut result = if n.is_negative() && self.is_negative() {
+            -1
+        } else {
+            1
+        };
+        let tz = n.trailing_zeros();
+        if tz > 0 {
+            if self.is_even() {
+                return 0;
+            }
+            // (a/2) = −1 iff a ≡ ±3 (mod 8); two's-complement low bits give
+            // `a mod 8` for negative `a` as well.
+            let lo = self.least_significant_limb();
+            let a8 = if self.is_negative() {
+                lo.wrapping_neg()
+            } else {
+                lo
+            } & 7;
+            if tz & 1 == 1 && (a8 == 3 || a8 == 5) {
+                result = -result;
+            }
+        }
+        let odd = n.magnitude_ref().shr(tz as u64);
+        if odd.is_one() {
+            return result;
+        }
+        result * crate::nat::jacobi(self, &odd)
     }
 
     /// Returns the Legendre symbol `(self / p)` for an odd prime `p`. (Same
@@ -1371,8 +1486,8 @@ impl From<Nat> for Int {
 }
 
 impl Int {
-    /// Parses a decimal integer in the given `radix` (2–36), with an optional
-    /// leading `+`/`-`.
+    /// Parses an integer in the given `radix` (2–62), with an optional leading
+    /// `+`/`-`. See [`Nat::write_radix`] for the digit alphabet.
     pub fn from_str_radix(s: &str, radix: u32) -> Result<Int> {
         let (sign, digits) = match s.strip_prefix('-') {
             Some(rest) => (Sign::Negative, rest),
@@ -1382,7 +1497,8 @@ impl Int {
         Ok(Int::from_sign_magnitude(sign, mag))
     }
 
-    /// Writes `self` in the given `radix` (2–36) to `out`.
+    /// Writes `self` in the given `radix` (2–62) to `out`. See
+    /// [`Nat::write_radix`] for the digit alphabet.
     pub fn write_radix(&self, out: &mut impl fmt::Write, radix: u32) -> fmt::Result {
         if self.is_negative() {
             out.write_str("-")?;
@@ -1493,6 +1609,10 @@ macro_rules! binops {
 binops!(Add, add, AddAssign, add_assign);
 binops!(Sub, sub, SubAssign, sub_assign);
 binops!(Mul, mul, MulAssign, mul_assign);
+// Two's-complement bitwise ops (see `Int::bitand`).
+binops!(BitAnd, bitand, BitAndAssign, bitand_assign);
+binops!(BitOr, bitor, BitOrAssign, bitor_assign);
+binops!(BitXor, bitxor, BitXorAssign, bitxor_assign);
 
 /// `/` and `%` use truncated (toward-zero) division, matching `i64`/`i128`. Use
 /// the `div_rem_euclid`/`div_rem_floor` methods for the other conventions.

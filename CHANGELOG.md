@@ -7,11 +7,39 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+### Added
+
+- *(int)* GMP-parity integer operations, differentially tested against libgmp:
+  `Int::to_f64_trunc`/`Nat::to_f64_trunc` (`mpz_get_d`) and `Nat::to_f64`;
+  `Int::kronecker`; two's-complement `Int::test_bit`/`set_bit`/`clear_bit`/
+  `complement_bit` and `Int::not` (`!`); `count_ones`, `hamming_distance`,
+  `scan0`/`scan1` on `Int` and `Nat`; `Int::div_2k_floor`/`div_2k_ceil`/
+  `rem_2k_trunc`; `isqrt`/`isqrt_rem`/`root`/`root_rem` (any `u64` degree),
+  `is_perfect_square` and `is_perfect_power`; `Int::binomial_int` for any
+  integer `n` (`mpz_bin_ui`); `Int::magnitude_ref`/`into_magnitude`;
+  big-endian and two's-complement byte import/export (`Int::{from,to}_bytes_{be,le}`,
+  `Int::{from,to}_signed_bytes_{be,le}`, `Nat::{from,to}_bytes_be`)
+- *(int)* `<<`/`>>` (`u64` shift, `>>` rounding toward −∞) and `&`/`|`/`^`
+  operators for `Int`
+- *(nat)* radixes up to 62 in parsing and `write_radix` (GMP's `0-9A-Za-z`
+  alphabet above 36; case-insensitive up to 36); the CLI's `:base` follows
+
+### Fixed
+
+- *(int)* `Int::to_f64` rounds correctly (nearest, ties to even) for values of
+  three or more limbs; it previously accumulated limbs with double rounding,
+  e.g. `2^128 + 2^75 + 1` gave `2^128` instead of `2^128 + 2^76`
+- *(int)* `Int::jacobi` no longer panics for even or non-positive `n`; it
+  answers with the Kronecker extension, like `mpz_jacobi`
+- *(int)* `Int::extended_gcd(0, 0)` returns `(0, 0, 0)` (was `(0, 1, 0)`)
+
 ### Changed
 
 - **breaking** *(int)* `Int::pow`, `Int::mul_2k`, `Int::div_2k_trunc`,
   `Int::mod_2k` and `Int::bit` take a `u64` (was `u32`), matching `Nat`'s
   bit-index and shift widths
+- *(int)* `Int::pow` answers bases `0`, `±1` and `±2^k` directly, so their
+  exponent may be any `u64`
 
 ### Fixed
 

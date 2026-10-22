@@ -104,9 +104,13 @@ mod limb;
 #[cfg(feature = "int")]
 pub mod int;
 #[cfg(feature = "int")]
+mod int_bits;
+#[cfg(feature = "int")]
 mod int_jacobsthal;
 #[cfg(feature = "int")]
 mod int_multiplicative;
+#[cfg(feature = "int")]
+mod int_roots;
 #[cfg(feature = "int")]
 pub mod nat;
 

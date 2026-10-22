@@ -2729,7 +2729,7 @@ impl Nat {
     /// The divisor must be non-zero. Uses a precomputed Möller–Granlund
     /// reciprocal so the per-limb step is two multiplications instead of a
     /// (libcall) 128-by-64-bit hardware division.
-    fn divmod_small(&self, d: Limb) -> (Nat, Limb) {
+    pub(crate) fn divmod_small(&self, d: Limb) -> (Nat, Limb) {
         debug_assert!(d != 0, "divmod_small by zero");
         let n = self.limbs.len();
         if n == 0 {
@@ -2926,6 +2926,18 @@ impl Nat {
         n
     }
 
+    /// Returns the nearest `f64` (ties to even), or `+∞` when the value rounds
+    /// past `f64::MAX`.
+    pub fn to_f64(&self) -> f64 {
+        limbs_to_f64(&self.limbs, true)
+    }
+
+    /// Returns the `f64` obtained by truncating toward zero (GMP's
+    /// `mpz_get_d`), or `+∞` when the value is `≥ 2^1024`.
+    pub fn to_f64_trunc(&self) -> f64 {
+        limbs_to_f64(&self.limbs, false)
+    }
+
     /// Builds a natural from little-endian bytes.
     pub fn from_bytes_le(bytes: &[u8]) -> Nat {
         let mut limbs = Vec::with_capacity(bytes.len() / 8 + 1);
@@ -3052,9 +3064,12 @@ impl Nat {
         x
     }
 
-    /// Writes the magnitude in the given `radix` (2–36) to `out`.
+    /// Writes the magnitude in the given `radix` (2–62) to `out`.
+    ///
+    /// Digits follow GMP's convention: `0-9a-z` for radixes up to 36, and
+    /// `0-9A-Za-z` (upper case first) for radixes 37–62.
     pub fn write_radix(&self, out: &mut impl fmt::Write, radix: u32) -> fmt::Result {
-        assert!((2..=36).contains(&radix), "radix must be in 2..=36");
+        assert!((2..=62).contains(&radix), "radix must be in 2..=62");
         if self.is_zero() {
             return out.write_str("0");
         }
@@ -3148,12 +3163,12 @@ fn simple_radix_string(n: &Nat, radix: u32) -> String {
         if n.is_zero() {
             // Most significant chunk: stop at its leading digit.
             while r != 0 {
-                buf.push(digit_char((r % radix as u64) as u32));
+                buf.push(digit_char((r % radix as u64) as u32, radix));
                 r /= radix as u64;
             }
         } else {
             for _ in 0..chunk {
-                buf.push(digit_char((r % radix as u64) as u32));
+                buf.push(digit_char((r % radix as u64) as u32, radix));
                 r /= radix as u64;
             }
         }
@@ -3162,19 +3177,73 @@ fn simple_radix_string(n: &Nat, radix: u32) -> String {
     String::from_utf8(buf).unwrap_or_default()
 }
 
-/// Maps a digit value `0..36` to its ASCII character (`0-9`, then `a-z`).
+/// Converts normalized little-endian limbs to `f64`, rounding to nearest-even
+/// (`round`) or truncating toward zero; `+∞` past the `f64` range. Only the top 64 bits plus a sticky bit
+/// are inspected, so this is `O(1)` past the sticky scan.
+pub(crate) fn limbs_to_f64(limbs: &[Limb], round: bool) -> f64 {
+    let Some(&hi) = limbs.last() else {
+        return 0.0;
+    };
+    let n = limbs.len() as u64 * 64 - hi.leading_zeros() as u64;
+    if n <= 64 {
+        // `as f64` already rounds to nearest-even; truncation drops the bits
+        // below the 53-bit significand first.
+        return if round || n <= 53 {
+            hi as f64
+        } else {
+            ((hi >> (n - 53)) << (n - 53)) as f64
+        };
+    }
+    // The top 64 bits, and whether anything below them is non-zero.
+    let shift = n - 64;
+    let (i, off) = ((shift / 64) as usize, (shift % 64) as u32);
+    let mut top = limbs[i] >> off;
+    if off > 0 {
+        top |= limbs[i + 1] << (64 - off);
+    }
+    let sticky = (off > 0 && limbs[i] << (64 - off) != 0) || limbs[..i].iter().any(|&l| l != 0);
+    let mut mant = top >> 11;
+    let rest = top & 0x7ff;
+    if round && (rest > 0x400 || (rest == 0x400 && (sticky || mant & 1 == 1))) {
+        mant += 1; // may carry to 2^53, still exact
+    }
+    let exp = n - 53; // value ≈ mant · 2^exp, with mant ∈ [2^52, 2^53]
+    if exp > 1023 - 52 {
+        return f64::INFINITY;
+    }
+    mant as f64 * f64::from_bits((exp + 1023) << 52)
+}
+
+/// Maps a digit value `0..radix` to its ASCII character: `0-9a-z` for
+/// `radix ≤ 36`, `0-9A-Za-z` above.
 #[inline]
-fn digit_char(d: u32) -> u8 {
-    if d < 10 {
-        b'0' + d as u8
-    } else {
-        b'a' + (d - 10) as u8
+fn digit_char(d: u32, radix: u32) -> u8 {
+    match d {
+        0..10 => b'0' + d as u8,
+        _ if radix <= 36 => b'a' + (d - 10) as u8,
+        10..36 => b'A' + (d - 10) as u8,
+        _ => b'a' + (d - 36) as u8,
     }
 }
 
-/// Parses an unsigned integer in the given `radix` (2–36).
+/// Maps an ASCII digit to its value in `radix`, the inverse of [`digit_char`]
+/// except that letters are case-insensitive for `radix ≤ 36`.
+#[inline]
+fn digit_value(c: char, radix: u32) -> Option<u32> {
+    let v = match c {
+        '0'..='9' => c as u32 - '0' as u32,
+        'a'..='z' if radix <= 36 => c as u32 - 'a' as u32 + 10,
+        'a'..='z' => c as u32 - 'a' as u32 + 36,
+        'A'..='Z' => c as u32 - 'A' as u32 + 10,
+        _ => return None,
+    };
+    (v < radix).then_some(v)
+}
+
+/// Parses an unsigned integer in the given `radix` (2–62); see
+/// [`Nat::write_radix`] for the digit alphabet.
 pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
-    if !(2..=36).contains(&radix) || s.is_empty() {
+    if !(2..=62).contains(&radix) || s.is_empty() {
         return Err(Error::Parse);
     }
     // Largest `d` with `radix^d` fitting a `u64`, and that base `B = radix^d`.
@@ -3190,7 +3259,7 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
     // Validate and collect the digit values (big-endian).
     let digits: Vec<u32> = s
         .chars()
-        .map(|c| c.to_digit(radix).ok_or(Error::Parse))
+        .map(|c| digit_value(c, radix).ok_or(Error::Parse))
         .collect::<Result<_>>()?;
 
     // Fast path for small inputs: a single base-`B` limb.

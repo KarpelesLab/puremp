@@ -32,6 +32,11 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 - *(nat)* `Nat::isqrt` is 1.6–1.9× faster up to a few thousand bits: an
   `f64`-seeded single-step `u128` base case and fewer temporaries per
   Karatsuba-square-root level
+- *(nat)* Division: Burnikel–Ziegler pads the divisor to a block that halves
+  evenly down to the base case instead of the next power of two (12–33% at
+  non-power-of-two sizes), and long quotients (and very large operands) use
+  Newton-reciprocal division — ~2 products per further quotient block instead
+  of ~5 (e.g. a 5n/n division at 8000 limbs drops from ~20 to ~11 products)
 - *(int)* `Int::extended_gcd` uses an extended Lehmer loop (and the Half-GCD
   driver past ~256 limbs) and reduces the Bézout pair to the same
   GMP-normalized cofactors, instead of quadratic plain Euclid: ~17× faster at

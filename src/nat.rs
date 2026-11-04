@@ -606,12 +606,19 @@ fn bz_block(x: &Nat, i: usize, n: usize) -> Nat {
 /// `a > b` and `b.limbs.len() >= 2`.
 fn bz_div_rem(a: &Nat, b: &Nat) -> (Nat, Nat) {
     let n = b.limbs.len();
-    // Use a power-of-two block size so every recursive split stays even and the
-    // recursion never bails to quadratic Knuth. Padding the divisor to `n2`
+    // Use a block size that stays even through every recursive split so the
+    // recursion never bails to quadratic Knuth early. Padding the divisor to `n2`
     // limbs by an extra left shift is value-preserving: shifting both operands
     // left by the same amount leaves the quotient unchanged and only scales the
     // remainder, which the final `shr` undoes.
-    let n2 = n.next_power_of_two();
+    // Smallest block n2 ≥ n that halves evenly k times down to the base case
+    // (n2 = ⌈n/2^k⌉·2^k with ⌈n/2^k⌉ < BZ_BASE): pads by < 2^k limbs rather
+    // than up to 2× for a next-power-of-two block.
+    let mut k = 0;
+    while n.div_ceil(1 << k) >= BZ_BASE {
+        k += 1;
+    }
+    let n2 = n.div_ceil(1 << k) << k;
     let s = b.limbs[n - 1].leading_zeros() as u64;
     let shift = s + (n2 - n) as u64 * LIMB_BITS as u64;
     let bn = b.shl(shift); // exactly n2 limbs, top bit set
@@ -632,6 +639,249 @@ fn bz_div_rem(a: &Nat, b: &Nat) -> (Nat, Nat) {
         q = q.add(&part.shl((t - 1 - j) as u64 * nbits));
     }
     (q, r.shr(shift))
+}
+
+// --- Newton-reciprocal division (Brent & Zimmermann, MCA §3.4–3.5) ---------
+//
+// For large operands, where multiplication is NTT-based and Burnikel–Ziegler
+// costs `O(M(n)·log n)`, divide through an approximate reciprocal instead:
+// `V ≈ β^(2n)/d` by Newton's iteration with doubling precision (`O(M(n))`),
+// then each `n`-limb block of the quotient is one high product with `V` and
+// one back-multiplication, corrected exactly against the true remainder.
+
+/// Whether Newton-reciprocal division beats Burnikel–Ziegler for an `n`-limb
+/// divisor and an `m`-limb quotient. BZ costs ~5 products per further `n`-limb
+/// quotient block, Newton ~2 after a one-time ~3-product reciprocal, so Newton
+/// wins on long quotients from moderate sizes, and on balanced ones only once
+/// BZ's `log n` factor dominates. (Measured on x86-64; ratios to `M(n)`.)
+fn newton_div_worthwhile(n: usize, m: usize) -> bool {
+    (n >= 768 && m >= 4 * n) || (n >= 2048 && m >= 2 * n) || (n >= 16384 && m >= n)
+}
+
+/// Precision (limbs) at or below which the reciprocal is computed by one exact
+/// division instead of a further Newton level.
+const NEWTON_RECIP_BASE: usize = 192;
+
+/// `⌊x / β^k⌋` (drops the low `k` limbs).
+fn limbs_shr(x: &Nat, k: usize) -> Nat {
+    if k >= x.limbs.len() {
+        Nat::zero()
+    } else {
+        Nat::from_limbs(&x.limbs[k..])
+    }
+}
+
+/// `x · β^k`.
+fn limbs_shl(x: &Nat, k: usize) -> Nat {
+    if x.is_zero() {
+        return Nat::zero();
+    }
+    let mut v = Vec::with_capacity(x.limbs.len() + k);
+    v.resize(k, 0);
+    v.extend_from_slice(&x.limbs);
+    Nat { limbs: v }
+}
+
+/// Approximate reciprocal of the normalized `n`-limb `d` (top bit set):
+/// returns `V` with `|V − β^(2n)/d| ≤ 4`.
+///
+/// One Newton step from the reciprocal `Vh` of the top `h = ⌈n/2⌉ + 1` limbs
+/// `dh`: with `e = β^(n+h) − d·Vh` (`|e| ≲ 6·β^n`),
+/// `V = Vh·β^(n−h) + ⌊Vh·e / β^(2h)⌋`, whose relative error is the square of
+/// `Vh`'s (≲ (6β^−h)²), so the absolute error is `O(β^(n−2h)) < 1` plus
+/// rounding.
+fn newton_recip(d: &Nat) -> Nat {
+    let n = d.limbs.len();
+    if n <= NEWTON_RECIP_BASE {
+        return limbs_shl(&Nat::one(), 2 * n).div_rem(d).expect("d > 0").0;
+    }
+    let h = n / 2 + 2;
+    let dh = limbs_shr(d, n - h);
+    let vh = newton_recip(&dh);
+    let p = d.mul(&vh);
+    let top = limbs_shl(&Nat::one(), n + h);
+    let base = limbs_shl(&vh, n - h);
+    // Truncate e to its top limbs: dropping h − 1 low limbs perturbs
+    // Vh·e/β^(2h) by < Vh·β^(h−1)/β^(2h) < 1.
+    if p.cmp_ref(&top) != Ordering::Greater {
+        let e = top.checked_sub(&p).expect("p <= top");
+        let corr = limbs_shr(&vh.mul(&limbs_shr(&e, h - 1)), h + 1);
+        base.add(&corr)
+    } else {
+        let e = p.checked_sub(&top).expect("p > top");
+        let corr = limbs_shr(&vh.mul(&limbs_shr(&e, h - 1)), h + 1);
+        base.checked_sub(&corr.add_u64(1))
+            .expect("correction is far below Vh·β^(n−h)")
+    }
+}
+
+/// Turns a quotient estimate `q0` (within a few units of `⌊a/d⌋`) into the
+/// exact `(q, r)` by stepping against the true remainder; `None` if the
+/// estimate was off by more than a small bound (the caller then falls back).
+fn correct_quotient(a: &Nat, d: &Nat, q0: Nat) -> Option<(Nat, Nat)> {
+    const MAX_STEPS: usize = 16;
+    let qd = q0.mul(d);
+    let mut q = q0;
+    let mut r = if qd.cmp_ref(a) == Ordering::Greater {
+        // Too large: step down until q·d ≤ a, tracking the deficit q·d − a.
+        let mut deficit = qd;
+        deficit.sub_assign_limbs(&a.limbs);
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            if steps > MAX_STEPS || q.is_zero() {
+                return None;
+            }
+            q.sub_assign_u64_unchecked(1);
+            if deficit.cmp_ref(d) != Ordering::Greater {
+                let mut r = d.clone();
+                r.sub_assign_limbs(&deficit.limbs);
+                break r;
+            }
+            deficit.sub_assign_limbs(&d.limbs);
+        }
+    } else {
+        let mut r = a.clone();
+        r.sub_assign_limbs(&qd.limbs);
+        r
+    };
+    let mut steps = 0;
+    while r.cmp_ref(d) != Ordering::Less {
+        steps += 1;
+        if steps > MAX_STEPS {
+            return None;
+        }
+        r.sub_assign_limbs(&d.limbs);
+        q.add_assign_u64(1);
+    }
+    Some((q, r))
+}
+
+/// Divides `a < d·β^(n−2)` by the normalized `n`-limb `d` using its
+/// approximate reciprocal `v ≈ β^(2n)/d` (from [`newton_recip`]).
+///
+/// `q₀ = ⌊⌊a/β^(n−2)⌋·⌊v/β⌋ / β^(n+1)⌋`: dropping `n − 2` limbs of `a` costs
+/// `< 2β^(−2)`, dropping one limb of `v` costs `< β^(−1)`, so `q₀` is within a
+/// few units of `⌊a/d⌋`. Both factors have at most `n` limbs, keeping the
+/// product at a clean `n × n` size (the quotient block is `n − 2` limbs).
+fn newton_div_block(a: &Nat, d: &Nat, v: &Nat, n: usize) -> (Nat, Nat) {
+    let q0 = limbs_shr(&limbs_shr(a, n - 2).mul(&limbs_shr(v, 1)), n + 1);
+    correct_quotient(a, d, q0).unwrap_or_else(|| div_rem_classic(a, d))
+}
+
+/// `a divmod d` (`d` ≥ 2 limbs) by Burnikel–Ziegler / Knuth only — never the
+/// Newton path, so the Newton code can fall back on it without recursion.
+fn div_rem_classic(a: &Nat, d: &Nat) -> (Nat, Nat) {
+    match a.cmp_ref(d) {
+        Ordering::Less => (Nat::zero(), a.clone()),
+        Ordering::Equal => (Nat::one(), Nat::zero()),
+        Ordering::Greater => {
+            let q = a.limbs.len() - d.limbs.len();
+            if d.limbs.len() >= BZ_THRESHOLD && q >= BZ_THRESHOLD {
+                bz_div_rem(a, d)
+            } else {
+                a.div_rem_knuth(d)
+            }
+        }
+    }
+}
+
+/// Division with a short quotient: `a < d·β^f` for the normalized `n`-limb
+/// `d`, with `f + 2 < n`. Only the top `f + 2` limbs of `d` (and the matching
+/// limbs of `a`) determine the quotient up to a small error, so divide those
+/// (a balanced `≈ 2f`-by-`f` problem), then correct against the full remainder
+/// with one `f`-by-`n` product.
+fn div_short_quotient(a: &Nat, d: &Nat, f: usize) -> (Nat, Nat) {
+    let n = d.limbs.len();
+    debug_assert!(f + 2 < n);
+    let k = n - (f + 2);
+    let at = limbs_shr(a, k);
+    let dt = limbs_shr(d, k);
+    let q0 = if at.cmp_ref(&dt) == Ordering::Less {
+        Nat::zero()
+    } else {
+        at.div_rem(&dt).expect("dt > 0").0
+    };
+    correct_quotient(a, d, q0).unwrap_or_else(|| div_rem_classic(a, d))
+}
+
+/// A divisor prepared for repeated Newton-reciprocal division: normalized
+/// (top bit set) with its approximate reciprocal `v ≈ β^(2n)/d`.
+struct PreInv {
+    d: Nat,
+    shift: u64,
+    v: Nat,
+}
+
+impl PreInv {
+    /// Prepares `b` (≥ 3 limbs).
+    fn new(b: &Nat) -> PreInv {
+        let n = b.limbs.len();
+        debug_assert!(n >= 3);
+        let shift = b.limbs[n - 1].leading_zeros() as u64;
+        let d = b.shl(shift);
+        let v = newton_recip(&d);
+        PreInv { d, shift, v }
+    }
+
+    /// `a divmod b` for any `a`.
+    fn div_rem(&self, a: &Nat) -> (Nat, Nat) {
+        let d = &self.d;
+        let n = d.limbs.len();
+        if a.limbs.len() < n {
+            return (Nat::zero(), a.clone());
+        }
+        let an = a.shl(self.shift);
+        // Quotient limbs m (q < β^m); blocks of w = n − 2 quotient limbs from
+        // the top, the first one taking the remainder m mod w.
+        let m = an.limbs.len() + 1 - n;
+        let w = n - 2;
+        let first = match m % w {
+            0 => w,
+            f => f,
+        };
+        let mut q_limbs: Vec<Limb> = alloc::vec![0; m];
+        let mut r = Nat::zero();
+        let mut pos = m; // quotient limbs still to produce, below `pos`
+        let mut width = first;
+        while pos > 0 {
+            let lo = pos - width;
+            // Window W = R·β^width + an[lo..pos) < d·β^width, where R < d is
+            // the running remainder; initially R is an's top n − 1 limbs.
+            let cur = if pos == m {
+                Nat::from_limbs(&an.limbs[lo..])
+            } else {
+                let mut cur = Vec::with_capacity(width + r.limbs.len());
+                cur.extend_from_slice(&an.limbs[lo..pos]);
+                cur.extend_from_slice(&r.limbs);
+                Nat::from_limb_vec(cur)
+            };
+            let (qi, ri) = if width == w {
+                newton_div_block(&cur, d, &self.v, n)
+            } else {
+                div_short_quotient(&cur, d, width)
+            };
+            q_limbs[lo..lo + qi.limbs.len()].copy_from_slice(&qi.limbs);
+            r = ri;
+            pos = lo;
+            width = w;
+        }
+        (Nat::from_limb_vec(q_limbs), r.shr(self.shift))
+    }
+}
+
+/// Newton-reciprocal division. Precondition: `a > b`, `b` has ≥ 3 limbs.
+fn newton_div_rem(a: &Nat, b: &Nat) -> (Nat, Nat) {
+    let n = b.limbs.len();
+    // A quotient shorter than the block width needs no reciprocal.
+    let shift = b.limbs[n - 1].leading_zeros() as u64;
+    let an = a.shl(shift);
+    let m = an.limbs.len() + 1 - n;
+    if m + 2 < n {
+        let (q, r) = div_short_quotient(&an, &b.shl(shift), m);
+        return (q, r.shr(shift));
+    }
+    PreInv::new(b).div_rem(a)
 }
 
 /// Divide a `≤ 2n`-limb value by the `n`-limb normalized divisor `b`
@@ -2825,6 +3075,9 @@ impl Nat {
         // quotient are long: schoolbook costs `O(n·m)` for an `m`-limb
         // quotient, which beats any recursion when `m` is small.
         let quot_limbs = self.limbs.len() - rhs.limbs.len();
+        if newton_div_worthwhile(rhs.limbs.len(), quot_limbs) {
+            return Some(newton_div_rem(self, rhs));
+        }
         if rhs.limbs.len() >= BZ_THRESHOLD && quot_limbs >= BZ_THRESHOLD {
             return Some(bz_div_rem(self, rhs));
         }
@@ -4790,6 +5043,98 @@ mod tests {
             for k in [3u32, 4, 5, 7, 11, 13] {
                 check(&n, k);
             }
+        }
+    }
+
+    #[test]
+    fn newton_division_matches_knuth() {
+        let mut st = 0xdead_beef_1234_5678u64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let mut rand = |len: usize, mode: u64| -> Nat {
+            Nat::from_limb_vec(
+                (0..len)
+                    .map(|_| match mode {
+                        0 => next(),
+                        1 => u64::MAX,
+                        _ => {
+                            if next() % 4 == 0 {
+                                next()
+                            } else {
+                                0
+                            }
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        for &(la, lb) in &[
+            (5usize, 3usize),
+            (400, 200),
+            (401, 250),
+            (900, 450),
+            (1000, 300),
+            (1200, 1100),
+            (2000, 390),
+            (398, 200),
+            (399, 200),
+            (600, 200),
+            (601, 200),
+            (396, 200),
+            (397, 200),
+            (300, 200),
+        ] {
+            for mode in 0..3u64 {
+                let a = rand(la, mode).add_u64(1);
+                let mut b = rand(lb, (mode + 1) % 3);
+                if b.limbs.len() < 2 {
+                    b = b.add(&limbs_shl(&Nat::one(), lb - 1));
+                }
+                if a.cmp_ref(&b) != Ordering::Greater {
+                    continue;
+                }
+                assert_eq!(
+                    newton_div_rem(&a, &b),
+                    a.div_rem_knuth(&b),
+                    "{la}/{lb} mode {mode}"
+                );
+            }
+            // β^(lb−1) and β^lb − 1 divisors, all-ones dividend.
+            let a = rand(la, 1);
+            let b = limbs_shl(&Nat::one(), lb - 1);
+            assert_eq!(newton_div_rem(&a, &b), a.div_rem_knuth(&b));
+            let b = rand(lb, 1);
+            assert_eq!(newton_div_rem(&a, &b), a.div_rem_knuth(&b));
+            let b = rand(lb, 1).shr(1);
+            assert_eq!(newton_div_rem(&a, &b), a.div_rem_knuth(&b));
+        }
+        // The production dispatch (Nat::div_rem) on a size that selects Newton.
+        let a = rand(3900, 0);
+        let b = rand(770, 0);
+        assert!(newton_div_worthwhile(770, 3900 - 770));
+        assert_eq!(a.div_rem(&b).unwrap(), a.div_rem_knuth(&b));
+        // newton_recip stays within its error bound
+        for n in [3usize, 193, 200, 400, 777] {
+            let d = rand(n, 0).add(&limbs_shl(&Nat::one(), n).shr(1));
+            let d = Nat::from_limbs(&d.limbs[..n]);
+            let d = if d.bit_len() < (n as u64) * 64 {
+                d.add(&limbs_shl(&Nat::one(), n).shr(1))
+            } else {
+                d
+            };
+            let v = newton_recip(&d);
+            let exact = limbs_shl(&Nat::one(), 2 * n).div_rem(&d).unwrap().0;
+            let diff = if v > exact {
+                v.checked_sub(&exact)
+            } else {
+                exact.checked_sub(&v)
+            }
+            .unwrap();
+            assert!(diff <= Nat::from_u64(4), "recip error {diff} at n={n}");
         }
     }
 

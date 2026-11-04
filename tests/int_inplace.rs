@@ -236,3 +236,29 @@ fn pow10_and_wide_pow() {
     assert_eq!(Nat::from_u64(4).pow(40), Nat::one().shl(80));
     assert_eq!(Nat::from_u64(3).pow(5), Nat::from_u64(243));
 }
+
+#[test]
+fn isqrt_is_floor_root() {
+    let mut rng = Rng(99);
+    for limbs in 0..40usize {
+        for _ in 0..30 {
+            let v: Vec<u64> = (0..limbs)
+                .map(|_| match rng.next() % 6 {
+                    0 => 0,
+                    1 => u64::MAX,
+                    _ => rng.next(),
+                })
+                .collect();
+            let a = Nat::from_limb_vec(v);
+            for x in [
+                a.clone(),
+                a.square(),
+                a.square().add_u64(0).checked_sub_u64(1).unwrap_or_default(),
+            ] {
+                let r = x.isqrt();
+                assert!(r.square() <= x, "isqrt({x}) too big");
+                assert!(r.add_u64(1).square() > x, "isqrt({x}) too small");
+            }
+        }
+    }
+}

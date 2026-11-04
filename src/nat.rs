@@ -738,21 +738,40 @@ fn sqrt_rem(a: &Nat) -> (Nat, Nat) {
     // a = H·B^(2l) + a₁·B^l + a₀ with B = 2^64; recurse on the (normalized)
     // high part, then one division computes the low half of the root.
     let l = n / 4;
-    let lbits = l as u64 * LIMB_BITS as u64;
-    let high = Nat::from_limbs(&a.limbs[2 * l..]);
-    let (s1, r1) = sqrt_rem(&high);
-    let a1 = Nat::from_limbs(&a.limbs[l..2 * l]);
-    let a0 = Nat::from_limbs(&a.limbs[..l]);
+    // `lo ‖ hi` = lo + hi·B^l for an l-limb `lo`, built in one allocation.
+    let concat = |lo: &[Limb], hi: &Nat| -> Nat {
+        let mut v = Vec::with_capacity(l + hi.limbs.len() + 1);
+        v.extend_from_slice(lo);
+        v.extend_from_slice(&hi.limbs);
+        Nat::from_limb_vec(v)
+    };
+    let (s1, r1) = sqrt_rem(&Nat::from_limbs(&a.limbs[2 * l..]));
     // (q, u) = (r₁·B^l + a₁) divmod 2·s₁; root estimate s = s₁·B^l + q.
-    let (q, u) = r1.shl(lbits).add(&a1).div_rem(&s1.shl(1)).expect("s1 > 0");
-    let mut s = s1.shl(lbits).add(&q);
+    let mut s1x2 = s1.clone();
+    s1x2.add_assign_limbs(&s1.limbs);
+    let (q, u) = concat(&a.limbs[l..2 * l], &r1)
+        .div_rem(&s1x2)
+        .expect("s1 > 0");
+    let mut s = Nat {
+        limbs: Vec::with_capacity(l + s1.limbs.len() + 1),
+    };
+    s.limbs.resize(l, 0);
+    s.limbs.extend_from_slice(&s1.limbs);
+    s.add_assign_limbs(&q.limbs);
     // r = u·B^l + a₀ − q², fixed up so 0 ≤ r ≤ 2s. Both loops run O(1) times
     // and cost only additions of half-size values — never full-width squarings.
-    let t = u.shl(lbits).add(&a0);
+    let t = concat(&a.limbs[..l], &u);
     let q2 = q.square();
     let one = Nat::one();
-    match t.checked_sub(&q2) {
-        Some(mut r) => {
+    let diff = if t.cmp_ref(&q2) == Ordering::Less {
+        Err((t, q2))
+    } else {
+        let mut r = t;
+        r.sub_assign_limbs(&q2.limbs);
+        Ok(r)
+    };
+    match diff {
+        Ok(mut r) => {
             // Rarely the estimate is one too small: while r > 2s, step s up
             // (r −= 2s+1 with the old s). Exiting at the first r ≤ 2s makes s
             // the floor, since r = a − s² is maintained exactly.
@@ -768,10 +787,11 @@ fn sqrt_rem(a: &Nat) -> (Nat, Nat) {
                 s = s.add(&one);
             }
         }
-        None => {
+        Err((t, q2)) => {
             // Estimate too large (r < 0): while r < 0, step s down (r += 2s−1
             // with the old s), tracked as the positive deficit q² − t.
-            let mut deficit = q2.checked_sub(&t).expect("t < q2");
+            let mut deficit = q2;
+            deficit.sub_assign_limbs(&t.limbs);
             loop {
                 let d = s
                     .shl(1)
@@ -791,20 +811,37 @@ fn sqrt_rem(a: &Nat) -> (Nat, Nat) {
 
 /// Integer square root of a `u128` (base case of [`Nat::isqrt`]).
 fn isqrt_u128(v: u128) -> u128 {
-    if v == 0 {
-        return 0;
+    if v >> 64 == 0 {
+        return isqrt_u64(v as u64) as u128;
     }
+    // Seed from the top 62–64 bits (an even shift 2k): with t = ⌊√(v >> 2k)⌋ ≥ 2^31,
+    // x₀ = (t + 1)·2^k exceeds √v by less than 2^k, so one Newton step leaves
+    // an error below 2^(2k)/2^(k+32) ≤ 1 (k ≤ 32); then fix up exactly.
     let bits = 128 - v.leading_zeros();
-    // Seed ≥ √v; Newton from above descends to ⌊√v⌋. `x + v/x` stays near
-    // `2·√v ≤ 2^65`, so it never overflows.
-    let mut x = 1u128 << bits.div_ceil(2);
-    loop {
-        let y = (x + v / x) / 2;
-        if y >= x {
-            return x;
-        }
-        x = y;
+    let k = (bits - 64).div_ceil(2);
+    let top = isqrt_u64((v >> (2 * k)) as u64) as u128;
+    let x0 = (top + 1) << k; // > √v, and ≤ 2^64
+    let mut x = (x0 + v / x0) / 2; // ≥ ⌊√v⌋ (AM-GM), and close to it
+    // x < 2^64 + small; x·x may need checking without overflow.
+    while x.checked_mul(x).is_none_or(|sq| sq > v) {
+        x -= 1;
     }
+    while (x + 1).checked_mul(x + 1).is_some_and(|sq| sq <= v) {
+        x += 1;
+    }
+    x
+}
+
+/// `⌊√v⌋` for a `u64`, from the hardware `f64` square root plus an exact fix-up.
+fn isqrt_u64(v: u64) -> u64 {
+    let mut x = (v as f64).sqrt() as u64; // within ±1 of the true root
+    while x.checked_mul(x).is_none_or(|sq| sq > v) {
+        x -= 1;
+    }
+    while (x + 1).checked_mul(x + 1).is_some_and(|sq| sq <= v) {
+        x += 1;
+    }
+    x
 }
 
 /// Left-to-right fixed-window modular exponentiation in an abstract domain.
@@ -4753,6 +4790,57 @@ mod tests {
             for k in [3u32, 4, 5, 7, 11, 13] {
                 check(&n, k);
             }
+        }
+    }
+
+    #[test]
+    fn isqrt_u128_is_exact() {
+        let check = |v: u128| {
+            let x = isqrt_u128(v);
+            assert!(x * x <= v, "isqrt({v}) = {x} too big");
+            assert!(
+                (x + 1).checked_mul(x + 1).is_none_or(|sq| sq > v),
+                "isqrt({v}) = {x} too small"
+            );
+        };
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for sh in 0..128u32 {
+            for _ in 0..200 {
+                let v = (((next() as u128) << 64) | next() as u128) >> sh;
+                check(v);
+                let r = isqrt_u128(v);
+                check(r * r);
+                check((r * r).saturating_sub(1));
+            }
+        }
+        for v in [
+            0u128,
+            1,
+            2,
+            3,
+            4,
+            u64::MAX as u128,
+            1 << 64,
+            (1 << 64) + 1,
+            u128::MAX,
+            u128::MAX - 1,
+        ] {
+            check(v);
+        }
+        let m = u64::MAX as u128;
+        check(m * m);
+        check(m * m - 1);
+        check(m * m + 2 * m);
+        for v in [u64::MAX, u64::MAX - 1, (1 << 52) + 1, 1 << 63] {
+            check(v as u128);
+            let r = isqrt_u64(v) as u128;
+            assert!(r * r <= v as u128 && (r + 1) * (r + 1) > v as u128);
         }
     }
 

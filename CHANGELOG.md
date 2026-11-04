@@ -29,6 +29,9 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ### Performance
 
+- *(nat)* `Nat::isqrt` is 1.6–1.9× faster up to a few thousand bits: an
+  `f64`-seeded single-step `u128` base case and fewer temporaries per
+  Karatsuba-square-root level
 - *(int)* `Int::extended_gcd` uses an extended Lehmer loop (and the Half-GCD
   driver past ~256 limbs) and reduces the Bézout pair to the same
   GMP-normalized cofactors, instead of quadratic plain Euclid: ~17× faster at

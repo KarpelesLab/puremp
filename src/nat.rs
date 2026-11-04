@@ -5510,7 +5510,7 @@ impl Nat {
             // Build the ladder `[radix^1, radix^2, radix^4, …]` once (largest
             // entry ≤ self), then share it across the whole recursion instead
             // of re-squaring it at every node.
-            let mut powers = alloc::vec![Nat::from_u64(radix as u64)];
+            let mut powers = alloc::vec![RadixPow::of(radix as u64)];
             let bits = self.bit_len();
             loop {
                 let last = powers.last().unwrap();
@@ -5520,7 +5520,7 @@ impl Nat {
                     break;
                 }
                 let sq = last.square();
-                if sq.cmp_ref(self) == Ordering::Greater {
+                if !sq.le(self) {
                     break;
                 }
                 powers.push(sq);
@@ -5533,9 +5533,74 @@ impl Nat {
 /// Recursive base-`radix` conversion sharing a precomputed power ladder
 /// (`powers[k] == radix^(2^k)`, ascending): appends the digits of `v` to `out`,
 /// left-padded with zeros to at least `width` digits (`0` = minimal).
+/// A power `radix^e` of a radix-conversion ladder, stored as its odd part
+/// times a power of two: `odd · 2^shift`. For radix 10 the odd part `5^e` is
+/// ~30% shorter than `10^e`, so every product and division against the
+/// ladder shrinks accordingly, and the power of two is a mere shift.
+pub(crate) struct RadixPow {
+    pub(crate) odd: Nat,
+    pub(crate) shift: u64,
+}
+
+impl RadixPow {
+    /// `b` itself (`b ≥ 2`).
+    pub(crate) fn of(b: u64) -> RadixPow {
+        let t = b.trailing_zeros();
+        RadixPow {
+            odd: Nat::from_u64(b >> t),
+            shift: t as u64,
+        }
+    }
+
+    /// The square of this power.
+    pub(crate) fn square(&self) -> RadixPow {
+        RadixPow {
+            odd: self.odd.square(),
+            shift: 2 * self.shift,
+        }
+    }
+
+    /// Bit length of the power.
+    pub(crate) fn bit_len(&self) -> u64 {
+        self.odd.bit_len() + self.shift
+    }
+
+    /// `self ≤ v` (the power is a multiple of `2^shift`, so this is
+    /// `odd ≤ ⌊v / 2^shift⌋`).
+    pub(crate) fn le(&self, v: &Nat) -> bool {
+        match self.bit_len().cmp(&v.bit_len()) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => self.odd.cmp_ref(&v.shr(self.shift)) != Ordering::Greater,
+        }
+    }
+
+    /// `x · self`.
+    pub(crate) fn mul(&self, x: &Nat) -> Nat {
+        x.mul(&self.odd).shl(self.shift)
+    }
+
+    /// `v divmod self`, dividing `⌊v / 2^shift⌋` by the odd part (through
+    /// `inv`, its precomputed reciprocal, when given) and reattaching the low
+    /// `shift` bits to the remainder.
+    pub(crate) fn div_rem(&self, v: &Nat, inv: Option<&PreInv>) -> (Nat, Nat) {
+        let vs = v.shr(self.shift);
+        let (q, ro) = match inv {
+            Some(inv) => inv.div_rem(&vs),
+            None => vs.div_rem(&self.odd).expect("odd part is non-zero"),
+        };
+        let r = if self.shift == 0 {
+            ro
+        } else {
+            ro.shl(self.shift).add(&v.low_bits(self.shift))
+        };
+        (q, r)
+    }
+}
+
 pub(crate) fn to_radix_recursive(
     v: &Nat,
-    powers: &[Nat],
+    powers: &[RadixPow],
     inverses: &[Option<PreInv>],
     radix: u32,
     width: usize,
@@ -5548,13 +5613,10 @@ pub(crate) fn to_radix_recursive(
     // Split by the largest ladder entry `p = radix^(2^k) ≤ v`.
     let k = powers
         .iter()
-        .rposition(|p| p.cmp_ref(v) != Ordering::Greater)
+        .rposition(|p| p.le(v))
         .expect("v is large, so radix <= v");
     let len = 1usize << k;
-    let (q, r) = match inverses.get(k) {
-        Some(Some(inv)) => inv.div_rem(v),
-        _ => v.div_rem(&powers[k]).expect("p is non-zero"),
-    };
+    let (q, r) = powers[k].div_rem(v, inverses.get(k).and_then(Option::as_ref));
     // The high part fills whatever the padding leaves above the low `len`
     // digits; the low part is zero-padded to exactly `len`.
     to_radix_recursive(&q, powers, inverses, radix, width.saturating_sub(len), out);
@@ -5791,7 +5853,7 @@ pub(crate) fn pack_radix_chunks(bytes: &[u8], radix: u32) -> Result<(Vec<Limb>, 
 
 /// Number of base-`B` chunks at or below which [`nat_from_base_chunks`] uses
 /// in-place Horner evaluation rather than recursing.
-pub(crate) const PARSE_RECURSION_CHUNKS: usize = 512;
+pub(crate) const PARSE_RECURSION_CHUNKS: usize = 128;
 
 /// Evaluates `Σ chunks[i]·B^i` (`chunks` least-significant first, each
 /// `< B`). Short inputs use Horner's rule in place on one limb buffer (one
@@ -5804,7 +5866,7 @@ pub(crate) fn nat_from_base_chunks(chunks: &[Limb], base: Limb) -> Nat {
         return horner_base_chunks(chunks, base);
     }
     // powers[k] = B^(2^k) for every 2^k < chunks.len().
-    let mut powers = alloc::vec![Nat::from_u64(base)];
+    let mut powers = alloc::vec![RadixPow::of(base)];
     while 2usize << (powers.len() - 1) < chunks.len() {
         let sq = powers.last().unwrap().square();
         powers.push(sq);
@@ -5813,7 +5875,7 @@ pub(crate) fn nat_from_base_chunks(chunks: &[Limb], base: Limb) -> Nat {
 }
 
 /// Recursive step of [`nat_from_base_chunks`] (`powers[k] == B^(2^k)`).
-pub(crate) fn chunks_recursive(chunks: &[Limb], powers: &[Nat], base: Limb) -> Nat {
+pub(crate) fn chunks_recursive(chunks: &[Limb], powers: &[RadixPow], base: Limb) -> Nat {
     if chunks.len() <= PARSE_RECURSION_CHUNKS {
         return horner_base_chunks(chunks, base);
     }
@@ -5822,7 +5884,7 @@ pub(crate) fn chunks_recursive(chunks: &[Limb], powers: &[Nat], base: Limb) -> N
     let (low, high) = chunks.split_at(1 << k);
     let hi = chunks_recursive(high, powers, base);
     let lo = chunks_recursive(low, powers, base);
-    hi.mul(&powers[k]).add(&lo)
+    powers[k].mul(&hi).add(&lo)
 }
 
 /// Horner evaluation of `Σ chunks[i]·B^i` in one growing limb buffer.

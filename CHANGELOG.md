@@ -53,6 +53,10 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 - *(nat)* Schoolbook division's `submul_1` kernel uses the `!(!r + a·q)`
   form, adding the carry last (the addmul kernels' short carry chain): ~20%
   faster per limb, ~1.25× faster division at 4096/2048 bits
+- *(nat)* Radix conversion keeps its power ladders as odd part × power of
+  two (`10^e = 5^e·2^e`), so products and divisions against them are ~30%
+  shorter for radix 10, and the parse base case is retuned: decimal parsing
+  ~1.3× and printing ~1.2× faster at 100k–1M digits
 - *(nat)* Large Newton divisions take their back-multiplication and the
   reciprocal's Newton-step product modulo `β^L − 1` (one cyclic transform of
   about half the length, the true value recovered from its small signed

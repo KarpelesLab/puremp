@@ -6,7 +6,7 @@ use core::fmt;
 
 use crate::error::Result;
 use crate::nat::{
-    Nat, PARSE_RECURSION_CHUNKS, PreInv, RADIX_RECURSION_LIMBS, chunks_recursive,
+    Nat, PARSE_RECURSION_CHUNKS, PreInv, RADIX_RECURSION_LIMBS, RadixPow, chunks_recursive,
     horner_base_chunks, nat_from_base_chunks, pack_radix_chunks, radix_chunk, simple_radix_string,
     to_radix_recursive,
 };
@@ -37,12 +37,12 @@ pub struct RadixConverter {
     radix: u32,
     max_bits: u64,
     /// `radix^(2^k)` with bit length ≤ `max_bits`, for printing.
-    powers: Vec<Nat>,
+    powers: Vec<RadixPow>,
     inverses: Vec<Option<PreInv>>,
     /// `B^(2^k)` for `B = radix^chunk`, covering `max_bits`-bit values, for
     /// parsing.
     base: u64,
-    chunk_powers: Vec<Nat>,
+    chunk_powers: Vec<RadixPow>,
 }
 
 impl fmt::Debug for RadixConverter {
@@ -59,7 +59,7 @@ impl RadixConverter {
     /// `max_bits` bits. Panics if `radix` is out of range.
     pub fn new(radix: u32, max_bits: u64) -> RadixConverter {
         assert!((2..=62).contains(&radix), "radix must be in 2..=62");
-        let mut powers = alloc::vec![Nat::from_u64(radix as u64)];
+        let mut powers = alloc::vec![RadixPow::of(radix as u64)];
         loop {
             let last = powers.last().expect("non-empty");
             if 2 * last.bit_len() - 1 > max_bits {
@@ -73,14 +73,14 @@ impl RadixConverter {
         }
         let inverses = powers
             .iter()
-            .map(|p| (p.as_limbs().len() >= PREINV_LIMBS).then(|| PreInv::new(p)))
+            .map(|p| (p.odd.as_limbs().len() >= PREINV_LIMBS).then(|| PreInv::new(&p.odd)))
             .collect();
         let (_, base) = radix_chunk(radix);
         // Each full chunk spans B ≥ 2^(bits(B) − 1), so a `max_bits`-bit value
         // has at most max_bits / (bits(B) − 1) + 1 chunks.
         let chunk_bits = (64 - base.leading_zeros() - 1) as u64;
         let max_chunks = (max_bits / chunk_bits) as usize + 1;
-        let mut chunk_powers = alloc::vec![Nat::from_u64(base)];
+        let mut chunk_powers = alloc::vec![RadixPow::of(base)];
         while 2usize << (chunk_powers.len() - 1) < max_chunks {
             let sq = chunk_powers.last().expect("non-empty").square();
             chunk_powers.push(sq);

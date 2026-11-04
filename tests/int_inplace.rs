@@ -293,3 +293,19 @@ fn radix_converter_round_trips() {
         assert!(conv.parse(b"1-2").is_err());
     }
 }
+
+#[test]
+fn addmul_small_operands_do_not_overflow() {
+    // u64::MAX² overflows i128: the inline fast path must fall back.
+    let m = Int::from(u64::MAX);
+    let want = m.mul(&m);
+    let mut x = Int::ZERO;
+    x.addmul(&m, &m);
+    assert_eq!(x, want);
+    let mut x = Int::ZERO;
+    x.submul(&m, &m);
+    assert_eq!(x, want.neg());
+    let mut x = Int::from(i64::MIN);
+    x.addmul(&m, &m.neg());
+    assert_eq!(x, Int::from(i64::MIN).sub(&want));
+}

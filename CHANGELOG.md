@@ -72,6 +72,10 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ### Fixed
 
+- *(int)* `Int::addmul`/`submul` with two single-limb operands no longer
+  overflow `i128` in their inline fast path (wrong results in release builds
+  for products of magnitudes near `u64::MAX`)
+
 - *(algebraic)* `neg`, `sub`, `recip`/`div` and multiplication by a negative
   rational no longer collapse the value onto a spurious root of a non-minimal
   defining polynomial sitting at the excluded lower end of the isolating

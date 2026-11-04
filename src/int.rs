@@ -537,8 +537,10 @@ impl Int {
             let s = if *ns { -(*ms as i128) } else { *ms as i128 };
             let x = if *na { -(*ma as i128) } else { *ma as i128 };
             let y = if *nb { -(*mb as i128) } else { *mb as i128 };
-            let r = s + x * y;
-            if let Ok(v) = i64::try_from(r) {
+            // |x·y| < 2^128 can overflow i128; only the in-range case is fast.
+            if let Some(r) = x.checked_mul(y).and_then(|p| s.checked_add(p))
+                && let Ok(v) = i64::try_from(r)
+            {
                 *self = Int::from_i64(v);
                 return;
             }
@@ -557,8 +559,10 @@ impl Int {
             let s = if *ns { -(*ms as i128) } else { *ms as i128 };
             let x = if *na { -(*ma as i128) } else { *ma as i128 };
             let y = if *nb { -(*mb as i128) } else { *mb as i128 };
-            let r = s - x * y;
-            if let Ok(v) = i64::try_from(r) {
+            // |x·y| < 2^128 can overflow i128; only the in-range case is fast.
+            if let Some(r) = x.checked_mul(y).and_then(|p| s.checked_sub(p))
+                && let Ok(v) = i64::try_from(r)
+            {
                 *self = Int::from_i64(v);
                 return;
             }

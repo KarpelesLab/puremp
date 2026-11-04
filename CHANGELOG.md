@@ -16,6 +16,10 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ### Performance
 
+- *(int)* `Int::extended_gcd` uses an extended Lehmer loop (and the Half-GCD
+  driver past ~256 limbs) and reduces the Bézout pair to the same
+  GMP-normalized cofactors, instead of quadratic plain Euclid: ~17× faster at
+  256 bits, ~16× at 20k bits; `Int::modinv` takes the same path
 - *(int)* `Int` arithmetic, division and comparison borrow multi-limb
   magnitudes instead of cloning them, single-limb operands no longer go
   through a heap `Nat`, and `+=`/`-=` (and `+`/`-` with an owned left

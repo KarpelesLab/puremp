@@ -710,28 +710,15 @@ impl Int {
         if modulus.is_zero() {
             return None;
         }
-        let m = modulus.magnitude();
+        let m = modulus.magnitude_ref();
         // Reduce to a non-negative representative in [0, m); the inverse depends
-        // only on `self mod m`. `a` and `m` are both non-negative, so the
-        // Half-GCD cofactor is a Bézout coefficient of `a·x + m·y = gcd(a, m)`.
-        let a = self.rem_euclid(modulus).magnitude();
-        if a.limb_count().min(m.limb_count()) >= crate::nat::HGCD_MODINV_THRESHOLD {
-            // `x` is *some* Bézout coefficient with `a·x ≡ gcd (mod m)`; when the
-            // gcd is 1 it is the (unique mod m) inverse, so `x mod modulus`
-            // matches Euclid's exactly. `None` means the reduction guard tripped
-            // — fall through to the trusted Euclidean path.
-            if let Some((g, x, _)) = a.extgcd_hgcd(&m) {
-                if !g.is_one() {
-                    return None;
-                }
-                return Some(x.rem_euclid(modulus));
-            }
+        // only on `self mod m`, and any Bézout cofactor of `a` gives it.
+        let a = self.rem_euclid(modulus).into_magnitude();
+        if a.is_zero() {
+            return m.is_one().then_some(Int::ZERO);
         }
-        let (g, x, _) = self.extended_gcd(modulus);
-        if !g.is_one() {
-            return None;
-        }
-        Some(x.rem_euclid(modulus))
+        let (g, x) = a.extgcd_cofactor(&m);
+        g.is_one().then(|| x.rem_euclid(modulus))
     }
 
     /// Deterministic Baillie–PSW primality test (`false` for `self < 2`).
@@ -899,17 +886,46 @@ impl Int {
 
     /// Extended GCD: returns `(g, x, y)` with `g == self·x + b·y` and `g ≥ 0`.
     ///
-    /// This is the plain extended Euclidean algorithm. Its Bézout pair `(x, y)`
-    /// is the canonical minimal one the algorithm produces and is part of the
-    /// public contract, so — unlike [`Int::modinv`], where only `x mod m`
-    /// matters and which uses the subquadratic Half-GCD driver above a size
-    /// threshold — this stays Euclidean. It also serves as the reference the
-    /// Half-GCD path is differentially tested against.
+    /// The cofactors follow GMP's `mpz_gcdext` normalization: `|x| < |b|/(2g)`
+    /// and `|y| < |self|/(2g)`, which define them uniquely, except that
+    /// `x = 0, y = sgn(b)` when `|self| == |b|`, `x = sgn(self)` when `b = 0`
+    /// or `|b| = 2g`, `y = sgn(b)` when `self = 0` or `|self| = 2g`, and
+    /// `(0, 0, 0)` for `self = b = 0`.
     ///
-    /// The cofactors follow GMP's `mpz_gcdext` normalization: `|s| < |b|/(2g)`
-    /// and `|t| < |a|/(2g)`, with `s = 0, t = sgn(b)` when `|a| == |b|`, and
-    /// `(0, 0, 0)` for `a = b = 0`.
+    /// Any Bézout pair is reduced to that canonical one, so the work is done
+    /// by Lehmer's algorithm (and the subquadratic Half-GCD driver on large
+    /// operands), tracking only `self`'s cofactor; `y` then follows from one
+    /// exact division.
     pub fn extended_gcd(&self, b: &Int) -> (Int, Int, Int) {
+        let (sa, sb) = (self.signum(), b.signum());
+        let (ma, mb) = (self.magnitude_ref(), b.magnitude_ref());
+        if sb == 0 {
+            return (self.abs(), Int::from_i64(sa as i64), Int::ZERO);
+        }
+        if sa == 0 || ma == mb {
+            return (b.abs(), Int::ZERO, Int::from_i64(sb as i64));
+        }
+        let (g, x) = ma.extgcd_cofactor(&mb);
+        // x·|a| ≡ g (mod |b|): the canonical cofactor is the residue of x mod
+        // m = |b|/g in (−m/2, m/2] (only m = 2 can reach m/2, the `|b| = 2g`
+        // case, where it gives 1 as required).
+        let m = Int::from(mb.div_rem(&g).expect("g > 0").0);
+        let mut s = x.rem_euclid(&m);
+        if s.mul_2k(1) > m {
+            s -= &m;
+        }
+        if sa < 0 {
+            s = -s;
+        }
+        let g = Int::from(g);
+        let t = g.sub(&s.mul(self)).div_exact(b);
+        (g, s, t)
+    }
+
+    /// The plain extended Euclidean algorithm, kept as the independent
+    /// reference the fast paths are tested against.
+    #[cfg(test)]
+    pub(crate) fn extended_gcd_euclid(&self, b: &Int) -> (Int, Int, Int) {
         if self.is_zero() && b.is_zero() {
             return (Int::ZERO, Int::ZERO, Int::ZERO);
         }

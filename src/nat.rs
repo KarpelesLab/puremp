@@ -97,14 +97,11 @@ fn hgcd_with_test_base<R>(base: usize, f: impl FnOnce() -> R) -> R {
 /// Half-GCD path is never slower than Lehmer.
 const HGCD_GCD_THRESHOLD: usize = 10240;
 
-/// Smallest operand (in limbs, the smaller of the two) at which [`Int::modinv`]
-/// engages the Half-GCD cofactor driver. Below it, plain extended Euclid's tight
-/// loop wins and covers the very hot small-modulus case. The crossover against
-/// plain extended Euclid — a genuinely quadratic reference, unlike [`Nat::gcd`]'s
-/// Lehmer path — sits far lower than [`HGCD_GCD_THRESHOLD`]: measured ~3× at 32
-/// limbs, ~7× at 128, growing past ~100× beyond 8k limbs. Kept with margin so
-/// the Half-GCD path is never slower.
-pub(crate) const HGCD_MODINV_THRESHOLD: usize = 32;
+/// Smallest operand (in limbs, the smaller of the two) at which the extended
+/// GCD ([`Int::extended_gcd`], [`Int::modinv`]) engages the Half-GCD cofactor
+/// driver; below it the extended Lehmer loop wins (measured crossover ~250
+/// limbs).
+pub(crate) const HGCD_MODINV_THRESHOLD: usize = 256;
 
 /// Limb floor for the extended-GCD Half-GCD driver: the reductions (each a
 /// `O(M(n))` half-length strip, base-cased through the windowed-Lehmer matrix)
@@ -1798,8 +1795,8 @@ impl Nat {
         self.limbs.is_empty()
     }
 
-    /// Number of significant base-`2^64` limbs (`0` for zero). Used by sibling
-    /// modules to pick size-gated algorithms (e.g. the extended-GCD dispatch).
+    /// Number of significant base-`2^64` limbs (`0` for zero).
+    #[cfg(test)]
     #[inline]
     pub(crate) fn limb_count(&self) -> usize {
         self.limbs.len()
@@ -2677,6 +2674,85 @@ impl Nat {
         let vr = v.limbs[0];
         let ur = u.divmod_small(vr).1;
         Nat::from_u64(u64_gcd(vr, ur))
+    }
+
+    /// Returns `(g, x)` with `g = gcd(self, rhs)` and `x·self ≡ g (mod rhs)`
+    /// (*a* Bézout cofactor, not normalized), by the Half-GCD driver on large
+    /// operands and Lehmer's algorithm otherwise. Precondition: both non-zero.
+    pub(crate) fn extgcd_cofactor(&self, rhs: &Nat) -> (Nat, Int) {
+        if self.limbs.len().min(rhs.limbs.len()) >= HGCD_MODINV_THRESHOLD
+            && let Some((g, x, _)) = self.extgcd_hgcd(rhs)
+        {
+            return (g, x);
+        }
+        self.extgcd_lehmer(rhs)
+    }
+
+    /// Extended Lehmer GCD: returns `(g, x)` with `g = gcd(self, rhs)` and
+    /// `x·self ≡ g (mod rhs)` — *a* Bézout cofactor of `self`, not normalized.
+    /// Only `self`'s cofactor is tracked (the caller recovers the other with
+    /// one exact division), applying each scalar Lehmer matrix to the full
+    /// operands and to the cofactor pair. Precondition: both non-zero.
+    pub(crate) fn extgcd_lehmer(&self, rhs: &Nat) -> (Nat, Int) {
+        debug_assert!(!self.is_zero() && !rhs.is_zero());
+        // Invariants: u ≡ x0·self, v ≡ x1·self (mod rhs).
+        let mut u = self.clone();
+        let mut v = rhs.clone();
+        let (mut x0, mut x1) = (Int::ONE, Int::ZERO);
+        if u.cmp_ref(&v) == Ordering::Less {
+            core::mem::swap(&mut u, &mut v);
+            core::mem::swap(&mut x0, &mut x1);
+        }
+        let lin = |a: i128, x: &Int, b: i128, y: &Int| -> Int {
+            let mut r = x.mul(&Int::from_i128(a));
+            r += &y.mul(&Int::from_i128(b));
+            r
+        };
+        while v.limbs.len() > 1 {
+            let (a, b, c, d) = if v.limbs.len() >= LEHMER_DW_LIMBS {
+                let shift = u.bit_len() - 126;
+                lehmer_step128(shifted_window(&u, shift), shifted_window(&v, shift))
+            } else {
+                let shift = u.bit_len().saturating_sub(63);
+                lehmer_step64(
+                    shifted_window(&u, shift) as u64,
+                    shifted_window(&v, shift) as u64,
+                )
+            };
+            if b == 0 {
+                let (q, r) = u.div_rem(&v).expect("v is non-zero");
+                u = core::mem::replace(&mut v, r);
+                let nx = x0.sub(&x1.mul(&Int::from(q)));
+                x0 = core::mem::replace(&mut x1, nx);
+            } else {
+                let nu = lincomb_pos(a, &u, b, &v);
+                let nv = lincomb_pos(c, &u, d, &v);
+                let nx0 = lin(a, &x0, b, &x1);
+                let nx1 = lin(c, &x0, d, &x1);
+                (u, v, x0, x1) = (nu, nv, nx0, nx1);
+                if u.cmp_ref(&v) == Ordering::Less {
+                    core::mem::swap(&mut u, &mut v);
+                    core::mem::swap(&mut x0, &mut x1);
+                }
+            }
+        }
+        if v.is_zero() {
+            return (u, x0);
+        }
+        // One division brings both into a single limb, then finish with a
+        // machine-word Euclid accumulating the matrix (entries ≤ 2^64 in size).
+        let vr = v.limbs[0];
+        let (q, ur) = u.divmod_small(vr);
+        let nx = x0.sub(&x1.mul(&Int::from(q)));
+        x0 = core::mem::replace(&mut x1, nx);
+        let (mut p, mut r) = (vr, ur);
+        let (mut a, mut b, mut c, mut d) = (1i128, 0i128, 0i128, 1i128);
+        while r != 0 {
+            let q = (p / r) as i128;
+            (a, b, c, d) = (c, d, a - q * c, b - q * d);
+            (p, r) = (r, p % r);
+        }
+        (Nat::from_u64(p), lin(a, &x0, b, &x1))
     }
 
     /// Returns bit `i` (0 = least significant), or `false` past the top.
@@ -6136,11 +6212,70 @@ mod tests {
 
     // --- Half-GCD extended-GCD cofactor driver (backs `Int::modinv`) --------
 
+    /// `Int::extended_gcd` (Lehmer / Half-GCD plus normalization) must return
+    /// exactly the plain extended-Euclid triple, for every sign combination,
+    /// shared factors, unbalanced sizes, and sizes on both sides of the
+    /// Half-GCD threshold.
+    #[test]
+    fn extended_gcd_matches_euclid() {
+        let mut st = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let check = |a: &Int, b: &Int| {
+            for (x, y) in [
+                (a.clone(), b.clone()),
+                (a.neg(), b.clone()),
+                (a.clone(), b.neg()),
+                (a.neg(), b.neg()),
+                (b.clone(), a.clone()),
+            ] {
+                assert_eq!(
+                    x.extended_gcd(&y),
+                    x.extended_gcd_euclid(&y),
+                    "extended_gcd({x}, {y})"
+                );
+            }
+        };
+        let small = [0i64, 1, 2, 3, 4, 5, 6, 7, 10, 12, 15, 46, 240, 1 << 40];
+        for &a in &small {
+            for &b in &small {
+                check(&Int::from(a), &Int::from(b));
+            }
+        }
+        let sizes = [1usize, 2, 3, 5, 9, 17, 33, 40, 70];
+        for &la in &sizes {
+            for &lb in &sizes {
+                for _ in 0..3 {
+                    let a = Int::from(hgcd_build(la, &mut next));
+                    let b = Int::from(hgcd_build(lb, &mut next));
+                    check(&a, &b);
+                    // Shared factor (gcd > 1), including |b| = 2g / |a| = 2g.
+                    let f = Int::from(hgcd_build(1 + la / 3, &mut next));
+                    check(&a.mul(&f), &b.mul(&f));
+                    check(&a.mul(&f), &f.mul_2k(1));
+                    check(&a.mul(&f), &f);
+                }
+            }
+        }
+        // Past the Half-GCD threshold.
+        let n = HGCD_MODINV_THRESHOLD + 4;
+        let a = Int::from(hgcd_build(n + 9, &mut next));
+        let b = Int::from(hgcd_build(n, &mut next));
+        let f = Int::from(hgcd_build(3, &mut next));
+        assert_eq!(a.extended_gcd(&b), a.extended_gcd_euclid(&b));
+        let (af, bf) = (a.mul(&f), b.neg().mul(&f));
+        assert_eq!(af.extended_gcd(&bf), af.extended_gcd_euclid(&bf));
+    }
+
     /// Reference modular inverse of `a` mod `m` (`m > 1`) via plain extended
     /// Euclid on `Int`, or `None` when not coprime. Independent of the Half-GCD
     /// path — the oracle the fast `modinv` must match exactly.
     fn modinv_ref(a: &Nat, m: &Nat) -> Option<Nat> {
-        let (g, x, _) = Int::from(a.clone()).extended_gcd(&Int::from(m.clone()));
+        let (g, x, _) = Int::from(a.clone()).extended_gcd_euclid(&Int::from(m.clone()));
         if !g.is_one() {
             return None;
         }
@@ -6293,7 +6428,7 @@ mod tests {
                 let ai = Int::from_sign_magnitude(sa, a.clone());
                 let mi = Int::from_sign_magnitude(sm, m.clone());
                 // Euclid reference inverse (bypasses the fast path).
-                let (g, x, _) = ai.extended_gcd(&mi);
+                let (g, x, _) = ai.extended_gcd_euclid(&mi);
                 let expect = g.is_one().then(|| x.rem_euclid(&mi));
                 assert_eq!(ai.modinv(&mi), expect, "dispatched modinv vs Euclid");
                 if let Some(inv) = ai.modinv(&mi) {
@@ -6321,7 +6456,7 @@ mod tests {
         };
         // Plain extended Euclid, the pre-existing modinv path, as the baseline.
         let euclid_modinv = |a: &Int, m: &Int| -> Option<Int> {
-            let (g, x, _) = a.extended_gcd(m);
+            let (g, x, _) = a.extended_gcd_euclid(m);
             g.is_one().then(|| x.rem_euclid(m))
         };
         println!(

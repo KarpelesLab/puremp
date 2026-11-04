@@ -7,6 +7,35 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/KarpelesLab/puremp/compare/v0.3.2...v0.3.3) - 2026-11-04
+
+### Added
+
+- *(nat)* RadixConverter with cached power ladders
+- *(int)* constant-time modpow_sec for secret exponents
+- *(int)* ASCII byte-slice radix I/O, pow10/mul_pow10, u64 Nat::pow
+
+### Fixed
+
+- *(int)* addmul/submul fast path overflowed i128 on large single-limb operands
+- *(nat)* keep no_std builds working without f64::sqrt
+- *(algebraic)* keep the value when negation, negative scaling or reciprocal flips the interval
+
+### Other
+
+- *(nat)* isqrt in stack buffers up to 192 limbs
+- *(nat)* radix ladders as odd part times a power of two
+- *(nat)* wrap-around products in Newton division
+- *(nat)* shorter carry chain in the division submul_1 kernel
+- *(nat)* faster multiplication and squaring
+- *(nat)* allocation-free double-word Lehmer gcd/extgcd and cheaper Half-GCD
+- *(nat)* product-scanning Montgomery kernels for modpow and modpow_sec
+- *(nat)* allocation-free Karatsuba square root on limb slices
+- *(nat)* Newton-reciprocal division for long quotients, tighter BZ padding
+- *(nat)* faster isqrt base case and fewer temporaries per level
+- *(int)* extended Lehmer / Half-GCD extended_gcd with GMP cofactor normalization
+- *(int)* borrow magnitudes, in-place add/sub and u64 fast paths
+
 ### Added
 
 - *(int)* `Int::add_u64`/`sub_u64`/`mul_u64` and in-place

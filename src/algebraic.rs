@@ -398,14 +398,32 @@ impl Algebraic {
 
     /// Returns `-self`.
     pub fn neg(&self) -> Algebraic {
-        // Root of p(−x); interval negates and flips.
-        let neg_poly = compose_neg(&self.poly);
+        // Root of p(−x); interval negates and flips, so the excluded lower end
+        // must first be moved off any spurious root.
+        let a = self.lo_off_root();
+        if a.is_rational() {
+            return Algebraic::from_rational(a.lo.neg());
+        }
         Algebraic {
-            poly: squarefree(&neg_poly),
-            lo: self.hi.neg(),
-            hi: self.lo.neg(),
+            poly: squarefree(&compose_neg(&a.poly)),
+            lo: a.hi.neg(),
+            hi: a.lo.neg(),
         }
         .normalized()
+    }
+
+    /// `self` refined until its lower end is no root of the defining
+    /// polynomial. The end is excluded from `(lo, hi]`, so it may hold a
+    /// spurious root of a non-minimal polynomial, which an operation flipping
+    /// the interval (negation, negative scaling, reciprocal) would otherwise
+    /// turn into the included end. Refinement anchors on `hi`, so the value is
+    /// kept; the result may collapse to a rational.
+    fn lo_off_root(&self) -> Algebraic {
+        let mut a = self.clone();
+        while a.lo != a.hi && eval_sign(&a.poly, &a.lo) == 0 {
+            a.refine();
+        }
+        a
     }
 
     /// Returns `self + rhs`.
@@ -445,9 +463,14 @@ impl Algebraic {
         }
         // Root of the reversed polynomial xⁿ p(1/x); interval is [1/hi, 1/lo]
         // (for a fixed-sign interval, which signum() has guaranteed).
-        let mut a = self.clone();
-        while a.lo.signum() != a.hi.signum() || a.lo.is_zero() || a.hi.is_zero() {
+        let mut a = self.lo_off_root();
+        while !a.is_rational()
+            && (a.lo.signum() != a.hi.signum() || a.lo.is_zero() || a.hi.is_zero())
+        {
             a.refine();
+        }
+        if a.is_rational() {
+            return Algebraic::from_rational(a.lo.recip());
         }
         let rev = reverse_poly(&a.poly);
         let (nlo, nhi) = (a.hi.recip(), a.lo.recip());
@@ -480,13 +503,23 @@ impl Algebraic {
         if self.is_rational() {
             return Algebraic::from_rational(self.lo.mul(c));
         }
-        let (lo, hi) = if c.is_positive() {
-            (self.lo.mul(c), self.hi.mul(c))
-        } else {
-            (self.hi.mul(c), self.lo.mul(c))
-        };
+        if c.is_positive() {
+            return Algebraic {
+                poly: squarefree(&compose_scale(&self.poly, c)),
+                lo: self.lo.mul(c),
+                hi: self.hi.mul(c),
+            }
+            .normalized();
+        }
+        // A negative factor flips the interval: move the excluded lower end off
+        // any spurious root first.
+        let a = self.lo_off_root();
+        if a.is_rational() {
+            return Algebraic::from_rational(a.lo.mul(c));
+        }
+        let (lo, hi) = (a.hi.mul(c), a.lo.mul(c));
         Algebraic {
-            poly: squarefree(&compose_scale(&self.poly, c)),
+            poly: squarefree(&compose_scale(&a.poly, c)),
             lo,
             hi,
         }

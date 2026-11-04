@@ -83,3 +83,31 @@ fn real_roots_of_polynomial() {
     // no real roots
     assert!(Algebraic::real_roots_of(&poly(&[1, 0, 1])).is_empty());
 }
+
+#[test]
+fn interval_flip_skips_spurious_excluded_root() {
+    // √3 + √3 lives on x³ − 12x with interval (0, 8]: the excluded lower end is
+    // the spurious root 0, which negation / negative scaling / reciprocal must
+    // not turn into the value (issue #22).
+    let s3 = root_sqrt(3);
+    let two_s3 = s3.add(&s3);
+    let want = -2.0 * 3.0f64.sqrt();
+    for v in [
+        two_s3.neg(),
+        two_s3.mul(&Algebraic::from_int(Int::from(-1))),
+        Algebraic::from_int(Int::ZERO).sub(&two_s3),
+        -two_s3.clone(),
+    ] {
+        assert_eq!(v.signum(), -1);
+        assert!(!v.is_rational());
+        assert!((v.to_f64() - want).abs() < 1e-12);
+    }
+    // b = (1 + √3) + (1 + √3) keeps the spurious root 2 at its excluded end.
+    let one_s3 = s3.add(&Algebraic::from_int(Int::ONE));
+    let b = one_s3.add(&one_s3);
+    let r = b.recip();
+    assert!(!r.is_rational());
+    assert!((r.to_f64() - 1.0 / (2.0 + 2.0 * 3.0f64.sqrt())).abs() < 1e-12);
+    let d = Algebraic::from_int(Int::ONE).div(&b);
+    assert!((d.to_f64() - r.to_f64()).abs() < 1e-15);
+}

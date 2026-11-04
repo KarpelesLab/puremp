@@ -7,6 +7,13 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+### Fixed
+
+- *(algebraic)* `neg`, `sub`, `recip`/`div` and multiplication by a negative
+  rational no longer collapse the value onto a spurious root of a non-minimal
+  defining polynomial sitting at the excluded lower end of the isolating
+  interval (`-(√3 + √3)` read as `0`, `1/(2 + 2√3)` as `1/2`)
+
 ## [0.3.2](https://github.com/KarpelesLab/puremp/compare/v0.3.1...v0.3.2) - 2026-10-22
 
 ### Added

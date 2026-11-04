@@ -53,6 +53,11 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 - *(nat)* Schoolbook division's `submul_1` kernel uses the `!(!r + a·q)`
   form, adding the carry last (the addmul kernels' short carry chain): ~20%
   faster per limb, ~1.25× faster division at 4096/2048 bits
+- *(nat)* Large Newton divisions take their back-multiplication and the
+  reciprocal's Newton-step product modulo `β^L − 1` (one cyclic transform of
+  about half the length, the true value recovered from its small signed
+  residue); balanced divisions switch to Newton from ~6000 limbs, 10–23%
+  faster than Burnikel–Ziegler there
 - *(nat)* Division: Burnikel–Ziegler pads the divisor to a block that halves
   evenly down to the base case instead of the next power of two (12–33% at
   non-power-of-two sizes), and long quotients (and very large operands) use

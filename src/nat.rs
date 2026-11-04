@@ -825,6 +825,189 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
     r
 }
 
+/// `a·b mod (β^n − 1)` (`β = 2^64`) as `n` limbs, by one cyclic three-prime
+/// convolution of length `n` — the wrap-around of the cyclic transform is
+/// exactly the reduction, so this costs about half of a full `2n`-limb
+/// product. `n` must be a transform length (`mp_shape(n) == Some(n)`) and
+/// `a.len(), b.len() ≤ n`. The result is a residue in `[0, β^n − 1]` (the
+/// value `β^n − 1` also represents zero).
+fn mul_mod_bnm1(a: &[Limb], b: &[Limb], n: usize) -> Vec<Limb> {
+    debug_assert_eq!(mp_shape(n), Some(n));
+    debug_assert!(a.len() <= n && b.len() <= n);
+    let mut out = alloc::vec![0 as Limb; n];
+    if a.is_empty() || b.is_empty() {
+        return out;
+    }
+    let radix3 = n.is_multiple_of(3);
+    let m = if radix3 { n / 3 } else { n };
+    let square = core::ptr::eq(a, b) || a == b;
+    let mut res: [Vec<u64>; 3] = Default::default();
+    for (slot, pr) in res.iter_mut().zip(&MP_PRIMES) {
+        let (p, pinv) = (pr.p, pr.pinv);
+        let tw = mp_twiddles(m, pr);
+        let pow3 = if radix3 { mp_powers(n, pr) } else { Vec::new() };
+        let mut fa = mp_forward(a, n, &tw, &pow3, pr);
+        if square {
+            for x in fa.iter_mut() {
+                *x = mp_mul(*x, *x, p, pinv);
+            }
+        } else {
+            let fb = mp_forward(b, n, &tw, &pow3, pr);
+            for (x, &y) in fa.iter_mut().zip(&fb) {
+                *x = mp_mul(*x, y, p, pinv);
+            }
+        }
+        mp_inverse(&mut fa, &tw, &pow3, pr);
+        *slot = fa;
+    }
+    let scale = |pr: &MpPrime| {
+        let n_inv = pr.p - (pr.p - 1) / n as u64;
+        ((n_inv as u128 * pr.r2 as u128) % pr.p as u128) as u64
+    };
+    let [q1, q2, q3] = &MP_PRIMES;
+    let (p1, p2, p3) = (q1.p, q2.p, q3.p);
+    let (s1, s2, s3) = (scale(q1), scale(q2), scale(q3));
+    let inv_p1_mod_p2 = mp_to_mont(mp_pow_slow(p1 % p2, p2 - 2, p2), q2);
+    let p1_mod_p3 = mp_to_mont(p1 % p3, q3);
+    let p12_mod_p3 = ((p1 as u128 * p2 as u128) % p3 as u128) as u64;
+    let inv_p12_mod_p3 = mp_to_mont(mp_pow_slow(p12_mod_p3, p3 - 2, p3), q3);
+    let p12 = p1 as u128 * p2 as u128;
+    let (p12_lo, p12_hi) = (p12 as u64, (p12 >> 64) as u64);
+    let [res1, res2, res3] = &res;
+    // Each cyclic coefficient is < n·2^128 < p1·p2·p3; Garner-recombine and
+    // carry-propagate as in `mul_ntt`.
+    let (mut c0, mut c1) = (0u64, 0u64);
+    for (k, o) in out.iter_mut().enumerate() {
+        let r1 = mp_csub(mp_mul(res1[k], s1, p1, q1.pinv), p1);
+        let r2 = mp_csub(mp_mul(res2[k], s2, p2, q2.pinv), p2);
+        let r3 = mp_csub(mp_mul(res3[k], s3, p3, q3.pinv), p3);
+        let v2 = mp_csub(mp_mul(r2 + 2 * p2 - r1, inv_p1_mod_p2, p2, q2.pinv), p2);
+        let t = mp_csub(mp_mul(v2, p1_mod_p3, p3, q3.pinv), p3) + r1;
+        let t = mp_csub(mp_csub(t, 2 * p3), p3);
+        let v3 = mp_csub(mp_mul(r3 + p3 - t, inv_p12_mod_p3, p3, q3.pinv), p3);
+        let x12 = r1 as u128 + p1 as u128 * v2 as u128;
+        let lo = p12_lo as u128 * v3 as u128;
+        let hi = p12_hi as u128 * v3 as u128 + (lo >> 64);
+        let s = c0 as u128 + (x12 as u64) as u128 + (lo as u64) as u128;
+        let mm = c1 as u128 + (x12 >> 64) + (hi as u64) as u128 + (s >> 64);
+        *o = s as u64;
+        c0 = mm as u64;
+        c1 = ((hi >> 64) + (mm >> 64)) as u64;
+    }
+    // The carry out of the top is a multiple of β^n ≡ 1: fold it back in.
+    let mut carry = [c0, c1];
+    while carry != [0, 0] {
+        let mut c = 0u64;
+        for (i, o) in out.iter_mut().enumerate() {
+            let add = if i < 2 { carry[i] } else { 0 };
+            if add == 0 && c == 0 && i >= 2 {
+                break;
+            }
+            let (s1, k1) = o.overflowing_add(add);
+            let (s2, k2) = s1.overflowing_add(c);
+            *o = s2;
+            c = k1 as u64 + k2 as u64;
+        }
+        carry = [c, 0];
+    }
+    out
+}
+
+/// `x mod (β^n − 1)` as `n` limbs (residue in `[0, β^n − 1]`).
+fn fold_bnm1(x: &[Limb], n: usize) -> Vec<Limb> {
+    let mut out = alloc::vec![0 as Limb; n];
+    let mut carry = 0u64;
+    for chunk in x.chunks(n) {
+        let mut c = 0u64;
+        for (o, &v) in out.iter_mut().zip(chunk) {
+            let (s1, k1) = o.overflowing_add(v);
+            let (s2, k2) = s1.overflowing_add(c);
+            *o = s2;
+            c = k1 as u64 + k2 as u64;
+        }
+        for o in out[chunk.len()..].iter_mut() {
+            if c == 0 {
+                break;
+            }
+            let (s, k) = o.overflowing_add(c);
+            *o = s;
+            c = k as u64;
+        }
+        carry += c;
+    }
+    while carry != 0 {
+        let mut c = carry;
+        for o in out.iter_mut() {
+            if c == 0 {
+                break;
+            }
+            let (s, k) = o.overflowing_add(c);
+            *o = s;
+            c = k as u64;
+        }
+        carry = c;
+    }
+    out
+}
+
+/// `(t − x) mod (β^n − 1)` for residues `t`, `x` of `n` limbs.
+fn sub_mod_bnm1(mut t: Vec<Limb>, x: &[Limb]) -> Vec<Limb> {
+    let mut borrow = 0;
+    for (o, &v) in t.iter_mut().zip(x) {
+        let (d, b) = sbb(*o, v, borrow);
+        *o = d;
+        borrow = b;
+    }
+    // A borrow out means we wrapped by β^n; add back β^n − 1 ≡ subtract 1 more
+    // across the wrap: t − x + β^n − 1 = (wrapped t − x) − 1.
+    while borrow != 0 {
+        let mut b = 1;
+        for o in t.iter_mut() {
+            let (d, bb) = sbb(*o, 0, b);
+            *o = d;
+            b = bb;
+            if b == 0 {
+                break;
+            }
+        }
+        borrow = b;
+    }
+    t
+}
+
+/// The cyclic length used for a residue product next to an `n`-limb divisor
+/// (smallest transform length `≥ n + 2`), when that is the cheaper route —
+/// only in the NTT range, where a cyclic transform costs about half a full
+/// product.
+fn bnm1_length(n: usize) -> Option<usize> {
+    if n < BNM1_MIN_LIMBS {
+        return None;
+    }
+    mp_shape(n + 2)
+}
+
+/// Divisor size from which Newton division takes products modulo `β^L − 1`
+/// (much lower in unit tests, so the residue path is exercised at sizes
+/// where the reference division is cheap).
+#[cfg(not(test))]
+const BNM1_MIN_LIMBS: usize = 1500;
+#[cfg(test)]
+const BNM1_MIN_LIMBS: usize = 100;
+
+/// Recovers the integer `v` with `|v| < (β^n − 1)/2` from its residue `t`
+/// mod `β^n − 1` (`n` limbs): returns `(negative, |v|)`.
+fn signed_from_bnm1(t: Vec<Limb>) -> (bool, Nat) {
+    // t ≥ (β^n − 1)/2 ⇔ top bit set (or all ones): then v = t − (β^n − 1).
+    let n = t.len();
+    if t[n - 1] >> 63 == 0 {
+        return (false, Nat::from_limb_vec(t));
+    }
+    // |v| = (β^n − 1) − t = !t limb-wise.
+    let neg: Vec<Limb> = t.iter().map(|&x| !x).collect();
+    let mag = Nat::from_limb_vec(neg);
+    (!mag.is_zero(), mag)
+}
+
 /// Decides whether the three-prime NTT beats the Karatsuba/Toom ladder for a
 /// product of the given operand sizes (in limbs). The transform length (see
 /// [`mp_plan`]) steps through `2^k` and `3·2^k`, so the NTT's cost is a step
@@ -934,7 +1117,7 @@ fn bz_div_rem(a: &Nat, b: &Nat) -> (Nat, Nat) {
 /// wins on long quotients from moderate sizes, and on balanced ones only once
 /// BZ's `log n` factor dominates. (Measured on x86-64; ratios to `M(n)`.)
 fn newton_div_worthwhile(n: usize, m: usize) -> bool {
-    (n >= 768 && m >= 4 * n) || (n >= 2048 && m >= 2 * n) || (n >= 16384 && m >= n)
+    (n >= 768 && m >= 4 * n) || (n >= 2048 && m >= 2 * n) || (n >= 6000 && m >= n)
 }
 
 /// Precision (limbs) at or below which the reciprocal is computed by one exact
@@ -977,17 +1160,32 @@ fn newton_recip(d: &Nat) -> Nat {
     let h = n / 2 + 2;
     let dh = limbs_shr(d, n - h);
     let vh = newton_recip(&dh);
-    let p = d.mul(&vh);
-    let top = limbs_shl(&Nat::one(), n + h);
     let base = limbs_shl(&vh, n - h);
+    // e = β^(n+h) − d·Vh, |e| ≲ 6·β^n: from the full product, or from its
+    // residue mod β^L − 1 (L ≥ n + 2) when a cyclic transform is cheaper.
+    let (neg, e) = match bnm1_length(n) {
+        Some(l) => {
+            let x = mul_mod_bnm1(&d.limbs, &vh.limbs, l);
+            let mut top = alloc::vec![0 as Limb; l];
+            top[(n + h) % l] = 1; // β^(n+h) mod β^L − 1 (n + h < 2L)
+            signed_from_bnm1(sub_mod_bnm1(top, &x))
+        }
+        None => {
+            let p = d.mul(&vh);
+            let top = limbs_shl(&Nat::one(), n + h);
+            if p.cmp_ref(&top) != Ordering::Greater {
+                (false, top.checked_sub(&p).expect("p <= top"))
+            } else {
+                (true, p.checked_sub(&top).expect("p > top"))
+            }
+        }
+    };
     // Truncate e to its top limbs: dropping h − 1 low limbs perturbs
     // Vh·e/β^(2h) by < Vh·β^(h−1)/β^(2h) < 1.
-    if p.cmp_ref(&top) != Ordering::Greater {
-        let e = top.checked_sub(&p).expect("p <= top");
+    if !neg {
         let corr = limbs_shr(&vh.mul(&limbs_shr(&e, h - 1)), h + 1);
         base.add(&corr)
     } else {
-        let e = p.checked_sub(&top).expect("p > top");
         let corr = limbs_shr(&vh.mul(&limbs_shr(&e, h - 1)), h + 1);
         base.checked_sub(&corr.add_u64(1))
             .expect("correction is far below Vh·β^(n−h)")
@@ -998,13 +1196,37 @@ fn newton_recip(d: &Nat) -> Nat {
 /// exact `(q, r)` by stepping against the true remainder; `None` if the
 /// estimate was off by more than a small bound (the caller then falls back).
 fn correct_quotient(a: &Nat, d: &Nat, q0: Nat) -> Option<(Nat, Nat)> {
-    const MAX_STEPS: usize = 16;
     let qd = q0.mul(d);
-    let mut q = q0;
-    let mut r = if qd.cmp_ref(a) == Ordering::Greater {
-        // Too large: step down until q·d ≤ a, tracking the deficit q·d − a.
+    if qd.cmp_ref(a) == Ordering::Greater {
         let mut deficit = qd;
         deficit.sub_assign_limbs(&a.limbs);
+        finish_quotient(d, q0, true, deficit)
+    } else {
+        let mut r = a.clone();
+        r.sub_assign_limbs(&qd.limbs);
+        finish_quotient(d, q0, false, r)
+    }
+}
+
+/// [`correct_quotient`] computing the remainder estimate `a − q₀·d` modulo
+/// `β^L − 1` (one cyclic transform of length `L ≥ n + 2` instead of the full
+/// product): `|a − q₀·d|` is a few multiples of `d < β^n`, far below
+/// `(β^L − 1)/2`, so its residue determines it.
+fn correct_quotient_bnm1(a: &Nat, d: &Nat, q0: Nat, l: usize) -> Option<(Nat, Nat)> {
+    let x = mul_mod_bnm1(&q0.limbs, &d.limbs, l);
+    let t = sub_mod_bnm1(fold_bnm1(&a.limbs, l), &x);
+    let (neg, mag) = signed_from_bnm1(t);
+    finish_quotient(d, q0, neg, mag)
+}
+
+/// Exact `(q, r)` from a quotient estimate `q` and the signed remainder
+/// estimate `±mag = a − q·d`, by stepping `q` (at most a few times); `None`
+/// if the estimate was too far off.
+fn finish_quotient(d: &Nat, mut q: Nat, neg: bool, mag: Nat) -> Option<(Nat, Nat)> {
+    const MAX_STEPS: usize = 16;
+    let mut r = if neg && !mag.is_zero() {
+        // Too large: step down until q·d ≤ a, tracking the deficit q·d − a.
+        let mut deficit = mag;
         let mut steps = 0;
         loop {
             steps += 1;
@@ -1020,9 +1242,7 @@ fn correct_quotient(a: &Nat, d: &Nat, q0: Nat) -> Option<(Nat, Nat)> {
             deficit.sub_assign_limbs(&d.limbs);
         }
     } else {
-        let mut r = a.clone();
-        r.sub_assign_limbs(&qd.limbs);
-        r
+        mag
     };
     let mut steps = 0;
     while r.cmp_ref(d) != Ordering::Less {
@@ -1045,7 +1265,11 @@ fn correct_quotient(a: &Nat, d: &Nat, q0: Nat) -> Option<(Nat, Nat)> {
 /// product at a clean `n × n` size (the quotient block is `n − 2` limbs).
 fn newton_div_block(a: &Nat, d: &Nat, v: &Nat, n: usize) -> (Nat, Nat) {
     let q0 = limbs_shr(&limbs_shr(a, n - 2).mul(&limbs_shr(v, 1)), n + 1);
-    correct_quotient(a, d, q0).unwrap_or_else(|| div_rem_classic(a, d))
+    let fixed = match bnm1_length(n) {
+        Some(l) => correct_quotient_bnm1(a, d, q0, l),
+        None => correct_quotient(a, d, q0),
+    };
+    fixed.unwrap_or_else(|| div_rem_classic(a, d))
 }
 
 /// `a divmod d` (`d` ≥ 2 limbs) by Burnikel–Ziegler / Knuth only — never the
@@ -6544,6 +6768,69 @@ mod tests {
             let n = Nat::from_bytes_le(&bytes);
             for k in [3u32, 4, 5, 7, 11, 13] {
                 check(&n, k);
+            }
+        }
+    }
+
+    #[test]
+    fn mul_mod_bnm1_matches_full_product() {
+        let mut st = 0x5151_aaaa_0f0f_1234u64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for l in [2usize, 4, 6, 8, 12, 16, 48, 64, 96, 384] {
+            assert_eq!(mp_shape(l), Some(l));
+            let modulus = limbs_shl(&Nat::one(), l).checked_sub_u64(1).unwrap();
+            for (la, lb) in [(l, l), (l, 1), (l / 2 + 1, l), (1, 1)] {
+                for fill in [0u64, 1, 2] {
+                    let mk = |len: usize, next: &mut dyn FnMut() -> u64| -> Vec<Limb> {
+                        (0..len)
+                            .map(|_| match fill {
+                                0 => next(),
+                                1 => Limb::MAX,
+                                _ => next() & 1,
+                            })
+                            .collect()
+                    };
+                    let a = mk(la, &mut next);
+                    let b = mk(lb, &mut next);
+                    let want = Nat::from_limbs(&a)
+                        .mul(&Nat::from_limbs(&b))
+                        .div_rem(&modulus)
+                        .unwrap()
+                        .1;
+                    let got = Nat::from_limb_vec(mul_mod_bnm1(&a, &b, l))
+                        .div_rem(&modulus)
+                        .unwrap()
+                        .1;
+                    assert_eq!(got, want, "L={l} {la}x{lb} fill {fill}");
+                    // fold and signed recovery
+                    let folded = Nat::from_limb_vec(fold_bnm1(
+                        &Nat::from_limbs(&a).mul(&Nat::from_limbs(&b)).limbs,
+                        l,
+                    ))
+                    .div_rem(&modulus)
+                    .unwrap()
+                    .1;
+                    assert_eq!(folded, want);
+                }
+            }
+            // signed recovery of small values of both signs
+            for v in [0i64, 1, -1, 12345, -98765] {
+                let mag = Nat::from_u64(v.unsigned_abs());
+                let res = if v >= 0 {
+                    let mut t = mag.limbs.clone();
+                    t.resize(l, 0);
+                    t
+                } else {
+                    let mut t = modulus.checked_sub(&mag).unwrap().limbs;
+                    t.resize(l, 0);
+                    t
+                };
+                assert_eq!(signed_from_bnm1(res), (v < 0, mag));
             }
         }
     }

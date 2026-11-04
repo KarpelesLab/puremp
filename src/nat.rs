@@ -1735,6 +1735,21 @@ fn lehmer_step128(mut x: u128, mut y: u128) -> (i128, i128, i128, i128) {
     (a, b, c, d)
 }
 
+/// Compares two normalized little-endian limb slices as naturals.
+pub(crate) fn cmp_limbs(a: &[Limb], b: &[Limb]) -> Ordering {
+    match a.len().cmp(&b.len()) {
+        Ordering::Equal => {}
+        non_eq => return non_eq,
+    }
+    for (x, y) in a.iter().rev().zip(b.iter().rev()) {
+        match x.cmp(y) {
+            Ordering::Equal => continue,
+            non_eq => return non_eq,
+        }
+    }
+    Ordering::Equal
+}
+
 /// An arbitrary-precision natural number (a non-negative integer).
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct Nat {
@@ -1827,18 +1842,17 @@ impl Nat {
     }
 
     /// Compares two naturals.
+    #[inline]
     fn cmp_ref(&self, other: &Nat) -> Ordering {
-        match self.limbs.len().cmp(&other.limbs.len()) {
-            Ordering::Equal => {}
-            non_eq => return non_eq,
-        }
-        for (a, b) in self.limbs.iter().rev().zip(other.limbs.iter().rev()) {
-            match a.cmp(b) {
-                Ordering::Equal => continue,
-                non_eq => return non_eq,
-            }
-        }
-        Ordering::Equal
+        cmp_limbs(&self.limbs, &other.limbs)
+    }
+
+    /// A natural holding a copy of the (normalized) `limbs`, with room for
+    /// `capacity` limbs so a following in-place update need not reallocate.
+    pub(crate) fn from_limbs_with_capacity(limbs: &[Limb], capacity: usize) -> Nat {
+        let mut v = Vec::with_capacity(capacity.max(limbs.len()));
+        v.extend_from_slice(limbs);
+        Nat { limbs: v }
     }
 
     /// Returns `self + rhs`.
@@ -3101,6 +3115,156 @@ impl Nat {
         n
     }
 
+    /// Builds a natural from an owned vector of little-endian limbs, taking it
+    /// over without copying (any trailing zeros are stripped).
+    pub fn from_limb_vec(limbs: Vec<Limb>) -> Nat {
+        let mut n = Nat { limbs };
+        n.normalize();
+        n
+    }
+
+    /// Consumes the natural and returns its little-endian limbs without
+    /// copying (normalized: empty for zero, non-zero top limb otherwise).
+    pub fn into_limbs(self) -> Vec<Limb> {
+        self.limbs
+    }
+
+    /// Returns `self + v`.
+    pub fn add_u64(&self, v: u64) -> Nat {
+        let mut out = Vec::with_capacity(self.limbs.len() + 1);
+        out.extend_from_slice(&self.limbs);
+        let mut n = Nat { limbs: out };
+        n.add_assign_u64(v);
+        n
+    }
+
+    /// Returns `self − v`, or `None` if `v > self`.
+    pub fn checked_sub_u64(&self, v: u64) -> Option<Nat> {
+        if self.limbs.len() <= 1 {
+            let x = self.limbs.first().copied().unwrap_or(0);
+            return x.checked_sub(v).map(Nat::from_u64);
+        }
+        let mut n = self.clone();
+        n.sub_assign_u64_unchecked(v);
+        Some(n)
+    }
+
+    /// Returns `self · v`.
+    pub fn mul_u64(&self, v: u64) -> Nat {
+        if v == 0 || self.is_zero() {
+            return Nat::zero();
+        }
+        let mut out = Vec::with_capacity(self.limbs.len() + 1);
+        out.extend_from_slice(&self.limbs);
+        let mut n = Nat { limbs: out };
+        n.mul_assign_u64(v);
+        n
+    }
+
+    /// `self += v` in place.
+    pub(crate) fn add_assign_u64(&mut self, v: u64) {
+        let mut carry = v;
+        for l in self.limbs.iter_mut() {
+            if carry == 0 {
+                return;
+            }
+            let (s, c) = l.overflowing_add(carry);
+            *l = s;
+            carry = c as Limb;
+        }
+        if carry != 0 {
+            self.limbs.push(carry);
+        }
+    }
+
+    /// `self −= v` in place; the caller guarantees `v ≤ self`.
+    pub(crate) fn sub_assign_u64_unchecked(&mut self, v: u64) {
+        let mut borrow = v;
+        for l in self.limbs.iter_mut() {
+            if borrow == 0 {
+                break;
+            }
+            let (d, b) = l.overflowing_sub(borrow);
+            *l = d;
+            borrow = b as Limb;
+        }
+        debug_assert_eq!(borrow, 0, "sub_assign_u64_unchecked underflow");
+        self.normalize();
+    }
+
+    /// `self ·= v` in place.
+    pub(crate) fn mul_assign_u64(&mut self, v: u64) {
+        if v == 0 {
+            self.limbs.clear();
+            return;
+        }
+        let mut carry = 0;
+        for l in self.limbs.iter_mut() {
+            let (lo, hi) = mac(0, *l, v, carry);
+            *l = lo;
+            carry = hi;
+        }
+        if carry != 0 {
+            self.limbs.push(carry);
+        }
+    }
+
+    /// `self += rhs` in place, reusing `self`'s buffer.
+    pub(crate) fn add_assign_limbs(&mut self, rhs: &[Limb]) {
+        if rhs.len() > self.limbs.len() {
+            self.limbs.resize(rhs.len(), 0);
+        }
+        let mut carry = 0;
+        for (a, &b) in self.limbs.iter_mut().zip(rhs) {
+            let (s, c) = adc(*a, b, carry);
+            *a = s;
+            carry = c;
+        }
+        let mut i = rhs.len();
+        while carry != 0 {
+            if i == self.limbs.len() {
+                self.limbs.push(carry);
+                break;
+            }
+            let (s, c) = adc(self.limbs[i], 0, carry);
+            self.limbs[i] = s;
+            carry = c;
+            i += 1;
+        }
+    }
+
+    /// `self −= rhs` in place; the caller guarantees `rhs ≤ self`.
+    pub(crate) fn sub_assign_limbs(&mut self, rhs: &[Limb]) {
+        let mut borrow = 0;
+        for (a, &b) in self.limbs.iter_mut().zip(rhs) {
+            let (d, bb) = sbb(*a, b, borrow);
+            *a = d;
+            borrow = bb;
+        }
+        let mut i = rhs.len();
+        while borrow != 0 {
+            let (d, bb) = sbb(self.limbs[i], 0, borrow);
+            self.limbs[i] = d;
+            borrow = bb;
+            i += 1;
+        }
+        self.normalize();
+    }
+
+    /// `self = rhs − self` in place; the caller guarantees `self ≤ rhs`.
+    pub(crate) fn rsub_assign_limbs(&mut self, rhs: &[Limb]) {
+        debug_assert!(self.limbs.len() <= rhs.len());
+        self.limbs.resize(rhs.len(), 0);
+        let mut borrow = 0;
+        for (a, &b) in self.limbs.iter_mut().zip(rhs) {
+            let (d, bb) = sbb(b, *a, borrow);
+            *a = d;
+            borrow = bb;
+        }
+        debug_assert_eq!(borrow, 0, "rsub_assign_limbs underflow");
+        self.normalize();
+    }
+
     /// Returns the nearest `f64` (ties to even), or `+∞` when the value rounds
     /// past `f64::MAX`.
     pub fn to_f64(&self) -> f64 {
@@ -4353,7 +4517,7 @@ impl core::ops::Mul for Nat {
 impl core::ops::AddAssign for Nat {
     #[inline]
     fn add_assign(&mut self, rhs: Nat) {
-        *self = Nat::add(self, &rhs);
+        self.add_assign_limbs(&rhs.limbs);
     }
 }
 
@@ -4361,6 +4525,35 @@ impl core::ops::MulAssign for Nat {
     #[inline]
     fn mul_assign(&mut self, rhs: Nat) {
         *self = Nat::mul(self, &rhs);
+    }
+}
+
+impl core::ops::AddAssign<&Nat> for Nat {
+    /// In-place addition, reusing `self`'s buffer.
+    #[inline]
+    fn add_assign(&mut self, rhs: &Nat) {
+        self.add_assign_limbs(&rhs.limbs);
+    }
+}
+
+impl core::ops::AddAssign<u64> for Nat {
+    #[inline]
+    fn add_assign(&mut self, rhs: u64) {
+        self.add_assign_u64(rhs);
+    }
+}
+
+impl core::ops::MulAssign<u64> for Nat {
+    #[inline]
+    fn mul_assign(&mut self, rhs: u64) {
+        self.mul_assign_u64(rhs);
+    }
+}
+
+impl core::ops::MulAssign<&Nat> for Nat {
+    #[inline]
+    fn mul_assign(&mut self, rhs: &Nat) {
+        *self = Nat::mul(self, rhs);
     }
 }
 

@@ -22,7 +22,7 @@ use alloc::borrow::Cow;
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
-use crate::nat::Nat;
+use crate::nat::{Nat, cmp_limbs};
 
 /// The sign of an [`Int`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -159,6 +159,12 @@ impl Int {
         Int::from_sign_magnitude(sign, Nat::from_limbs(limbs))
     }
 
+    /// Builds an integer from a sign and an owned vector of little-endian
+    /// magnitude limbs, taking the vector over without copying.
+    pub fn from_limb_vec(sign: Sign, limbs: Vec<u64>) -> Int {
+        Int::from_sign_magnitude(sign, Nat::from_limb_vec(limbs))
+    }
+
     /// Expands to sign-magnitude form for the slow path.
     fn to_sign_mag(&self) -> (Sign, Nat) {
         match &self.0 {
@@ -173,6 +179,145 @@ impl Int {
                 }
             }
             Repr::Large { sign, mag } => (*sign, mag.clone()),
+        }
+    }
+
+    /// The magnitude's little-endian limbs, borrowed when heap-backed and
+    /// placed in `tmp` (no allocation) when inline.
+    #[inline]
+    fn mag_limbs<'a>(&'a self, tmp: &'a mut [u64; 1]) -> &'a [u64] {
+        match &self.0 {
+            Repr::Small { mag, .. } => {
+                tmp[0] = *mag;
+                if *mag == 0 { &tmp[..0] } else { &tmp[..] }
+            }
+            Repr::Large { mag, .. } => mag.as_limbs(),
+        }
+    }
+
+    /// `self + (−1)^negate · rhs` without cloning either operand.
+    fn add_signed(&self, rhs: &Int, negate: bool) -> Int {
+        if let (Repr::Small { neg: na, mag: ma }, Repr::Small { neg: nb, mag: mb }) =
+            (&self.0, &rhs.0)
+        {
+            let nb = *nb ^ negate;
+            if *na == nb {
+                if let Some(s) = ma.checked_add(*mb) {
+                    return Int::small(*na, s);
+                }
+            } else if ma >= mb {
+                return Int::small(*na, ma - mb);
+            } else {
+                return Int::small(nb, mb - ma);
+            }
+        }
+        let sa = self.sign();
+        let sb = if negate { -rhs.sign() } else { rhs.sign() };
+        if sb == Sign::Zero {
+            return self.clone();
+        }
+        if sa == Sign::Zero {
+            return if negate { rhs.neg() } else { rhs.clone() };
+        }
+        let (mut ta, mut tb) = ([0u64; 1], [0u64; 1]);
+        let a = self.mag_limbs(&mut ta);
+        let b = rhs.mag_limbs(&mut tb);
+        if sa == sb {
+            let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+            let mut n = Nat::from_limbs_with_capacity(long, long.len() + 1);
+            n.add_assign_limbs(short);
+            return Int::from_sign_magnitude(sa, n);
+        }
+        match cmp_limbs(a, b) {
+            Ordering::Equal => Int::ZERO,
+            Ordering::Greater => {
+                let mut n = Nat::from_limbs_with_capacity(a, a.len());
+                n.sub_assign_limbs(b);
+                Int::from_sign_magnitude(sa, n)
+            }
+            Ordering::Less => {
+                let mut n = Nat::from_limbs_with_capacity(b, b.len());
+                n.sub_assign_limbs(a);
+                Int::from_sign_magnitude(sb, n)
+            }
+        }
+    }
+
+    /// `self += (−1)^negate · rhs` in place, reusing `self`'s buffer.
+    fn add_assign_signed(&mut self, rhs: &Int, negate: bool) {
+        if matches!((&self.0, &rhs.0), (Repr::Small { .. }, Repr::Small { .. })) {
+            *self = self.add_signed(rhs, negate);
+            return;
+        }
+        let sb = if negate { -rhs.sign() } else { rhs.sign() };
+        if sb == Sign::Zero {
+            return;
+        }
+        let sa = self.sign();
+        if sa == Sign::Zero {
+            *self = if negate { rhs.neg() } else { rhs.clone() };
+            return;
+        }
+        let mut tb = [0u64; 1];
+        let b = rhs.mag_limbs(&mut tb);
+        let mut mag = match core::mem::replace(&mut self.0, Repr::Small { neg: false, mag: 0 }) {
+            Repr::Small { mag, .. } => Nat::from_limbs_with_capacity(&[mag], b.len() + 1),
+            Repr::Large { mag, .. } => mag,
+        };
+        let sign = if sa == sb {
+            mag.add_assign_limbs(b);
+            sa
+        } else {
+            match cmp_limbs(mag.as_limbs(), b) {
+                Ordering::Equal => return, // self is already ZERO
+                Ordering::Greater => {
+                    mag.sub_assign_limbs(b);
+                    sa
+                }
+                Ordering::Less => {
+                    mag.rsub_assign_limbs(b);
+                    sb
+                }
+            }
+        };
+        *self = Int::from_sign_magnitude(sign, mag);
+    }
+
+    /// Returns `self + v`.
+    #[inline]
+    pub fn add_u64(&self, v: u64) -> Int {
+        self.add_signed(&Int::from_u64(v), false)
+    }
+
+    /// Returns `self − v`.
+    #[inline]
+    pub fn sub_u64(&self, v: u64) -> Int {
+        self.add_signed(&Int::from_u64(v), true)
+    }
+
+    /// Returns `self · v`.
+    #[inline]
+    pub fn mul_u64(&self, v: u64) -> Int {
+        self.mul(&Int::from_u64(v))
+    }
+
+    /// `self += v` in place.
+    #[inline]
+    pub fn add_assign_u64(&mut self, v: u64) {
+        self.add_assign_signed(&Int::from_u64(v), false);
+    }
+
+    /// `self −= v` in place.
+    #[inline]
+    pub fn sub_assign_u64(&mut self, v: u64) {
+        self.add_assign_signed(&Int::from_u64(v), true);
+    }
+
+    /// `self ·= v` in place (reusing the buffer when heap-backed).
+    pub fn mul_assign_u64(&mut self, v: u64) {
+        match &mut self.0 {
+            Repr::Large { mag, .. } if v != 0 => mag.mul_assign_u64(v),
+            _ => *self = self.mul_u64(v),
         }
     }
 
@@ -291,33 +436,23 @@ impl Int {
     pub fn neg(&self) -> Int {
         match &self.0 {
             Repr::Small { neg, mag } => Int::small(!*neg, *mag),
-            Repr::Large { sign, mag } => Int::from_sign_magnitude(-*sign, mag.clone()),
+            Repr::Large { sign, mag } => Int(Repr::Large {
+                sign: -*sign,
+                mag: mag.clone(),
+            }),
         }
     }
 
     /// Returns `self + rhs`.
+    #[inline]
     pub fn add(&self, rhs: &Int) -> Int {
-        if let (Repr::Small { neg: na, mag: ma }, Repr::Small { neg: nb, mag: mb }) =
-            (&self.0, &rhs.0)
-        {
-            if na == nb {
-                if let Some(s) = ma.checked_add(*mb) {
-                    return Int::small(*na, s);
-                }
-            } else if ma >= mb {
-                return Int::small(*na, ma - mb);
-            } else {
-                return Int::small(*nb, mb - ma);
-            }
-        }
-        let (sa, a) = self.to_sign_mag();
-        let (sb, b) = rhs.to_sign_mag();
-        add_expanded(sa, &a, sb, &b)
+        self.add_signed(rhs, false)
     }
 
     /// Returns `self - rhs`.
+    #[inline]
     pub fn sub(&self, rhs: &Int) -> Int {
-        self.add(&rhs.neg())
+        self.add_signed(rhs, true)
     }
 
     /// Returns `self · rhs`.
@@ -328,19 +463,25 @@ impl Int {
         {
             return Int::small(na ^ nb, p);
         }
-        let (sa, a) = self.to_sign_mag();
-        let (sb, b) = rhs.to_sign_mag();
-        let sign = match (sa, sb) {
+        let sign = match (self.sign(), rhs.sign()) {
             (Sign::Zero, _) | (_, Sign::Zero) => return Int::ZERO,
             (x, y) if x == y => Sign::Positive,
             _ => Sign::Negative,
         };
-        Int::from_sign_magnitude(sign, a.mul(&b))
+        let mag = match (&self.0, &rhs.0) {
+            (Repr::Large { mag: a, .. }, Repr::Large { mag: b, .. }) => a.mul(b),
+            (Repr::Large { mag: a, .. }, Repr::Small { mag: b, .. })
+            | (Repr::Small { mag: b, .. }, Repr::Large { mag: a, .. }) => a.mul_u64(*b),
+            (Repr::Small { mag: a, .. }, Repr::Small { mag: b, .. }) => {
+                Nat::from_u128(*a as u128 * *b as u128)
+            }
+        };
+        Int::from_sign_magnitude(sign, mag)
     }
 
     /// Returns `self²` (always non-negative), via the fast squaring path.
     pub fn square(&self) -> Int {
-        Int::from(self.magnitude().square())
+        Int::from(self.magnitude_ref().square())
     }
 
     /// Returns `self` raised to `exp` (`self^0 == 1`), by square-and-multiply.
@@ -392,7 +533,7 @@ impl Int {
                 return;
             }
         }
-        *self = self.add(&a.mul(b));
+        self.add_assign_signed(&a.mul(b), false);
     }
 
     /// Fused multiply-subtract: `self -= a · b`.
@@ -412,7 +553,7 @@ impl Int {
                 return;
             }
         }
-        *self = self.sub(&a.mul(b));
+        self.add_assign_signed(&a.mul(b), true);
     }
 
     // --- division (three conventions: truncated, floor, Euclidean) ---
@@ -421,9 +562,20 @@ impl Int {
     /// rounded toward zero and the remainder taking the sign of `self`, or
     /// `None` if `d` is zero.
     pub fn div_rem(&self, d: &Int) -> Option<(Int, Int)> {
-        let (sa, a) = self.to_sign_mag();
-        let (sb, b) = d.to_sign_mag();
-        let (q, r) = a.div_rem(&b)?;
+        let (sa, sb) = (self.sign(), d.sign());
+        let (q, r) = match (&self.0, &d.0) {
+            (_, Repr::Small { mag: 0, .. }) => return None,
+            (Repr::Small { mag: a, .. }, Repr::Small { mag: b, .. }) => {
+                (Nat::from_u64(a / b), Nat::from_u64(a % b))
+            }
+            // |self| < 2^64 ≤ |d|.
+            (Repr::Small { mag: a, .. }, Repr::Large { .. }) => (Nat::zero(), Nat::from_u64(*a)),
+            (Repr::Large { mag: a, .. }, Repr::Small { mag: b, .. }) => {
+                let (q, r) = a.divmod_small(*b);
+                (q, Nat::from_u64(r))
+            }
+            (Repr::Large { mag: a, .. }, Repr::Large { mag: b, .. }) => a.div_rem(b)?,
+        };
         let q_sign = match (sa, sb) {
             (Sign::Zero, _) => Sign::Zero,
             (x, y) if x == y => Sign::Positive,
@@ -520,7 +672,7 @@ impl Int {
 
     /// Greatest common divisor (non-negative). `gcd(0, 0) == 0`.
     pub fn gcd(&self, b: &Int) -> Int {
-        Int::from(self.magnitude().gcd(&b.magnitude()))
+        Int::from(self.magnitude_ref().gcd(&b.magnitude_ref()))
     }
 
     /// Least common multiple (non-negative). `lcm(x, 0) == 0`.
@@ -528,8 +680,8 @@ impl Int {
         if self.is_zero() || b.is_zero() {
             return Int::ZERO;
         }
-        let ma = self.magnitude();
-        let mb = b.magnitude();
+        let ma = self.magnitude_ref();
+        let mb = b.magnitude_ref();
         let g = ma.gcd(&mb);
         let reduced = ma.div_rem(&g).expect("gcd is non-zero").0;
         Int::from(reduced.mul(&mb))
@@ -541,9 +693,9 @@ impl Int {
     pub fn modpow(&self, exp: &Int, modulus: &Int) -> Int {
         assert!(!exp.is_negative(), "modpow: negative exponent");
         assert!(!modulus.is_zero(), "modpow: zero modulus");
-        let m = modulus.magnitude();
-        let base = self.rem_euclid(modulus).magnitude(); // in [0, |m|)
-        Int::from(base.modpow(&exp.magnitude(), &m))
+        let m = modulus.magnitude_ref();
+        let base = self.rem_euclid(modulus).into_magnitude(); // in [0, |m|)
+        Int::from(base.modpow(&exp.magnitude_ref(), &m))
     }
 
     /// Returns the modular inverse of `self` mod `modulus` (in `[0, |modulus|)`),
@@ -814,21 +966,19 @@ impl Int {
 
     /// Returns `self << k` (multiply by `2^k`).
     pub fn mul_2k(&self, k: u64) -> Int {
-        let (s, m) = self.to_sign_mag();
-        Int::from_sign_magnitude(s, m.shl(k))
+        Int::from_sign_magnitude(self.sign(), self.magnitude_ref().shl(k))
     }
 
     /// Returns the truncated `self / 2^k` (rounds toward zero).
     pub fn div_2k_trunc(&self, k: u64) -> Int {
-        let (s, m) = self.to_sign_mag();
-        Int::from_sign_magnitude(s, m.shr(k))
+        Int::from_sign_magnitude(self.sign(), self.magnitude_ref().shr(k))
     }
 
     /// Returns `self mod 2^k`, the non-negative value in `[0, 2^k)` (the low `k`
     /// bits, Euclidean).
     pub fn mod_2k(&self, k: u64) -> Int {
-        let (s, m) = self.to_sign_mag();
-        let r = m.low_bits(k);
+        let s = self.sign();
+        let r = self.magnitude_ref().low_bits(k);
         if s == Sign::Negative && !r.is_zero() {
             let modulus = Nat::one().shl(k);
             Int::from(modulus.checked_sub(&r).expect("2^k > low_bits"))
@@ -1014,8 +1164,8 @@ impl Int {
 
     /// Returns the value as an `i128` if it fits.
     pub fn to_i128(&self) -> Option<i128> {
-        let (sign, mag) = self.to_sign_mag();
-        let m = mag.to_u128()?;
+        let sign = self.sign();
+        let m = self.magnitude_ref().to_u128()?;
         match sign {
             Sign::Zero => Some(0),
             Sign::Positive => (m <= i128::MAX as u128).then_some(m as i128),
@@ -1073,23 +1223,10 @@ macro_rules! try_from_int {
 try_from_int!(i8 => to_i128, i16 => to_i128, i32 => to_i128, i64 => to_i128, i128 => to_i128, isize => to_i128);
 try_from_int!(u8 => to_u128, u16 => to_u128, u32 => to_u128, u64 => to_u128, u128 => to_u128, usize => to_u128);
 
-/// Sign-magnitude addition on the slow (heap) path.
-fn add_expanded(sa: Sign, a: &Nat, sb: Sign, b: &Nat) -> Int {
-    match (sa, sb) {
-        (Sign::Zero, _) => Int::from_sign_magnitude(sb, b.clone()),
-        (_, Sign::Zero) => Int::from_sign_magnitude(sa, a.clone()),
-        (x, y) if x == y => Int::from_sign_magnitude(x, a.add(b)),
-        _ => match a.cmp(b) {
-            Ordering::Equal => Int::ZERO,
-            Ordering::Greater => Int::from_sign_magnitude(sa, a.checked_sub(b).expect("a > b")),
-            Ordering::Less => Int::from_sign_magnitude(sb, b.checked_sub(a).expect("b > a")),
-        },
-    }
-}
-
 /// Little-endian two's-complement limbs of `x` in exactly `len` limbs.
 fn twos_complement(x: &Int, len: usize) -> Vec<u64> {
-    let (sign, mag) = x.to_sign_mag();
+    let sign = x.sign();
+    let mag = x.magnitude_ref();
     let mut v = alloc::vec![0u64; len];
     for (slot, &limb) in v.iter_mut().zip(mag.as_limbs()) {
         *slot = limb;
@@ -1428,8 +1565,10 @@ impl Ord for Int {
             };
             return va.cmp(&vb);
         }
-        let (sa, a) = self.to_sign_mag();
-        let (sb, b) = other.to_sign_mag();
+        let (sa, sb) = (self.sign(), other.sign());
+        let (mut ta, mut tb) = ([0u64; 1], [0u64; 1]);
+        let a = self.mag_limbs(&mut ta);
+        let b = other.mag_limbs(&mut tb);
         match (sa, sb) {
             (Sign::Negative, Sign::Zero | Sign::Positive) | (Sign::Zero, Sign::Positive) => {
                 Ordering::Less
@@ -1438,8 +1577,8 @@ impl Ord for Int {
             (Sign::Positive, Sign::Zero | Sign::Negative) | (Sign::Zero, Sign::Negative) => {
                 Ordering::Greater
             }
-            (Sign::Positive, Sign::Positive) => a.cmp(&b),
-            (Sign::Negative, Sign::Negative) => b.cmp(&a),
+            (Sign::Positive, Sign::Positive) => cmp_limbs(a, b),
+            (Sign::Negative, Sign::Negative) => cmp_limbs(b, a),
         }
     }
 }
@@ -1606,8 +1745,78 @@ macro_rules! binops {
     };
 }
 
-binops!(Add, add, AddAssign, add_assign);
-binops!(Sub, sub, SubAssign, sub_assign);
+/// `+`/`-`: like [`binops!`], but an owned left operand (and the assign
+/// forms) are updated in place, reusing their buffer.
+macro_rules! addsub_binops {
+    ($tr:ident, $m:ident, $atr:ident, $am:ident, $negate:expr) => {
+        impl core::ops::$tr<Int> for Int {
+            type Output = Int;
+            #[inline]
+            fn $m(mut self, rhs: Int) -> Int {
+                self.add_assign_signed(&rhs, $negate);
+                self
+            }
+        }
+        impl core::ops::$tr<&Int> for Int {
+            type Output = Int;
+            #[inline]
+            fn $m(mut self, rhs: &Int) -> Int {
+                self.add_assign_signed(rhs, $negate);
+                self
+            }
+        }
+        impl core::ops::$tr<Int> for &Int {
+            type Output = Int;
+            #[inline]
+            fn $m(self, rhs: Int) -> Int {
+                Int::$m(self, &rhs)
+            }
+        }
+        impl core::ops::$tr<&Int> for &Int {
+            type Output = Int;
+            #[inline]
+            fn $m(self, rhs: &Int) -> Int {
+                Int::$m(self, rhs)
+            }
+        }
+        impl core::ops::$tr<i64> for Int {
+            type Output = Int;
+            #[inline]
+            fn $m(mut self, rhs: i64) -> Int {
+                self.add_assign_signed(&Int::from_i64(rhs), $negate);
+                self
+            }
+        }
+        impl core::ops::$tr<i64> for &Int {
+            type Output = Int;
+            #[inline]
+            fn $m(self, rhs: i64) -> Int {
+                Int::$m(self, &Int::from_i64(rhs))
+            }
+        }
+        impl core::ops::$atr<Int> for Int {
+            #[inline]
+            fn $am(&mut self, rhs: Int) {
+                self.add_assign_signed(&rhs, $negate);
+            }
+        }
+        impl core::ops::$atr<&Int> for Int {
+            #[inline]
+            fn $am(&mut self, rhs: &Int) {
+                self.add_assign_signed(rhs, $negate);
+            }
+        }
+        impl core::ops::$atr<i64> for Int {
+            #[inline]
+            fn $am(&mut self, rhs: i64) {
+                self.add_assign_signed(&Int::from_i64(rhs), $negate);
+            }
+        }
+    };
+}
+
+addsub_binops!(Add, add, AddAssign, add_assign, false);
+addsub_binops!(Sub, sub, SubAssign, sub_assign, true);
 binops!(Mul, mul, MulAssign, mul_assign);
 // Two's-complement bitwise ops (see `Int::bitand`).
 binops!(BitAnd, bitand, BitAndAssign, bitand_assign);
@@ -1648,7 +1857,10 @@ impl core::ops::Neg for Int {
     type Output = Int;
     #[inline]
     fn neg(self) -> Int {
-        Int::neg(&self)
+        match self.0 {
+            Repr::Small { neg, mag } => Int::small(!neg, mag),
+            Repr::Large { sign, mag } => Int(Repr::Large { sign: -sign, mag }),
+        }
     }
 }
 

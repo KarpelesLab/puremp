@@ -7,6 +7,20 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ## [Unreleased]
 
+### Added
+
+- *(int)* `Int::add_u64`/`sub_u64`/`mul_u64` and in-place
+  `add_assign_u64`/`sub_assign_u64`/`mul_assign_u64`; `Int::from_limb_vec`
+- *(nat)* `Nat::from_limb_vec`/`into_limbs` (no copy), `add_u64`,
+  `checked_sub_u64`, `mul_u64`, and `+= &Nat`, `+= u64`, `*= &Nat`, `*= u64`
+
+### Performance
+
+- *(int)* `Int` arithmetic, division and comparison borrow multi-limb
+  magnitudes instead of cloning them, single-limb operands no longer go
+  through a heap `Nat`, and `+=`/`-=` (and `+`/`-` with an owned left
+  operand) update the left operand's buffer in place
+
 ### Fixed
 
 - *(algebraic)* `neg`, `sub`, `recip`/`div` and multiplication by a negative

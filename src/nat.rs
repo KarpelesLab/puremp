@@ -4742,15 +4742,29 @@ fn div_3by2(u2: Limb, u1: Limb, u0: Limb, d1: Limb, d0: Limb, v: Limb) -> (Limb,
 #[inline]
 fn submul_1(r: &mut [Limb], a: &[Limb], q: Limb) -> Limb {
     debug_assert_eq!(r.len(), a.len());
-    let mut carry: Limb = 0;
-    for (ri, &ai) in r.iter_mut().zip(a) {
-        // q·aᵢ + carry ≤ 2^128 − 2^64, so the high limb plus the borrow fits.
-        let p = ai as u128 * q as u128 + carry as u128;
-        let (s, b) = ri.overflowing_sub(p as Limb);
-        *ri = s;
-        carry = (p >> LIMB_BITS) as Limb + b as Limb;
+    use crate::limb::DLimb;
+    // r − x = !(!r + x): with w = aᵢ·q + !rᵢ (< 2^128, independent of the
+    // carry), adding the running carry last gives !(new rᵢ) in the low limb
+    // and the borrow-out in the high part — the same short loop-carried chain
+    // as the addmul kernels, instead of multiply → add → subtract → add.
+    let mut c: Limb = 0;
+    let mut step = |ri: &mut Limb, ai: Limb| {
+        let w = ai as DLimb * q as DLimb + (!*ri) as DLimb;
+        let (s, k) = (w as Limb).overflowing_add(c);
+        c = (w >> LIMB_BITS) as Limb + Limb::from(k);
+        *ri = !s;
+    };
+    let (r2, r_tail) = r.as_chunks_mut::<2>();
+    let (a2, a_tail) = a.as_chunks::<2>();
+    for (x, y) in r2.iter_mut().zip(a2) {
+        let [x0, x1] = x;
+        step(x0, y[0]);
+        step(x1, y[1]);
     }
-    carry
+    if let (Some(x), Some(&y)) = (r_tail.first_mut(), a_tail.first()) {
+        step(x, y);
+    }
+    c
 }
 
 /// `r += a` over `r.len() == a.len()` limbs, returning the carry out.

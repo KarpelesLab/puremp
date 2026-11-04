@@ -115,6 +115,8 @@ mod int_roots;
 mod modpow_sec;
 #[cfg(feature = "int")]
 pub mod nat;
+#[cfg(feature = "int")]
+mod radix_converter;
 
 #[cfg(feature = "int")]
 pub mod random;
@@ -255,6 +257,8 @@ pub use poly_finite_field::FactorOverField;
 pub use int::{Int, Sign};
 #[cfg(feature = "int")]
 pub use nat::{Nat, Reciprocal, u_gcd, u64_gcd};
+#[cfg(feature = "int")]
+pub use radix_converter::RadixConverter;
 #[cfg(feature = "int")]
 pub use random::{MersenneTwister, RandomSource, SeedRng};
 

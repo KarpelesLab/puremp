@@ -262,3 +262,34 @@ fn isqrt_is_floor_root() {
         }
     }
 }
+
+#[test]
+fn radix_converter_round_trips() {
+    use puremp::RadixConverter;
+    let mut rng = Rng(1234);
+    for radix in [2u32, 10, 16, 36, 62] {
+        let conv = RadixConverter::new(radix, 20_000);
+        assert_eq!(conv.radix(), radix);
+        assert_eq!(conv.to_ascii(&Nat::zero()), b"0");
+        for limbs in [1usize, 5, 16, 17, 40, 100, 312, 313, 400] {
+            for _ in 0..3 {
+                let v: Vec<u64> = (0..limbs).map(|_| rng.next()).collect();
+                let x = Nat::from_limb_vec(v);
+                let want = x.to_ascii_radix(radix);
+                assert_eq!(conv.to_ascii(&x), want, "radix {radix}, {limbs} limbs");
+                assert_eq!(conv.parse(&want).unwrap(), x);
+                let mut buf = b"#".to_vec();
+                conv.write_ascii(&x, &mut buf);
+                assert_eq!(&buf[1..], &want[..]);
+            }
+        }
+        // powers of the radix and their neighbours (digit boundaries)
+        let p = Nat::from_u64(radix as u64).pow(3000 / radix as u64 + 900);
+        for x in [p.clone(), p.checked_sub_u64(1).unwrap(), p.add_u64(1)] {
+            assert_eq!(conv.to_ascii(&x), x.to_ascii_radix(radix));
+            assert_eq!(conv.parse(&x.to_ascii_radix(radix)).unwrap(), x);
+        }
+        assert!(conv.parse(b"").is_err());
+        assert!(conv.parse(b"1-2").is_err());
+    }
+}

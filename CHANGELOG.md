@@ -19,6 +19,10 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   `Nat`/`Int::from_ascii_radix`, `to_ascii_radix`, `write_ascii_radix`
   (appends to a `Vec<u8>`)
 - *(int)* `Nat`/`Int::pow10` and `mul_pow10`
+- *(nat)* `RadixConverter`: printing / parsing in a fixed radix with the power
+  ladders (and Newton reciprocals of the large print divisors) cached across
+  calls, for converting many numbers of similar size (~10–25% faster at
+  10k–100k digits)
 - *(nat)* `Nat::from_limb_vec`/`into_limbs` (no copy), `add_u64`,
   `checked_sub_u64`, `mul_u64`, and `+= &Nat`, `+= u64`, `*= &Nat`, `*= u64`
 

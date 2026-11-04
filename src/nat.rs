@@ -1384,137 +1384,39 @@ fn recombine_coeffs(product_limbs: usize, k: usize, coeffs: &[crate::int::Int]) 
     n
 }
 
-/// Modular inverse of an odd `x` modulo `2^64`, by Newton's iteration
-/// (`y ← y·(2 − x·y)`), which doubles the number of correct low bits each step.
-#[inline]
-fn inv_mod_2_64(x: Limb) -> Limb {
-    debug_assert!(x & 1 == 1, "inverse mod 2^64 requires an odd input");
-    // Seed correct to 5 bits, then 5 → 10 → 20 → 40 → 80 (≥ 64) bits.
-    let mut y = x.wrapping_mul(3) ^ 2;
-    for _ in 0..4 {
-        y = y.wrapping_mul(2u64.wrapping_sub(x.wrapping_mul(y)));
-    }
-    y
+/// `x`'s limbs zero-padded to exactly `n` (`x` must fit).
+fn padded(x: &Nat, n: usize) -> Vec<Limb> {
+    debug_assert!(
+        x.limbs.len() <= n,
+        "Montgomery operand wider than the modulus"
+    );
+    let mut v = Vec::with_capacity(n);
+    v.extend_from_slice(&x.limbs[..x.limbs.len().min(n)]);
+    v.resize(n, 0);
+    v
 }
 
 /// Montgomery multiplication: returns `a·b·R⁻¹ mod m` in `[0, m)`, where
-/// `R = 2^(64·m.len())` and `n0inv = −m⁻¹ mod 2^64`. Computes the full
-/// double-width product with the fast addmul_2 schoolbook (or the sub-quadratic
-/// dispatcher for large moduli), then reduces it in place with paired REDC
-/// steps. Requires an odd modulus with a non-zero top limb and `a, b < m`.
-fn mont_mul(a: &Nat, b: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
-    let s = m.len();
-    let mut t = alloc::vec![0 as Limb; 2 * s + 2];
-    if s < KARATSUBA_THRESHOLD {
-        // Zero-pad `b` to exactly s limbs so the row length is fixed; `a` keeps
-        // its natural length (short operands skip whole rows).
-        let mut bb: Vec<Limb> = Vec::with_capacity(s);
-        bb.extend_from_slice(&b.limbs);
-        bb.resize(s, 0);
-        let la = a.limbs.len();
-        mul_into_schoolbook(&a.limbs, &bb, &mut t[..la + s]);
-    } else {
-        let p = a.mul(b);
-        t[..p.limbs.len()].copy_from_slice(&p.limbs);
-    }
-    redc_in_place(&mut t, m, n0inv);
-    mont_extract(t, s, m)
+/// `R = 2^(64·m.len())`. Requires an odd modulus with a non-zero top limb and
+/// `a, b < m`.
+fn mont_mul(a: &Nat, b: &Nat, m: &[Limb]) -> Nat {
+    let mut out = padded(b, m.len());
+    let bp = out.clone();
+    crate::mont::Mont::new(m).mul(&mut out, &padded(a, m.len()), &bp);
+    let mut r = Nat { limbs: out };
+    r.normalize();
+    r
 }
 
-/// In-place Montgomery reduction of the double-width value in `t` (at least
-/// `2s + 2` limbs): performs the `s` word-level REDC steps two at a time
-/// through the addmul_2 kernel (half the passes over memory, two independent
-/// limb products in flight), leaving `t / B^s < 2m` in `t[s..]`.
-fn redc_in_place(t: &mut [Limb], m: &[Limb], n0inv: Limb) {
-    use crate::limb::DLimb;
-    let s = m.len();
-    debug_assert!(t.len() >= 2 * s + 2, "REDC needs a double-width buffer");
-    let mut i = 0;
-    while i + 2 <= s {
-        // q0 zeroes limb i. After q0·m lands, limb i+1 holds
-        // t[i+1] + carry(position i) + lo(q0·m[1]); q1 zeroes that.
-        let q0 = t[i].wrapping_mul(n0inv);
-        let c0 = (t[i] as DLimb + q0 as DLimb * m[0] as DLimb) >> LIMB_BITS;
-        let t1 = t[i + 1]
-            .wrapping_add(c0 as Limb)
-            .wrapping_add((q0 as DLimb * m[1] as DLimb) as Limb);
-        let q1 = t1.wrapping_mul(n0inv);
-        // t[i..] += (q0 + q1·B)·m: the paired-row kernel of
-        // [`mul_into_schoolbook`], with a carry ripple above the row.
-        let mut ph0: Limb = 0;
-        let mut pl1: Limb = 0;
-        let mut ph1: Limb = 0;
-        let mut ph1p: Limb = 0;
-        let mut carry: Limb = 0;
-        let (row, rest) = t[i..].split_at_mut(s);
-        for (o, &mj) in row.iter_mut().zip(m) {
-            let p0 = q0 as DLimb * mj as DLimb;
-            let p1 = q1 as DLimb * mj as DLimb;
-            let acc = *o as DLimb
-                + (p0 as Limb) as DLimb
-                + ph0 as DLimb
-                + pl1 as DLimb
-                + ph1p as DLimb
-                + carry as DLimb;
-            *o = acc as Limb;
-            carry = (acc >> LIMB_BITS) as Limb;
-            ph0 = (p0 >> LIMB_BITS) as Limb;
-            ph1p = ph1;
-            pl1 = p1 as Limb;
-            ph1 = (p1 >> LIMB_BITS) as Limb;
-        }
-        // Flush the pipeline into the two limbs above the row, then ripple.
-        let acc = rest[0] as DLimb + ph0 as DLimb + pl1 as DLimb + ph1p as DLimb + carry as DLimb;
-        rest[0] = acc as Limb;
-        let acc2 = rest[1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
-        rest[1] = acc2 as Limb;
-        let mut carry = (acc2 >> LIMB_BITS) as Limb;
-        for o in rest[2..].iter_mut() {
-            if carry == 0 {
-                break;
-            }
-            let sum = *o as DLimb + carry as DLimb;
-            *o = sum as Limb;
-            carry = (sum >> LIMB_BITS) as Limb;
-        }
-        debug_assert_eq!(carry, 0, "REDC carry escaped the buffer");
-        i += 2;
-    }
-    if i < s {
-        // Odd tail: one classic single REDC row.
-        let mi = t[i].wrapping_mul(n0inv) as DLimb;
-        let mut carry: DLimb = 0;
-        let (row, rest) = t[i..].split_at_mut(s);
-        for (tj, &mj) in row.iter_mut().zip(m) {
-            let sum = *tj as DLimb + mi * mj as DLimb + carry;
-            *tj = sum as Limb;
-            carry = sum >> LIMB_BITS;
-        }
-        let mut carry = carry as Limb;
-        for tj in rest.iter_mut() {
-            if carry == 0 {
-                break;
-            }
-            let sum = *tj as DLimb + carry as DLimb;
-            *tj = sum as Limb;
-            carry = (sum >> LIMB_BITS) as Limb;
-        }
-        debug_assert_eq!(carry, 0, "REDC carry escaped the buffer");
-    }
-}
-
-/// Extracts the REDC result from `t[s..]` (a value `< 2m`), applying the one
-/// conditional subtraction that brings it into `[0, m)`.
-fn mont_extract(t: Vec<Limb>, s: usize, m: &[Limb]) -> Nat {
-    let mut result = Nat {
-        limbs: t[s..].to_vec(),
-    };
-    result.normalize();
-    let m_nat = Nat { limbs: m.to_vec() };
-    if result.cmp_ref(&m_nat) != Ordering::Less {
-        result = result.checked_sub(&m_nat).expect("result < 2m");
-    }
-    result
+/// Montgomery squaring: returns `a²·R⁻¹ mod m` in `[0, m)` (same contract as
+/// [`mont_mul`] with both operands equal).
+fn mont_sqr(a: &Nat, m: &[Limb]) -> Nat {
+    let mut out = padded(a, m.len());
+    let ap = out.clone();
+    crate::mont::Mont::new(m).sqr(&mut out, &ap);
+    let mut r = Nat { limbs: out };
+    r.normalize();
+    r
 }
 
 /// Schoolbook squaring of `a` into the zeroed buffer `t` (`t.len() >= 2·a.len()`):
@@ -1594,27 +1496,10 @@ fn sqr_into(a: &[Limb], t: &mut [Limb]) {
     debug_assert_eq!(hi_bit, 0, "square doubling bit escaped the buffer");
 }
 
-/// Montgomery squaring: returns `a²·R⁻¹ mod m` in `[0, m)` (same contract as
-/// [`mont_mul`] with both operands equal). Computes the full double-width
-/// square with the fast symmetric squaring — about half the limb products of a
-/// general multiply — then reduces it in place with paired REDC steps.
-fn mont_sqr(a: &Nat, m: &[Limb], n0inv: Limb) -> Nat {
-    let s = m.len();
-    let mut t = alloc::vec![0 as Limb; 2 * s + 2];
-    if a.limbs.len() < KARATSUBA_SQR_THRESHOLD {
-        sqr_into(&a.limbs, &mut t);
-    } else {
-        let sq = a.square();
-        t[..sq.limbs.len()].copy_from_slice(&sq.limbs);
-    }
-    redc_in_place(&mut t, m, n0inv);
-    mont_extract(t, s, m)
-}
-
 /// Montgomery arithmetic context for an odd modulus `m > 1` (any limb count).
 ///
 /// Encapsulates the one-time setup that [`Nat::modpow_montgomery`] performs
-/// inline — `n0inv = −m⁻¹ mod 2⁶⁴` and `R² mod m`, with `R = 2^(64·k)` — so hot
+/// inline — `R² mod m`, with `R = 2^(64·k)` — so hot
 /// loops (Pollard rho, ECM) can convert their operands into Montgomery form once
 /// and run every multiply and squaring through [`mont_mul`]/[`mont_sqr`] without
 /// a per-step division-based reduction.
@@ -1629,8 +1514,6 @@ pub(crate) struct MontCtx {
     m: Vec<Limb>,
     /// Modulus as a `Nat`, for reductions and comparisons.
     modulus: Nat,
-    /// `−m⁻¹ mod 2⁶⁴`.
-    n0inv: Limb,
     /// `R² mod m`; converts a residue into Montgomery form via one `mont_mul`.
     r2: Nat,
     /// `R³ mod m`; turns the integer inverse of a Montgomery representative back
@@ -1646,15 +1529,13 @@ impl MontCtx {
         debug_assert!(!modulus.is_even(), "MontCtx requires an odd modulus");
         let k = modulus.limbs.len();
         let m = modulus.limbs.clone();
-        let n0inv = inv_mod_2_64(m[0]).wrapping_neg();
         let r = Nat::one().shl(k as u64 * LIMB_BITS as u64);
         let r2 = r.mul(&r).div_rem(modulus).expect("non-zero").1;
         let r3 = r2.mul(&r).div_rem(modulus).expect("non-zero").1;
-        let one = mont_mul(&Nat::one(), &r2, &m, n0inv);
+        let one = mont_mul(&Nat::one(), &r2, &m);
         MontCtx {
             m,
             modulus: modulus.clone(),
-            n0inv,
             r2,
             r3,
             one,
@@ -1683,25 +1564,25 @@ impl MontCtx {
         } else {
             a
         };
-        mont_mul(a, &self.r2, &self.m, self.n0inv)
+        mont_mul(a, &self.r2, &self.m)
     }
 
     /// Converts out of Montgomery form: `a·R⁻¹ mod m` (the true residue).
     pub(crate) fn to_residue(&self, a: &Nat) -> Nat {
-        mont_mul(a, &Nat::one(), &self.m, self.n0inv)
+        mont_mul(a, &Nat::one(), &self.m)
     }
 
     /// `a·b·R⁻¹ mod m`: the Montgomery product of two Montgomery-form operands
     /// (itself in Montgomery form). Requires `a, b < m`.
     #[inline]
     pub(crate) fn mul(&self, a: &Nat, b: &Nat) -> Nat {
-        mont_mul(a, b, &self.m, self.n0inv)
+        mont_mul(a, b, &self.m)
     }
 
     /// `a²·R⁻¹ mod m`: the Montgomery squaring of a Montgomery-form operand.
     #[inline]
     pub(crate) fn sqr(&self, a: &Nat) -> Nat {
-        mont_sqr(a, &self.m, self.n0inv)
+        mont_sqr(a, &self.m)
     }
 
     /// `(a + b) mod m` for reduced `a, b` (identical whether the operands are
@@ -1734,9 +1615,9 @@ impl MontCtx {
     pub(crate) fn pow(&self, base: &Nat, exp: &Nat) -> Nat {
         modpow_windowed(base.clone(), self.one.clone(), exp, |a, b| {
             if core::ptr::eq(a, b) {
-                mont_sqr(a, &self.m, self.n0inv)
+                mont_sqr(a, &self.m)
             } else {
-                mont_mul(a, b, &self.m, self.n0inv)
+                mont_mul(a, b, &self.m)
             }
         })
     }
@@ -1750,7 +1631,7 @@ impl MontCtx {
     /// (`a⁻¹R⁻¹ · R³ · R⁻¹ = a⁻¹R`), avoiding a separate convert-out/convert-in.
     pub(crate) fn inv(&self, u: &Nat) -> Option<Nat> {
         let inv = Int::from(u.clone()).modinv(&Int::from(self.modulus.clone()))?;
-        Some(mont_mul(&inv.magnitude(), &self.r3, &self.m, self.n0inv))
+        Some(mont_mul(&inv.magnitude(), &self.r3, &self.m))
     }
 }
 
@@ -4446,31 +4327,90 @@ impl Nat {
         })
     }
 
-    /// Montgomery-reduction modpow for an odd `modulus > 1`.
+    /// Montgomery-reduction modpow for an odd `modulus > 1`: left-to-right
+    /// sliding-window exponentiation (HAC Algorithm 14.85) over fixed-length
+    /// limb buffers, with a precomputed table of odd powers and no allocation
+    /// per step.
     fn modpow_montgomery(&self, exp: &Nat, modulus: &Nat) -> Nat {
-        let k = modulus.limbs.len();
-        let m = modulus.limbs.as_slice(); // exactly k words, top non-zero, odd
-        let n0inv = inv_mod_2_64(m[0]).wrapping_neg(); // −m⁻¹ mod 2^64
+        let bits = exp.bit_len() as usize;
+        if bits == 0 {
+            return Nat::one(); // modulus > 1
+        }
+        let n = modulus.limbs.len();
+        let m = modulus.limbs.as_slice(); // exactly n words, top non-zero, odd
+        let mut ws = crate::mont::Mont::new(m);
 
-        // R = 2^(64k); R² mod m converts a residue into Montgomery form via one
-        // Montgomery multiply. `1` in Montgomery form is R mod m = mont_mul(1, R²).
-        let r = Nat::one().shl(k as u64 * LIMB_BITS as u64);
-        let r2 = r.mul(&r).div_rem(modulus).expect("non-zero").1;
+        // R = 2^(64n); R² mod m converts a residue into Montgomery form via one
+        // Montgomery multiply.
+        let r = Nat::one().shl(n as u64 * LIMB_BITS as u64);
+        let r2 = padded(&r.square().div_rem(modulus).expect("non-zero").1, n);
+        let base = if self.cmp_ref(modulus) == Ordering::Less {
+            padded(self, n)
+        } else {
+            padded(&self.div_rem(modulus).expect("non-zero").1, n)
+        };
+        let mut g = alloc::vec![0 as Limb; n];
+        ws.mul(&mut g, &base, &r2);
 
-        let base_mod = self.div_rem(modulus).expect("non-zero").1;
-        let base = mont_mul(&base_mod, &r2, m, n0inv);
-        let one_mont = mont_mul(&Nat::one(), &r2, m, n0inv);
-        // The windowed ladder squares via `mulmod(&r, &r)`; detect that aliasing
-        // and take the cheaper dedicated Montgomery squaring.
-        let result = modpow_windowed(base, one_mont, exp, |a, b| {
-            if core::ptr::eq(a, b) {
-                mont_sqr(a, m, n0inv)
-            } else {
-                mont_mul(a, b, m, n0inv)
+        // Window width minimizing table cost 2^(w−1) plus ≈ bits/(w+1)
+        // window multiplies.
+        let w = (1..=8usize)
+            .min_by_key(|&w| (1usize << (w - 1)) + bits / (w + 1))
+            .expect("non-empty range");
+        // table[i] = g^(2i+1) (Montgomery form).
+        let half = 1usize << (w - 1);
+        let mut table = alloc::vec![0 as Limb; half * n];
+        table[..n].copy_from_slice(&g);
+        if half > 1 {
+            let mut g2 = alloc::vec![0 as Limb; n];
+            ws.sqr(&mut g2, &g);
+            for i in 1..half {
+                let (done, rest) = table.split_at_mut(i * n);
+                ws.mul(&mut rest[..n], &done[(i - 1) * n..], &g2);
             }
-        });
-        // Back out of Montgomery form: value = mont_mul(result, 1).
-        mont_mul(&result, &Nat::one(), m, n0inv)
+        }
+
+        let el = &exp.limbs;
+        let bit = |i: usize| (el[i / 64] >> (i % 64)) & 1 == 1;
+        let mut acc = alloc::vec![0 as Limb; n];
+        let mut tmp = alloc::vec![0 as Limb; n];
+        let mut first = true;
+        let mut i = bits; // bits i.. are consumed
+        while i > 0 {
+            let hi = i - 1;
+            if !bit(hi) {
+                ws.sqr(&mut tmp, &acc);
+                core::mem::swap(&mut acc, &mut tmp);
+                i = hi;
+                continue;
+            }
+            // Longest window [lo, hi] of at most w bits ending in a one.
+            let mut lo = hi.saturating_sub(w - 1);
+            while !bit(lo) {
+                lo += 1;
+            }
+            let mut val = 0usize;
+            for k in (lo..=hi).rev() {
+                val = (val << 1) | bit(k) as usize;
+            }
+            let entry = &table[(val >> 1) * n..((val >> 1) + 1) * n];
+            if first {
+                acc.copy_from_slice(entry);
+                first = false;
+            } else {
+                for _ in lo..=hi {
+                    ws.sqr(&mut tmp, &acc);
+                    core::mem::swap(&mut acc, &mut tmp);
+                }
+                ws.mul(&mut tmp, &acc, entry);
+                core::mem::swap(&mut acc, &mut tmp);
+            }
+            i = lo;
+        }
+        ws.leave(&mut tmp, &acc);
+        let mut out = Nat { limbs: tmp };
+        out.normalize();
+        out
     }
 
     /// Returns the smallest prime strictly greater than `self`, found by
@@ -5467,14 +5407,15 @@ mod tests {
     }
 
     #[test]
-    fn inv_mod_2_64_is_correct() {
+    fn neg_inv_mod_2_64_is_correct() {
+        use crate::mont::neg_inv;
         let mut x = 1u64;
         for _ in 0..100_000 {
             x = x.wrapping_mul(6364136223846793005).wrapping_add(1) | 1; // odd
-            assert_eq!(x.wrapping_mul(inv_mod_2_64(x)), 1, "inverse of {x}");
+            assert_eq!(x.wrapping_mul(neg_inv(x)), u64::MAX, "inverse of {x}");
         }
-        assert_eq!(inv_mod_2_64(1), 1);
-        assert_eq!(3u64.wrapping_mul(inv_mod_2_64(3)), 1);
+        assert_eq!(neg_inv(1), u64::MAX);
+        assert_eq!(3u64.wrapping_mul(neg_inv(3)), u64::MAX);
     }
 
     #[test]

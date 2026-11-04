@@ -114,6 +114,8 @@ mod int_roots;
 #[cfg(feature = "int")]
 mod modpow_sec;
 #[cfg(feature = "int")]
+mod mont;
+#[cfg(feature = "int")]
 pub mod nat;
 #[cfg(feature = "int")]
 mod radix_converter;

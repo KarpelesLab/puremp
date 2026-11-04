@@ -4,11 +4,12 @@
 //! The sequence of operations and memory accesses depends only on the *sizes*
 //! (limb counts) of the base, exponent and modulus, never on their values:
 //!
-//! - every reduction (`x mod m`, `R mod m`, `x·R mod m`) is a bit-serial
-//!   shift-and-subtract over a fixed number of bits, with the subtraction
-//!   selected by a mask rather than a branch;
-//! - Montgomery multiplication (CIOS) runs a fixed loop and ends with a masked
-//!   conditional subtraction;
+//! - `R mod m` and `R² mod m` come from a fixed number of masked doublings
+//!   and Montgomery squarings (counts derived from the limb count), and the
+//!   base enters Montgomery form through Montgomery multiplications by `R²`;
+//! - Montgomery multiplication and squaring (separated product + REDC, see
+//!   `crate::mont`) run fixed loops and end with a masked conditional
+//!   subtraction;
 //! - the exponent is consumed in fixed `w`-bit windows over all of its limbs
 //!   (leading zero bits included), always squaring `w` times and always
 //!   multiplying by a table entry fetched by scanning the whole table with
@@ -20,17 +21,11 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::hint::black_box;
 
 use crate::int::Int;
-use crate::limb::{Limb, adc, mac, sbb};
+use crate::limb::{Limb, adc, sbb};
+use crate::mont::{self, mask_from_bit};
 use crate::nat::Nat;
-
-/// All-ones when `bit == 1`, zero when `bit == 0` (`bit` must be 0 or 1).
-#[inline(always)]
-fn mask_from_bit(bit: Limb) -> Limb {
-    black_box(bit).wrapping_neg()
-}
 
 /// All-ones when `a == b`, zero otherwise, without a data-dependent branch.
 #[inline(always)]
@@ -40,124 +35,190 @@ fn mask_eq(a: Limb, b: Limb) -> Limb {
     mask_from_bit(((x | x.wrapping_neg()) >> 63) ^ 1)
 }
 
-/// `−m⁻¹ mod 2^64` for odd `m0` (fixed Newton iteration count).
-fn neg_inv_mod_2_64(m0: Limb) -> Limb {
-    let mut y = m0.wrapping_mul(3) ^ 2;
-    for _ in 0..4 {
-        y = y.wrapping_mul(2u64.wrapping_sub(m0.wrapping_mul(y)));
-    }
-    y.wrapping_neg()
+/// Constant-flow Montgomery arithmetic modulo an odd `m` (`n = m.len()` limbs,
+/// non-zero top limb).
+struct Ctx<'a> {
+    m: &'a [Limb],
+    mont: mont::Mont<'a>,
+    /// `R mod m`, the Montgomery form of 1 (`R = 2^(64n)`).
+    one: Vec<Limb>,
+    /// `R² mod m`, converts into Montgomery form.
+    r2: Vec<Limb>,
 }
 
-/// `x mod m` (`m` odd, `n = m.len()` limbs, top limb may be anything non-zero
-/// overall) by bit-serial shift-and-subtract over all `64·x.len()` bits.
-/// Returns `n` limbs.
-fn ct_mod(x: &[Limb], m: &[Limb]) -> Vec<Limb> {
-    let n = m.len();
-    // r < 2m < 2^(64n+1): one extra limb.
-    let mut r = vec![0 as Limb; n + 1];
-    let mut d = vec![0 as Limb; n + 1];
-    for i in (0..x.len() * 64).rev() {
-        let bit = (x[i / 64] >> (i % 64)) & 1;
-        // r = 2r + bit.
-        let mut carry = bit;
-        for l in r.iter_mut() {
+impl<'a> Ctx<'a> {
+    fn new(m: &'a [Limb]) -> Ctx<'a> {
+        let n = m.len();
+        debug_assert!(n > 0 && m[0] & 1 == 1);
+        let mut ctx = Ctx {
+            m,
+            mont: mont::Mont::new(m),
+            one: vec![0; n],
+            r2: vec![0; n],
+        };
+        // R mod m: start from 2^(64(n−1)) ≤ m, reduce once, then double 64
+        // times (each doubling reduced by one masked subtraction).
+        let mut x = vec![0 as Limb; n];
+        let mut d = vec![0 as Limb; n];
+        x[n - 1] = 1;
+        mont::final_sub(&mut d, &x, 0, m);
+        x.copy_from_slice(&d);
+        for _ in 0..64 {
+            ctx.double(&mut x, &mut d);
+        }
+        ctx.one.copy_from_slice(&x);
+        // R² mod m is the Montgomery form of 2^(64n) = 2^(k·2^j) with k odd:
+        // k doublings of R mod m give the Montgomery form of 2^k, and j
+        // Montgomery squarings raise it to 2^(k·2^j). Both counts depend on
+        // `n` only.
+        let bits = 64 * n;
+        let j = bits.trailing_zeros();
+        let k = bits >> j;
+        for _ in 0..k {
+            ctx.double(&mut x, &mut d);
+        }
+        for _ in 0..j {
+            ctx.sqr(&mut d, &x);
+            x.copy_from_slice(&d);
+        }
+        ctx.r2.copy_from_slice(&x);
+        ctx
+    }
+
+    /// `x = 2x mod m` for `x < m`; `d` is `n` limbs of scratch.
+    fn double(&self, x: &mut [Limb], d: &mut [Limb]) {
+        let mut carry = 0;
+        for l in x.iter_mut() {
             let next = *l >> 63;
             *l = (*l << 1) | carry;
             carry = next;
         }
-        // d = r − m; keep it iff no borrow.
-        let mut borrow = 0;
-        for j in 0..=n {
-            let mj = if j < n { m[j] } else { 0 };
-            let (v, b) = sbb(r[j], mj, borrow);
-            d[j] = v;
-            borrow = b;
-        }
-        let keep = mask_from_bit(borrow ^ 1);
-        for (rl, &dl) in r.iter_mut().zip(&d) {
-            *rl = (dl & keep) | (*rl & !keep);
-        }
+        mont::final_sub(d, x, carry, self.m);
+        x.copy_from_slice(d);
     }
-    r.truncate(n);
-    r
+
+    /// `out = a·b·R⁻¹ mod m` (`a·b < m·R`).
+    #[inline]
+    fn mul(&mut self, out: &mut [Limb], a: &[Limb], b: &[Limb]) {
+        self.mont.mul(out, a, b);
+    }
+
+    /// `out = a²·R⁻¹ mod m` (`a < m`).
+    #[inline]
+    fn sqr(&mut self, out: &mut [Limb], a: &[Limb]) {
+        self.mont.sqr(out, a);
+    }
+
+    /// Montgomery form `x·R mod m` of an arbitrary-length `x`, processed in
+    /// `n`-limb chunks from the top (Horner in the Montgomery domain: each
+    /// step multiplies the running value by `R` and adds the next chunk).
+    fn enter(&mut self, x: &[Limb]) -> Vec<Limb> {
+        let n = self.m.len();
+        let chunks = x.len().div_ceil(n).max(1);
+        let r2 = self.r2.clone();
+        let mut acc = vec![0 as Limb; n];
+        let mut chunk = vec![0 as Limb; n];
+        let mut cm = vec![0 as Limb; n];
+        let mut tmp = vec![0 as Limb; n];
+        for c in (0..chunks).rev() {
+            let lo = (c * n).min(x.len());
+            let hi = ((c + 1) * n).min(x.len());
+            chunk.fill(0);
+            chunk[..hi - lo].copy_from_slice(&x[lo..hi]);
+            // chunk < R and r2 < m, so the product is < m·R.
+            self.mul(&mut cm, &chunk, &r2);
+            if c + 1 < chunks {
+                tmp.copy_from_slice(&acc);
+                self.mul(&mut acc, &tmp, &r2);
+            }
+            // acc + cm < 2m.
+            let mut carry = 0;
+            for (t, (&a, &b)) in tmp.iter_mut().zip(acc.iter().zip(&cm)) {
+                let (s, c) = adc(a, b, carry);
+                *t = s;
+                carry = c;
+            }
+            mont::final_sub(&mut acc, &tmp, carry, self.m);
+        }
+        acc
+    }
+
+    /// Leaves Montgomery form: `x·R⁻¹ mod m`.
+    fn leave(&mut self, x: &[Limb]) -> Vec<Limb> {
+        let mut out = vec![0 as Limb; self.m.len()];
+        self.mont.leave(&mut out, x);
+        out
+    }
 }
 
-/// Montgomery product `a·b·R⁻¹ mod m` (`R = 2^(64n)`), CIOS, with `a, b < m`;
-/// writes `n` limbs to `out`. `t` is `n + 2` limbs of scratch.
-fn mont_mul(out: &mut [Limb], a: &[Limb], b: &[Limb], m: &[Limb], minv: Limb, t: &mut [Limb]) {
-    let n = m.len();
-    t.fill(0);
-    for &bi in b.iter().take(n) {
-        let mut carry = 0;
-        for j in 0..n {
-            let (lo, hi) = mac(t[j], a[j], bi, carry);
-            t[j] = lo;
-            carry = hi;
-        }
-        let (s, c) = adc(t[n], carry, 0);
-        t[n] = s;
-        t[n + 1] = c;
-        let q = t[0].wrapping_mul(minv);
-        let (_, mut carry) = mac(t[0], m[0], q, 0);
-        for j in 1..n {
-            let (lo, hi) = mac(t[j], m[j], q, carry);
-            t[j - 1] = lo;
-            carry = hi;
-        }
-        let (s, c) = adc(t[n], carry, 0);
-        t[n - 1] = s;
-        t[n] = t[n + 1] + c;
-    }
-    // T = t[n]·R + t[..n] < 2m; subtract m when T ≥ m.
-    let mut borrow = 0;
-    for j in 0..n {
-        let (v, b) = sbb(t[j], m[j], borrow);
-        out[j] = v;
-        borrow = b;
-    }
-    let take_diff = mask_from_bit((t[n] | (borrow ^ 1)) & 1);
-    for j in 0..n {
-        out[j] = (out[j] & take_diff) | (t[j] & !take_diff);
+/// Window width for an exponent of `bits` bits (derived from its limb count).
+fn window_bits(bits: usize) -> usize {
+    match bits {
+        0..=512 => 4,
+        513..=1024 => 5,
+        _ => 6,
     }
 }
 
-/// `base^exp mod m` in constant time with respect to the values (see the
-/// module docs). `m` must be odd with a non-zero top limb; `base` and `exp`
-/// are little-endian limbs of any length. Returns `n` limbs (not normalized).
-fn modpow_sec_limbs(base: &[Limb], exp: &[Limb], m: &[Limb]) -> Vec<Limb> {
-    let n = m.len();
-    debug_assert!(n > 0 && m[0] & 1 == 1);
-    let minv = neg_inv_mod_2_64(m[0]);
+/// Constant-time table lookup: `sel = Σᵢ table[i]·[masks[i] = all-ones]`
+/// over all `masks.len()` entries of `sel.len()` limbs each. Every entry is
+/// read; limbs are gathered four at a time so the partial results stay in
+/// registers across the scan.
+fn ct_select(sel: &mut [Limb], table: &[Limb], masks: &[Limb]) {
+    let n = sel.len();
+    debug_assert_eq!(table.len(), n * masks.len());
+    let mut j = 0;
+    while j + 4 <= n {
+        let mut s = [0 as Limb; 4];
+        for (entry, &mk) in table.chunks_exact(n).zip(masks) {
+            let e = &entry[j..j + 4];
+            for k in 0..4 {
+                s[k] |= e[k] & mk;
+            }
+        }
+        sel[j..j + 4].copy_from_slice(&s);
+        j += 4;
+    }
+    for (jj, out) in sel.iter_mut().enumerate().skip(j) {
+        let mut s = 0;
+        for (entry, &mk) in table.chunks_exact(n).zip(masks) {
+            s |= entry[jj] & mk;
+        }
+        *out = s;
+    }
+}
 
-    // one = R mod m; b = base·R mod m (both via the constant-time reduction).
-    let mut r_limbs = vec![0 as Limb; n + 1];
-    r_limbs[n] = 1;
-    let one = ct_mod(&r_limbs, m);
-    let mut shifted = vec![0 as Limb; n + base.len()];
-    shifted[n..].copy_from_slice(base);
-    let b = ct_mod(&shifted, m);
-
-    // Window width and table of b^i (Montgomery form), i in 0..2^w.
+/// `b^exp` in Montgomery form, for `b` already in Montgomery form, in
+/// constant time with respect to the values (see the module docs).
+fn pow_mont(ctx: &mut Ctx<'_>, b: &[Limb], exp: &[Limb]) -> Vec<Limb> {
+    let n = ctx.m.len();
     let bits = exp.len() * 64;
-    let w = if bits > 256 { 5 } else { 4 };
+    if bits == 0 {
+        return ctx.one.clone();
+    }
+    let w = window_bits(bits);
     let size = 1usize << w;
-    let mut t = vec![0 as Limb; n + 2];
+    // Table of b^i (Montgomery form), i in 0..2^w: even entries by squaring.
     let mut table = vec![0 as Limb; size * n];
-    table[..n].copy_from_slice(&one);
-    table[n..2 * n].copy_from_slice(&b);
+    table[..n].copy_from_slice(&ctx.one);
+    table[n..2 * n].copy_from_slice(b);
     for i in 2..size {
         let (done, rest) = table.split_at_mut(i * n);
-        mont_mul(&mut rest[..n], &done[(i - 1) * n..], &b, m, minv, &mut t);
+        if i % 2 == 0 {
+            ctx.sqr(&mut rest[..n], &done[(i / 2) * n..(i / 2 + 1) * n]);
+        } else {
+            ctx.mul(&mut rest[..n], &done[(i - 1) * n..], b);
+        }
     }
 
-    let mut acc = one.clone();
+    let mut acc = vec![0 as Limb; n];
     let mut tmp = vec![0 as Limb; n];
     let mut sel = vec![0 as Limb; n];
+    let mut masks = vec![0 as Limb; size];
     // Windows from the top; the first one takes the leftover high bits.
     let mut pos = bits;
-    let first = if bits.is_multiple_of(w) { w } else { bits % w };
-    let mut width = first;
+    let mut width = if bits.is_multiple_of(w) { w } else { bits % w };
+    let mut first = true;
     while pos > 0 {
         let lo = pos - width;
         // Window value: `width` bits of exp starting at `lo` (fixed shifts).
@@ -165,30 +226,37 @@ fn modpow_sec_limbs(base: &[Limb], exp: &[Limb], m: &[Limb]) -> Vec<Limb> {
         for k in (lo..pos).rev() {
             idx = (idx << 1) | ((exp[k / 64] >> (k % 64)) & 1);
         }
-        for _ in 0..width {
-            tmp.copy_from_slice(&acc);
-            mont_mul(&mut acc, &tmp, &tmp, m, minv, &mut t);
+        for (i, mk) in masks.iter_mut().enumerate() {
+            *mk = mask_eq(i as Limb, idx);
         }
-        // Constant-time table lookup.
-        sel.fill(0);
-        for i in 0..size {
-            let mask = mask_eq(i as Limb, idx);
-            for (s, &e) in sel.iter_mut().zip(&table[i * n..(i + 1) * n]) {
-                *s |= e & mask;
+        ct_select(&mut sel, &table, &masks);
+        if first {
+            // The accumulator starts at 1, so the first window needs neither
+            // squarings nor a multiply (a fixed, size-derived shortcut).
+            acc.copy_from_slice(&sel);
+            first = false;
+        } else {
+            for _ in 0..width {
+                ctx.sqr(&mut tmp, &acc);
+                core::mem::swap(&mut acc, &mut tmp);
             }
+            ctx.mul(&mut tmp, &acc, &sel);
+            core::mem::swap(&mut acc, &mut tmp);
         }
-        tmp.copy_from_slice(&acc);
-        mont_mul(&mut acc, &tmp, &sel, m, minv, &mut t);
         pos = lo;
         width = w;
     }
-
-    // Leave Montgomery form: acc·1·R⁻¹.
-    let mut unit = vec![0 as Limb; n];
-    unit[0] = 1;
-    tmp.copy_from_slice(&acc);
-    mont_mul(&mut acc, &tmp, &unit, m, minv, &mut t);
     acc
+}
+
+/// `base^exp mod m` in constant time with respect to the values (see the
+/// module docs). `m` must be odd with a non-zero top limb; `base` and `exp`
+/// are little-endian limbs of any length. Returns `n` limbs (not normalized).
+fn modpow_sec_limbs(base: &[Limb], exp: &[Limb], m: &[Limb]) -> Vec<Limb> {
+    let mut ctx = Ctx::new(m);
+    let b = ctx.enter(base);
+    let acc = pow_mont(&mut ctx, &b, exp);
+    ctx.leave(&acc)
 }
 
 /// `(m − x) mod m` for `x < m`, branch-free (maps `0` to `0`).
@@ -248,18 +316,17 @@ impl Int {
         let m = modulus.magnitude_ref();
         assert!(!m.is_even(), "modpow_sec: modulus must be odd");
         let m = m.as_limbs();
-        let reduced = ct_mod(self.magnitude_ref().as_limbs(), m);
-        let neg = ct_neg_mod(&reduced, m);
+        let mut ctx = Ctx::new(m);
+        // ±|self| in Montgomery form (negation is linear, so it commutes).
+        let pos = ctx.enter(self.magnitude_ref().as_limbs());
+        let neg = ct_neg_mod(&pos, m);
         let mask = mask_from_bit(self.is_negative() as Limb);
-        let base: Vec<Limb> = reduced
+        let base: Vec<Limb> = pos
             .iter()
             .zip(&neg)
             .map(|(&p, &q)| (q & mask) | (p & !mask))
             .collect();
-        Int::from(Nat::from_limb_vec(modpow_sec_limbs(
-            &base,
-            exp.magnitude_ref().as_limbs(),
-            m,
-        )))
+        let acc = pow_mont(&mut ctx, &base, exp.magnitude_ref().as_limbs());
+        Int::from(Nat::from_limb_vec(ctx.leave(&acc)))
     }
 }

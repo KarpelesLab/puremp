@@ -33,6 +33,12 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ### Performance
 
+- *(nat)* `Nat::modpow` (odd moduli) and `Nat::modpow_sec`/`Int::modpow_sec`
+  use new Montgomery kernels (finely integrated product scanning, constant
+  flow, no per-step allocation); `modpow` also switches to sliding windows and
+  `modpow_sec` gets its `R² mod m` and base conversion from Montgomery
+  operations instead of bit-serial reductions: `modpow` 1.3–1.35× faster at
+  512–4096 bits, `modpow_sec` 1.6× at 512 bits and 1.7–2.2× at 2048–4096 bits
 - *(nat)* `Nat::isqrt` is 2.1–3.8× faster up to ~12k bits: an `f64`-seeded
   single-step `u128` base case, and an allocation-free Karatsuba square root
   on limb slices (one shared scratch buffer) below 96-limb roots

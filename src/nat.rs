@@ -807,7 +807,7 @@ fn div_short_quotient(a: &Nat, d: &Nat, f: usize) -> (Nat, Nat) {
 
 /// A divisor prepared for repeated Newton-reciprocal division: normalized
 /// (top bit set) with its approximate reciprocal `v ≈ β^(2n)/d`.
-struct PreInv {
+pub(crate) struct PreInv {
     d: Nat,
     shift: u64,
     v: Nat,
@@ -815,7 +815,7 @@ struct PreInv {
 
 impl PreInv {
     /// Prepares `b` (≥ 3 limbs).
-    fn new(b: &Nat) -> PreInv {
+    pub(crate) fn new(b: &Nat) -> PreInv {
         let n = b.limbs.len();
         debug_assert!(n >= 3);
         let shift = b.limbs[n - 1].leading_zeros() as u64;
@@ -825,7 +825,7 @@ impl PreInv {
     }
 
     /// `a divmod b` for any `a`.
-    fn div_rem(&self, a: &Nat) -> (Nat, Nat) {
+    pub(crate) fn div_rem(&self, a: &Nat) -> (Nat, Nat) {
         let d = &self.d;
         let n = d.limbs.len();
         if a.limbs.len() < n {
@@ -1278,9 +1278,28 @@ fn isqrt_u128(v: u128) -> u128 {
     x
 }
 
-/// `⌊√v⌋` for a `u64`, from the hardware `f64` square root plus an exact fix-up.
+/// `⌊√v⌋` for a `u64`: the hardware `f64` square root (with `std`) or an
+/// integer Newton iteration (bare `no_std`, where `core` has no `sqrt`), plus
+/// an exact fix-up.
 fn isqrt_u64(v: u64) -> u64 {
+    #[cfg(feature = "std")]
     let mut x = (v as f64).sqrt() as u64; // within ±1 of the true root
+    #[cfg(not(feature = "std"))]
+    let mut x = {
+        if v == 0 {
+            return 0;
+        }
+        // Newton from above (2^⌈bits/2⌉ ≥ √v) descends to ⌊√v⌋.
+        let bits = 64 - v.leading_zeros();
+        let mut x = 1u64 << bits.div_ceil(2);
+        loop {
+            let y = (x + v / x) / 2;
+            if y >= x {
+                break x;
+            }
+            x = y;
+        }
+    };
     while x.checked_mul(x).is_none_or(|sq| sq > v) {
         x -= 1;
     }
@@ -4071,7 +4090,7 @@ impl Nat {
                 }
                 powers.push(sq);
             }
-            to_radix_recursive(self, &powers, radix, 0, out);
+            to_radix_recursive(self, &powers, &[], radix, 0, out);
         }
     }
 }
@@ -4079,7 +4098,14 @@ impl Nat {
 /// Recursive base-`radix` conversion sharing a precomputed power ladder
 /// (`powers[k] == radix^(2^k)`, ascending): appends the digits of `v` to `out`,
 /// left-padded with zeros to at least `width` digits (`0` = minimal).
-fn to_radix_recursive(v: &Nat, powers: &[Nat], radix: u32, width: usize, out: &mut Vec<u8>) {
+pub(crate) fn to_radix_recursive(
+    v: &Nat,
+    powers: &[Nat],
+    inverses: &[Option<PreInv>],
+    radix: u32,
+    width: usize,
+    out: &mut Vec<u8>,
+) {
     if v.limbs.len() <= RADIX_RECURSION_LIMBS {
         simple_radix_string(&v.limbs, radix, width, out);
         return;
@@ -4090,16 +4116,19 @@ fn to_radix_recursive(v: &Nat, powers: &[Nat], radix: u32, width: usize, out: &m
         .rposition(|p| p.cmp_ref(v) != Ordering::Greater)
         .expect("v is large, so radix <= v");
     let len = 1usize << k;
-    let (q, r) = v.div_rem(&powers[k]).expect("p is non-zero");
+    let (q, r) = match inverses.get(k) {
+        Some(Some(inv)) => inv.div_rem(v),
+        _ => v.div_rem(&powers[k]).expect("p is non-zero"),
+    };
     // The high part fills whatever the padding leaves above the low `len`
     // digits; the low part is zero-padded to exactly `len`.
-    to_radix_recursive(&q, powers, radix, width.saturating_sub(len), out);
-    to_radix_recursive(&r, powers, radix, len, out);
+    to_radix_recursive(&q, powers, inverses, radix, width.saturating_sub(len), out);
+    to_radix_recursive(&r, powers, inverses, radix, len, out);
 }
 
 /// Number of limbs at or below which radix conversion uses the simple
 /// single-limb-division loop rather than recursing.
-const RADIX_RECURSION_LIMBS: usize = 16;
+pub(crate) const RADIX_RECURSION_LIMBS: usize = 16;
 
 /// Appends the base-`radix` digits of the little-endian `limbs` (at most
 /// [`RADIX_RECURSION_LIMBS`]) to `out`, left-padded with zeros to at least
@@ -4110,7 +4139,7 @@ const RADIX_RECURSION_LIMBS: usize = 16;
 /// `radix^chunk` (the largest power fitting a `u64`) with a precomputed
 /// reciprocal, peeling a whole limb's worth of digits that are then split out
 /// with machine-word arithmetic.
-fn simple_radix_string(limbs: &[Limb], radix: u32, width: usize, out: &mut Vec<u8>) {
+pub(crate) fn simple_radix_string(limbs: &[Limb], radix: u32, width: usize, out: &mut Vec<u8>) {
     debug_assert!(limbs.len() <= RADIX_RECURSION_LIMBS);
     // Largest `chunk` with `radix^chunk` fitting a u64, and that power itself.
     let (chunk, base) = {
@@ -4288,39 +4317,46 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
 
 /// [`parse_radix`] on ASCII bytes.
 pub(crate) fn parse_radix_bytes(bytes: &[u8], radix: u32) -> Result<Nat> {
+    let (level, base) = pack_radix_chunks(bytes, radix)?;
+    Ok(match level.as_slice() {
+        [single] => Nat::from_u64(*single),
+        _ => nat_from_base_chunks(&level, base),
+    })
+}
+
+/// `(chunk, B)`: the largest `chunk` with `B = radix^chunk` fitting a `u64`.
+pub(crate) fn radix_chunk(radix: u32) -> (usize, u64) {
+    let (mut d, mut p) = (0usize, 1u64);
+    while let Some(next) = p.checked_mul(radix as u64) {
+        p = next;
+        d += 1;
+    }
+    (d, p)
+}
+
+/// Validates ASCII digits in `radix` (2–62) and packs them into base-`B`
+/// chunks, least significant first; returns the chunks and `B`.
+pub(crate) fn pack_radix_chunks(bytes: &[u8], radix: u32) -> Result<(Vec<Limb>, u64)> {
     if !(2..=62).contains(&radix) || bytes.is_empty() {
         return Err(Error::Parse);
     }
-    // Largest `d` with `radix^d` fitting a `u64`, and that base `B = radix^d`.
-    let (chunk, base) = {
-        let (mut d, mut p) = (0u32, 1u64);
-        while let Some(next) = p.checked_mul(radix as u64) {
-            p = next;
-            d += 1;
-        }
-        (d as usize, p)
-    };
-
-    // Validate and pack `chunk` digits at a time into base-`B` limbs in one
-    // pass, least-significant first (`rchunks` walks from the end). Digits are
-    // ASCII, so any byte of a multi-byte character is rejected.
+    let (chunk, base) = radix_chunk(radix);
+    // Validate and pack `chunk` digits at a time in one pass (`rchunks` walks
+    // from the end). Digits are ASCII, so any byte of a multi-byte character
+    // is rejected.
     let pack = |digits: &[u8]| -> Result<u64> {
         digits.iter().try_fold(0u64, |val, &b| {
             let dg = digit_value(b as char, radix).ok_or(Error::Parse)?;
             Ok(val * radix as u64 + dg as u64)
         })
     };
-    // Fast path for small inputs: a single base-`B` limb.
-    if bytes.len() <= chunk {
-        return Ok(Nat::from_u64(pack(bytes)?));
-    }
     let level: Vec<Limb> = bytes.rchunks(chunk).map(pack).collect::<Result<_>>()?;
-    Ok(nat_from_base_chunks(&level, base))
+    Ok((level, base))
 }
 
 /// Number of base-`B` chunks at or below which [`nat_from_base_chunks`] uses
 /// in-place Horner evaluation rather than recursing.
-const PARSE_RECURSION_CHUNKS: usize = 512;
+pub(crate) const PARSE_RECURSION_CHUNKS: usize = 512;
 
 /// Evaluates `Σ chunks[i]·B^i` (`chunks` least-significant first, each
 /// `< B`). Short inputs use Horner's rule in place on one limb buffer (one
@@ -4328,7 +4364,7 @@ const PARSE_RECURSION_CHUNKS: usize = 512;
 /// `2^k` chunks and the rest, `high·B^(2^k) + low`, sharing a ladder of
 /// `B^(2^k)` powers, which is `O(M(n)·log n)` with sub-quadratic
 /// multiplication.
-fn nat_from_base_chunks(chunks: &[Limb], base: Limb) -> Nat {
+pub(crate) fn nat_from_base_chunks(chunks: &[Limb], base: Limb) -> Nat {
     if chunks.len() <= PARSE_RECURSION_CHUNKS {
         return horner_base_chunks(chunks, base);
     }
@@ -4342,7 +4378,7 @@ fn nat_from_base_chunks(chunks: &[Limb], base: Limb) -> Nat {
 }
 
 /// Recursive step of [`nat_from_base_chunks`] (`powers[k] == B^(2^k)`).
-fn chunks_recursive(chunks: &[Limb], powers: &[Nat], base: Limb) -> Nat {
+pub(crate) fn chunks_recursive(chunks: &[Limb], powers: &[Nat], base: Limb) -> Nat {
     if chunks.len() <= PARSE_RECURSION_CHUNKS {
         return horner_base_chunks(chunks, base);
     }
@@ -4355,7 +4391,7 @@ fn chunks_recursive(chunks: &[Limb], powers: &[Nat], base: Limb) -> Nat {
 }
 
 /// Horner evaluation of `Σ chunks[i]·B^i` in one growing limb buffer.
-fn horner_base_chunks(chunks: &[Limb], base: Limb) -> Nat {
+pub(crate) fn horner_base_chunks(chunks: &[Limb], base: Limb) -> Nat {
     let mut acc: Vec<Limb> = Vec::with_capacity(chunks.len() + 1);
     for &c in chunks.iter().rev() {
         // acc = acc·B + c.

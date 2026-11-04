@@ -45,7 +45,7 @@ fn primes_up_to(n: u64) -> Vec<u64> {
 /// Whether `m` is an exact `k`th power, for `k ≥ 2`.
 fn is_kth_power(m: &Nat, k: u64) -> bool {
     let k = u32::try_from(k).expect("root degree below the bit length");
-    m.nth_root_floor(k).pow(k) == *m
+    m.nth_root_floor(k).pow(u64::from(k)) == *m
 }
 
 /// `⌊m^(1/n)⌋` for `n ≥ 1`, cutting large degrees short (`m < 2^n` ⇒ the root

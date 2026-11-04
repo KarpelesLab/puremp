@@ -241,7 +241,7 @@ impl fmt::Display for Dyadic {
         // value = |numerator| / 2^k = |numerator|·5^k / 10^k; place the point k
         // digits from the right.
         let k = self.scale as u32;
-        let scaled = mag.mul(&Nat::from_u64(5).pow(k));
+        let scaled = mag.mul(&Nat::from_u64(5).pow(u64::from(k)));
         let digits = scaled.to_string();
         let k = k as usize;
         if digits.len() <= k {

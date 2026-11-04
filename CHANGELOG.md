@@ -11,8 +11,17 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 - *(int)* `Int::add_u64`/`sub_u64`/`mul_u64` and in-place
   `add_assign_u64`/`sub_assign_u64`/`mul_assign_u64`; `Int::from_limb_vec`
+- *(int)* ASCII byte-slice I/O without `&str`/`String`:
+  `Nat`/`Int::from_ascii_radix`, `to_ascii_radix`, `write_ascii_radix`
+  (appends to a `Vec<u8>`)
+- *(int)* `Nat`/`Int::pow10` and `mul_pow10`
 - *(nat)* `Nat::from_limb_vec`/`into_limbs` (no copy), `add_u64`,
   `checked_sub_u64`, `mul_u64`, and `+= &Nat`, `+= u64`, `*= &Nat`, `*= u64`
+
+### Changed
+
+- *(nat)* `Nat::pow` takes a `u64` exponent (like `Int::pow`), answering
+  bases `0`, `1` and `2^k` directly
 
 ### Performance
 

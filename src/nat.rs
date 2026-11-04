@@ -3402,7 +3402,21 @@ impl Nat {
     }
 
     /// Returns `self` raised to `exp` (`self^0 == 1`), by square-and-multiply.
-    pub fn pow(&self, exp: u32) -> Nat {
+    ///
+    /// Bases `0`, `1` and `2^k` are answered directly, so their exponent may be
+    /// any `u64` (as long as the result fits in memory).
+    pub fn pow(&self, exp: u64) -> Nat {
+        if exp == 0 {
+            return Nat::one();
+        }
+        if self.is_zero() || self.is_one() {
+            return self.clone();
+        }
+        let tz = self.trailing_zeros();
+        if tz + 1 == self.bit_len() {
+            let shift = tz.checked_mul(exp).expect("pow: result too large");
+            return Nat::one().shl(shift);
+        }
         let mut result = Nat::one();
         let mut base = self.clone();
         let mut e = exp;
@@ -3416,6 +3430,19 @@ impl Nat {
             }
         }
         result
+    }
+
+    /// Returns `10^k`, computed as `5^k · 2^k`.
+    pub fn pow10(k: u64) -> Nat {
+        Nat::from_u64(5).pow(k).shl(k)
+    }
+
+    /// Returns `self · 10^k`.
+    pub fn mul_pow10(&self, k: u64) -> Nat {
+        if self.is_zero() || k == 0 {
+            return self.clone();
+        }
+        self.mul(&Nat::from_u64(5).pow(k)).shl(k)
     }
 
     /// Returns the floor of the square root, `⌊√self⌋`.
@@ -3458,7 +3485,7 @@ impl Nat {
         let kk = Nat::from_u64(k as u64);
         let mut x = Nat::one().shl(self.bit_len().div_ceil(k as u64));
         loop {
-            let div = self.div_rem(&x.pow(k - 1)).expect("x >= 1").0;
+            let div = self.div_rem(&x.pow(u64::from(k - 1))).expect("x >= 1").0;
             let next = x.mul(&km1).add(&div).div_rem(&kk).expect("k >= 1").0;
             if next.cmp_ref(&x) != Ordering::Less {
                 break;
@@ -3466,12 +3493,12 @@ impl Nat {
             x = next;
         }
         // Exact adjustment: land on the largest x with x^k ≤ N.
-        while x.pow(k).cmp_ref(self) == Ordering::Greater {
+        while x.pow(u64::from(k)).cmp_ref(self) == Ordering::Greater {
             x = x.checked_sub(&Nat::one()).expect("root is positive");
         }
         loop {
             let up = x.add(&Nat::one());
-            if up.pow(k).cmp_ref(self) == Ordering::Greater {
+            if up.pow(u64::from(k)).cmp_ref(self) == Ordering::Greater {
                 break;
             }
             x = up;
@@ -3491,18 +3518,54 @@ impl Nat {
         out.write_str(&self.to_radix_string(radix))
     }
 
-    /// Returns the minimal (no leading zeros) base-`radix` digit string, using
+    /// Appends the base-`radix` (2–62) ASCII digits to `out` (`"0"` for zero),
+    /// without going through `String`/`fmt`. Same alphabet as
+    /// [`Nat::write_radix`].
+    pub fn write_ascii_radix(&self, out: &mut Vec<u8>, radix: u32) {
+        assert!((2..=62).contains(&radix), "radix must be in 2..=62");
+        if self.is_zero() {
+            out.push(b'0');
+        } else {
+            self.append_radix_digits(radix, out);
+        }
+    }
+
+    /// Returns the base-`radix` (2–62) ASCII digits (`"0"` for zero). Same
+    /// alphabet as [`Nat::write_radix`].
+    pub fn to_ascii_radix(&self, radix: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_ascii_radix(&mut out, radix);
+        out
+    }
+
+    /// Parses ASCII digits in the given `radix` (2–62) from a byte slice,
+    /// without going through `&str`. Same alphabet as [`Nat::write_radix`]
+    /// (letters case-insensitive up to radix 36); no sign, whitespace or
+    /// separators, and an empty slice is an error.
+    pub fn from_ascii_radix(digits: &[u8], radix: u32) -> Result<Nat> {
+        parse_radix_bytes(digits, radix)
+    }
+
+    /// Returns the minimal (no leading zeros) base-`radix` digit string; see
+    /// [`Nat::append_radix_digits`].
+    fn to_radix_string(&self, radix: u32) -> String {
+        let mut out = Vec::new();
+        self.append_radix_digits(radix, &mut out);
+        String::from_utf8(out).unwrap_or_default()
+    }
+
+    /// Appends the minimal (no leading zeros) base-`radix` digits, using
     /// divide-and-conquer: split off a divisor `radix^len ≈ √self`, recurse on
     /// the quotient and remainder, and zero-pad the remainder to `len` digits.
     /// With sub-quadratic multiplication/division this is `O(M(n)·log n)`.
     /// Every level appends straight into one output buffer.
-    fn to_radix_string(&self, radix: u32) -> String {
+    fn append_radix_digits(&self, radix: u32, out: &mut Vec<u8>) {
         // ~1 digit per log2(radix) bits; a cheap estimate is enough for the
         // initial capacity (19.3 decimal digits per limb).
-        let mut out = Vec::with_capacity(self.limbs.len() * 20 + 1);
+        out.reserve(self.limbs.len() * 20 + 1);
         // Base case: a few limbs go straight through single-limb division.
         if self.limbs.len() <= RADIX_RECURSION_LIMBS {
-            simple_radix_string(&self.limbs, radix, 0, &mut out);
+            simple_radix_string(&self.limbs, radix, 0, out);
         } else {
             // Build the ladder `[radix^1, radix^2, radix^4, …]` once (largest
             // entry ≤ self), then share it across the whole recursion instead
@@ -3522,9 +3585,8 @@ impl Nat {
                 }
                 powers.push(sq);
             }
-            to_radix_recursive(self, &powers, radix, 0, &mut out);
+            to_radix_recursive(self, &powers, radix, 0, out);
         }
-        String::from_utf8(out).unwrap_or_default()
     }
 }
 
@@ -3735,7 +3797,12 @@ fn digit_value(c: char, radix: u32) -> Option<u32> {
 /// Parses an unsigned integer in the given `radix` (2–62); see
 /// [`Nat::write_radix`] for the digit alphabet.
 pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
-    if !(2..=62).contains(&radix) || s.is_empty() {
+    parse_radix_bytes(s.as_bytes(), radix)
+}
+
+/// [`parse_radix`] on ASCII bytes.
+pub(crate) fn parse_radix_bytes(bytes: &[u8], radix: u32) -> Result<Nat> {
+    if !(2..=62).contains(&radix) || bytes.is_empty() {
         return Err(Error::Parse);
     }
     // Largest `d` with `radix^d` fitting a `u64`, and that base `B = radix^d`.
@@ -3757,7 +3824,6 @@ pub(crate) fn parse_radix(s: &str, radix: u32) -> Result<Nat> {
             Ok(val * radix as u64 + dg as u64)
         })
     };
-    let bytes = s.as_bytes();
     // Fast path for small inputs: a single base-`B` limb.
     if bytes.len() <= chunk {
         return Ok(Nat::from_u64(pack(bytes)?));
@@ -4644,13 +4710,13 @@ mod tests {
         let check = |n: &Nat, k: u32| {
             let x = n.nth_root_floor(k);
             assert!(
-                x.pow(k).cmp_ref(n) != Ordering::Greater,
+                x.pow(u64::from(k)).cmp_ref(n) != Ordering::Greater,
                 "x^k > N (n bits={}, k={})",
                 n.bit_len(),
                 k
             );
             assert!(
-                x.add(&Nat::one()).pow(k).cmp_ref(n) == Ordering::Greater,
+                x.add(&Nat::one()).pow(u64::from(k)).cmp_ref(n) == Ordering::Greater,
                 "(x+1)^k <= N (n bits={}, k={})",
                 n.bit_len(),
                 k
@@ -4666,7 +4732,7 @@ mod tests {
         // Perfect powers and one below: m^k → m, m^k − 1 → m − 1.
         for m in 2u64..200 {
             for k in 3u32..=8 {
-                let mk = Nat::from_u64(m).pow(k);
+                let mk = Nat::from_u64(m).pow(u64::from(k));
                 assert_eq!(mk.nth_root_floor(k), Nat::from_u64(m));
                 assert_eq!(
                     mk.checked_sub(&Nat::one()).unwrap().nth_root_floor(k),
@@ -6733,7 +6799,7 @@ mod tests {
         }
         // Powers of the radix (and their neighbours) stress the zero padding.
         for k in [19u32, 38, 190, 400, 1000] {
-            let p = Nat::from_u64(10).pow(k);
+            let p = Nat::from_u64(10).pow(u64::from(k));
             for x in [
                 p.checked_sub(&Nat::one()).unwrap(),
                 p.clone(),
@@ -6784,7 +6850,7 @@ mod tests {
             c
         }
         for d in [40u32, 44, 48, 52, 56] {
-            let base = Nat::from_u64(10).pow(d / 2);
+            let base = Nat::from_u64(10).pow(u64::from(d / 2));
             for seed in 0..2u64 {
                 let p = prime_from(&base, seed * 2 + 1);
                 let q = prime_from(&base, seed * 1000 + 54321);

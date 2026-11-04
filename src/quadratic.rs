@@ -44,7 +44,7 @@ fn squarefree_part(d: &Int) -> (Int, Int) {
         if e % 2 == 1 {
             sf = sf.mul(&p);
         }
-        ext = ext.mul(&p.pow(e / 2));
+        ext = ext.mul(&p.pow(u64::from(e / 2)));
     }
     let sf = if neg {
         Int::from(sf).neg()

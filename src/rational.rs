@@ -603,7 +603,7 @@ impl FromStr for Rational {
             } else {
                 Nat::from_str(&digits)?
             };
-            let den = Nat::from_u64(10).pow(fp.len() as u32);
+            let den = Nat::from_u64(10).pow(fp.len() as u64);
             return Ok(Rational::normalize(
                 Int::from_sign_magnitude(sign, mag),
                 Int::from(den),

@@ -516,6 +516,16 @@ impl Int {
         result
     }
 
+    /// Returns `10^k`.
+    pub fn pow10(k: u64) -> Int {
+        Int::from(Nat::pow10(k))
+    }
+
+    /// Returns `self · 10^k`.
+    pub fn mul_pow10(&self, k: u64) -> Int {
+        Int::from_sign_magnitude(self.sign(), self.magnitude_ref().mul_pow10(k))
+    }
+
     /// Fused multiply-add: `self += a · b`.
     pub fn addmul(&mut self, a: &Int, b: &Int) {
         if let (
@@ -974,7 +984,7 @@ impl Int {
         }
         let m = self.magnitude();
         let r = m.nth_root_floor(n);
-        (r.pow(n) == m)
+        (r.pow(u64::from(n)) == m)
             .then(|| Int::from_sign_magnitude(if neg { Sign::Negative } else { Sign::Positive }, r))
     }
 
@@ -1658,7 +1668,37 @@ impl Int {
         if self.is_negative() {
             out.write_str("-")?;
         }
-        self.magnitude().write_radix(out, radix)
+        self.magnitude_ref().write_radix(out, radix)
+    }
+
+    /// Parses ASCII digits in the given `radix` (2–62) from a byte slice, with
+    /// an optional leading `+`/`-`, without going through `&str`. See
+    /// [`Nat::from_ascii_radix`].
+    pub fn from_ascii_radix(bytes: &[u8], radix: u32) -> Result<Int> {
+        let (sign, digits) = match bytes {
+            [b'-', rest @ ..] => (Sign::Negative, rest),
+            [b'+', rest @ ..] => (Sign::Positive, rest),
+            _ => (Sign::Positive, bytes),
+        };
+        let mag = crate::nat::parse_radix_bytes(digits, radix)?;
+        Ok(Int::from_sign_magnitude(sign, mag))
+    }
+
+    /// Appends `self` in the given `radix` (2–62) as ASCII to `out` (a leading
+    /// `-` when negative). See [`Nat::write_ascii_radix`].
+    pub fn write_ascii_radix(&self, out: &mut Vec<u8>, radix: u32) {
+        if self.is_negative() {
+            out.push(b'-');
+        }
+        self.magnitude_ref().write_ascii_radix(out, radix);
+    }
+
+    /// Returns `self` in the given `radix` (2–62) as ASCII bytes. See
+    /// [`Int::write_ascii_radix`].
+    pub fn to_ascii_radix(&self, radix: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_ascii_radix(&mut out, radix);
+        out
     }
 }
 

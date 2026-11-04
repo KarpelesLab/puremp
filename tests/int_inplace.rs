@@ -179,3 +179,60 @@ fn nat_owned_limbs_and_u64_ops() {
     assert_eq!(Nat::zero().checked_sub_u64(1), None);
     assert_eq!(Nat::from_u64(5).checked_sub_u64(5), Some(Nat::zero()));
 }
+
+#[test]
+fn ascii_radix_io_round_trips() {
+    let mut rng = Rng(7);
+    for _ in 0..500 {
+        let x = rng.int();
+        for radix in [2u32, 10, 16, 36, 62] {
+            let mut s = String::new();
+            x.write_radix(&mut s, radix).unwrap();
+            let bytes = x.to_ascii_radix(radix);
+            assert_eq!(bytes, s.as_bytes());
+            assert_eq!(Int::from_ascii_radix(&bytes, radix).unwrap(), x);
+            let m = x.magnitude();
+            let mb = m.to_ascii_radix(radix);
+            assert_eq!(Nat::from_ascii_radix(&mb, radix).unwrap(), m);
+            // appends after existing content
+            let mut buf = b"x=".to_vec();
+            x.write_ascii_radix(&mut buf, radix);
+            assert_eq!(&buf[2..], &bytes[..]);
+        }
+    }
+    // long values go through the divide-and-conquer paths
+    let big = Int::pow10(5000).sub_u64(1).neg();
+    let b = big.to_ascii_radix(10);
+    assert_eq!(b.len(), 5001);
+    assert_eq!(Int::from_ascii_radix(&b, 10).unwrap(), big);
+    assert_eq!(Int::from_ascii_radix(b"+0", 10).unwrap(), Int::ZERO);
+    assert_eq!(Nat::zero().to_ascii_radix(10), b"0");
+    assert!(Int::from_ascii_radix(b"", 10).is_err());
+    assert!(Int::from_ascii_radix(b"-", 10).is_err());
+    assert!(Nat::from_ascii_radix(b"-1", 10).is_err());
+    assert!(Nat::from_ascii_radix(b"12a", 10).is_err());
+    assert!(Nat::from_ascii_radix(b"1\xff", 16).is_err());
+}
+
+#[test]
+fn pow10_and_wide_pow() {
+    let mut p = Nat::one();
+    for k in 0..200u64 {
+        assert_eq!(Nat::pow10(k), p);
+        assert_eq!(Int::pow10(k), Int::from(p.clone()));
+        assert_eq!(Nat::from_u64(37).mul_pow10(k), p.mul_u64(37));
+        assert_eq!(
+            Int::from(-37).mul_pow10(k),
+            Int::from(p.clone()).mul_u64(37).neg()
+        );
+        p = p.mul_u64(10);
+    }
+    assert_eq!(Nat::zero().mul_pow10(1 << 40), Nat::zero());
+    assert_eq!(Nat::pow10(30).to_string(), format!("1{}", "0".repeat(30)));
+    // u64 exponents: trivial bases and powers of two skip the loop
+    assert_eq!(Nat::one().pow(u64::MAX), Nat::one());
+    assert_eq!(Nat::zero().pow(u64::MAX), Nat::zero());
+    assert_eq!(Nat::zero().pow(0), Nat::one());
+    assert_eq!(Nat::from_u64(4).pow(40), Nat::one().shl(80));
+    assert_eq!(Nat::from_u64(3).pow(5), Nat::from_u64(243));
+}

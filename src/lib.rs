@@ -112,6 +112,8 @@ mod int_multiplicative;
 #[cfg(feature = "int")]
 mod int_roots;
 #[cfg(feature = "int")]
+mod modpow_sec;
+#[cfg(feature = "int")]
 pub mod nat;
 
 #[cfg(feature = "int")]

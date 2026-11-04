@@ -11,6 +11,10 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 - *(int)* `Int::add_u64`/`sub_u64`/`mul_u64` and in-place
   `add_assign_u64`/`sub_assign_u64`/`mul_assign_u64`; `Int::from_limb_vec`
+- *(int)* `Nat`/`Int::modpow_sec`: constant-time modular exponentiation for
+  secret exponents (odd moduli), like GMP's `mpz_powm_sec` — Montgomery CIOS
+  with masked final subtraction, fixed windows over every exponent bit, a
+  full masked table scan per lookup, and bit-serial masked reductions
 - *(int)* ASCII byte-slice I/O without `&str`/`String`:
   `Nat`/`Int::from_ascii_radix`, `to_ascii_radix`, `write_ascii_radix`
   (appends to a `Vec<u8>`)

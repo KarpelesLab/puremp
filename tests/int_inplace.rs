@@ -240,7 +240,7 @@ fn pow10_and_wide_pow() {
 #[test]
 fn isqrt_is_floor_root() {
     let mut rng = Rng(99);
-    for limbs in 0..40usize {
+    for limbs in (0..40usize).chain([63, 64, 100, 150, 191, 192, 193, 250]) {
         for _ in 0..30 {
             let v: Vec<u64> = (0..limbs)
                 .map(|_| match rng.next() % 6 {

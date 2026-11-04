@@ -47,9 +47,9 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   `modpow_sec` gets its `R² mod m` and base conversion from Montgomery
   operations instead of bit-serial reductions: `modpow` 1.3–1.35× faster at
   512–4096 bits, `modpow_sec` 1.6× at 512 bits and 1.7–2.2× at 2048–4096 bits
-- *(nat)* `Nat::isqrt` is 2.1–3.8× faster up to ~12k bits: an `f64`-seeded
+- *(nat)* `Nat::isqrt` is 2.7–4.5× faster up to ~12k bits: an `f64`-seeded
   single-step `u128` base case, and an allocation-free Karatsuba square root
-  on limb slices (one shared scratch buffer) below 96-limb roots
+  on limb slices below 96-limb roots, run entirely in stack buffers
 - *(nat)* Schoolbook division's `submul_1` kernel uses the `!(!r + a·q)`
   form, adding the carry last (the addmul kernels' short carry chain): ~20%
   faster per limb, ~1.25× faster division at 4096/2048 bits

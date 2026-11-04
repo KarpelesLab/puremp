@@ -1614,6 +1614,35 @@ fn sqrtrem_slice(s: &mut [Limb], r: &mut [Limb], a: &[Limb], scratch: &mut [Limb
     carry as Limb
 }
 
+/// Inputs up to this many limbs take [`isqrt_stack`].
+const ISQRT_STACK_LIMBS: usize = 2 * SQRT_SLICE_LIMBS;
+
+/// `⌊√a⌋` for `3..=2N − 2` limbs entirely in stack buffers: the
+/// operand is normalized (even shift `2t`, plus one low zero limb for an odd
+/// limb count — another factor `β = 4^32`) straight into an array, and the
+/// root of the scaled value is shifted back by `t + 32·odd` bits.
+fn isqrt_stack<const N: usize>(a: &[Limb]) -> Nat {
+    let len = a.len();
+    debug_assert!(len >= 3 && len <= 2 * N - 2);
+    let sh = a[len - 1].leading_zeros() & !1;
+    let odd = len % 2;
+    let total = len + odd;
+    let mut buf = [[0 as Limb; N]; 2];
+    let buf = buf.as_flattened_mut();
+    shl_limbs_into(a, sh, &mut buf[odd..odd + len]);
+    let n = total / 2;
+    let mut sroot = [0 as Limb; N];
+    let mut rem = [0 as Limb; N];
+    let mut scratch = [[0 as Limb; N]; 4];
+    let scratch = scratch.as_flattened_mut();
+    sqrtrem_slice(&mut sroot[..n], &mut rem[..n], &buf[..total], scratch);
+    // Undo the scaling: shift right by sh/2 + 32·odd bits.
+    let back = sh / 2 + 32 * odd as u32;
+    let root = &mut sroot[..n];
+    shr_limbs_in_place(root, back);
+    Nat::from_limbs(root)
+}
+
 /// `(⌊√a⌋, a − ⌊√a⌋²)` via [`sqrtrem_slice`] for a normalized `a` (top limb
 /// `≥ 2^62`) of at most `2·SQRT_SLICE_LIMBS` limbs. An odd limb count is
 /// handled as `a·β` (root `s'`, `s = s' >> 32`, remainder recovered exactly).
@@ -5395,6 +5424,14 @@ impl Nat {
         let b = self.bit_len();
         if b <= 128 {
             return Nat::from_u128(isqrt_u128(self.to_u128().expect("<= 128 bits")));
+        }
+        // Stack buffers sized for the input (zero-filling a large buffer for a
+        // small operand would cost more than the root).
+        if self.limbs.len() <= 16 {
+            return isqrt_stack::<9>(&self.limbs);
+        }
+        if self.limbs.len() <= ISQRT_STACK_LIMBS {
+            return isqrt_stack::<{ ISQRT_STACK_LIMBS / 2 + 1 }>(&self.limbs);
         }
         // Normalize with an even left shift so the top limb is ≥ 2^62 (the
         // recursion's precondition); `⌊√(v·4^t)⌋ >> t == ⌊√v⌋` undoes it.

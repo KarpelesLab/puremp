@@ -47,6 +47,12 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
   non-power-of-two sizes), and long quotients (and very large operands) use
   Newton-reciprocal division — ~2 products per further quotient block instead
   of ~5 (e.g. a 5n/n division at 8000 limbs drops from ~20 to ~11 products)
+- *(nat)* `gcd`/`extended_gcd`/`modinv`: allocation-free double-word Lehmer
+  (Jebelean's exact-quotient condition, ~64 bits per in-place pass, cofactors
+  tracked as magnitudes), the same pass as the Half-GCD base case, a
+  top-part Half-GCD driver with an `O(n)` residue guard, and retuned
+  crossovers: gcd 1.3–2× faster (256 bits to 200k bits), extended gcd
+  1.6–2.6×
 - *(int)* `Int::extended_gcd` uses an extended Lehmer loop (and the Half-GCD
   driver past ~256 limbs) and reduces the Bézout pair to the same
   GMP-normalized cofactors, instead of quadratic plain Euclid: ~17× faster at

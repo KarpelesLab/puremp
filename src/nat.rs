@@ -18,7 +18,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
-use crate::int::Int;
+use crate::int::{Int, Sign};
 use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 
 // Multiplication crossovers, tuned from `measure_mul_crossovers` (see the test
@@ -46,14 +46,12 @@ const TOOM3_THRESHOLD: usize = 640;
 /// Operands with at least this many limbs use Toom-4 (above Toom-3).
 const TOOM4_THRESHOLD: usize = 6000;
 
-/// Lehmer passes use the double-word (126-bit) window above this many limbs;
-/// below it, the wider window's u128 division libcalls cost more than the
-/// full-length passes they save.
-const LEHMER_DW_LIMBS: usize = 110;
-
 /// Number of limbs below which the Half-GCD recursion stops and reduces the
-/// pair with the windowed-Lehmer base case (`hgcd_base`).
-const HGCD_RECURSION_BASE_LIMBS: usize = 128;
+/// pair with the in-place double-word Lehmer base case (`hgcd_base`). The
+/// allocation-free Lehmer pass is cheap enough that recursing below a few
+/// hundred limbs (where the matrix products are small Karatsuba/schoolbook
+/// ones) no longer pays.
+const HGCD_RECURSION_BASE_LIMBS: usize = 400;
 
 /// Production recursion base (in limbs). A test-only seam (see the `tests`
 /// module's `hgcd_with_test_base`) can shrink this so small inputs still drive
@@ -92,23 +90,27 @@ fn hgcd_with_test_base<R>(base: usize, f: impl FnOnce() -> R) -> R {
 }
 
 /// Smallest operand (in limbs) for which [`Nat::gcd`] engages the subquadratic
-/// Half-GCD driver; smaller inputs stay on the (faster there) Lehmer path. The
-/// crossover was measured near ~8k limbs; the threshold keeps a margin so the
-/// Half-GCD path is never slower than Lehmer.
-const HGCD_GCD_THRESHOLD: usize = 10240;
+/// Half-GCD driver; smaller inputs stay on the (faster there) in-place Lehmer
+/// path. Measured crossover: ~2200–2800 limbs (the two are within noise
+/// there).
+const HGCD_GCD_THRESHOLD: usize = 2400;
 
 /// Smallest operand (in limbs, the smaller of the two) at which the extended
 /// GCD ([`Int::extended_gcd`], [`Int::modinv`]) engages the Half-GCD cofactor
-/// driver; below it the extended Lehmer loop wins (measured crossover ~250
-/// limbs).
-pub(crate) const HGCD_MODINV_THRESHOLD: usize = 256;
+/// driver; below it the in-place extended Lehmer loop wins (measured
+/// crossover ~1000 limbs).
+pub(crate) const HGCD_MODINV_THRESHOLD: usize = 1000;
 
-/// Limb floor for the extended-GCD Half-GCD driver: the reductions (each a
-/// `O(M(n))` half-length strip, base-cased through the windowed-Lehmer matrix)
-/// run down to about this size, then the small residual is finished with exact
-/// Euclidean steps. Small — the Lehmer-window base case beats a plain-Euclid
-/// tail well below the recursion base, so recursing further pays.
-const HGCD_EXTGCD_FLOOR: usize = 8;
+/// Limb floor for the extended-GCD Half-GCD driver: the reductions run down
+/// to about this size, then the residual is finished by the extended Lehmer
+/// loop (tracking both cofactors), which is faster below it.
+const HGCD_EXTGCD_FLOOR: usize = 800;
+
+/// The drivers run each Half-GCD reduction on the top `1 − NUM/DEN` of the
+/// larger operand ([`hgcd_reduce_top`] with `k = bit_len·NUM/DEN` low bits
+/// split off): measured best among 1/4 … 1/2.
+const HGCD_SPLIT_NUM: u64 = 1;
+const HGCD_SPLIT_DEN: u64 = 3;
 
 // --- Three-prime NTT with full 64-bit limb coefficients ---
 //
@@ -1655,65 +1657,6 @@ fn add_at(out: &mut [Limb], offset: usize, val: &[Limb]) {
     }
 }
 
-/// Computes `a·u + b·v` (guaranteed non-negative by the Lehmer invariant) on
-/// naturals with explicit signs, in one fused pass with a signed 128-bit
-/// carry — no intermediate products or sign case allocations.
-/// Requires `|a|, |b| < 2^63` (they are i64 cofactors at every call site).
-fn lincomb_pos(a: i128, u: &Nat, b: i128, v: &Nat) -> Nat {
-    let (am, bm) = (a.unsigned_abs() as u64, b.unsigned_abs() as u64);
-    debug_assert!(a.unsigned_abs() >> 63 == 0 && b.unsigned_abs() >> 63 == 0);
-    let n = u.limbs.len().max(v.limbs.len()) + 2;
-    let ul = |i: usize| u.limbs.get(i).copied().unwrap_or(0);
-    let vl = |i: usize| v.limbs.get(i).copied().unwrap_or(0);
-    let mut out = Vec::with_capacity(n);
-    if a >= 0 && b >= 0 {
-        // Both terms add: unsigned accumulate (products < 2^127 each).
-        let mut carry: u128 = 0;
-        for i in 0..n {
-            let acc = am as u128 * ul(i) as u128 + bm as u128 * vl(i) as u128 + carry;
-            out.push(acc as Limb);
-            carry = acc >> LIMB_BITS;
-        }
-        debug_assert_eq!(carry, 0, "lincomb carry escaped");
-    } else {
-        // Exactly one term is negative; orient as m₁·w₁ − m₂·w₂ ≥ 0 and let a
-        // signed carry ripple (|product| < 2^127, so the i128 never overflows).
-        let (m1, m2, flip) = if a >= 0 {
-            (am, bm, false)
-        } else {
-            (bm, am, true)
-        };
-        let mut carry: i128 = 0;
-        for i in 0..n {
-            let (w1, w2) = if flip { (vl(i), ul(i)) } else { (ul(i), vl(i)) };
-            let p = m1 as i128 * w1 as i128 - m2 as i128 * w2 as i128 + carry;
-            out.push(p as Limb);
-            carry = p >> LIMB_BITS; // arithmetic: sign-extends the borrow
-        }
-        assert_eq!(
-            carry, 0,
-            "lincomb result is non-negative by the Lehmer invariant"
-        );
-    }
-    let mut r = Nat { limbs: out };
-    r.normalize();
-    r
-}
-
-/// `⌊x / 2^shift⌋` truncated to 128 bits, read directly from the limbs — no
-/// allocation, unlike `shr`. The Lehmer callers pick `shift` so the true value
-/// fits (any higher bits are zero by construction).
-fn shifted_window(x: &Nat, shift: u64) -> u128 {
-    let ls = (shift / LIMB_BITS as u64) as usize;
-    let bs = (shift % LIMB_BITS as u64) as u32;
-    let limb = |i: usize| -> u128 { x.limbs.get(i).map_or(0, |&l| l as u128) };
-    if bs == 0 {
-        limb(ls) | (limb(ls + 1) << LIMB_BITS)
-    } else {
-        (limb(ls) >> bs) | (limb(ls + 1) << (LIMB_BITS - bs)) | (limb(ls + 2) << (128 - bs))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Subquadratic Half-GCD (Schönhage; Möller, *Math. Comp.* 77 (2008);
 // Lichtblau, "Half-GCD, Fast Rational Recovery, and Planar Lattice Reduction",
@@ -1860,65 +1803,87 @@ fn hgcd_straddle(r: &mut HgcdMat, va: &mut Int, vb: &mut Int, h: u64) {
     }
 }
 
-/// One forward Euclidean step on `Nat` operands `u > v > 0`, updating the
-/// cofactor matrix `R ← E(q)·R` (`q = ⌊u/v⌋`) and the pair `(u, v) ← (v, u−qv)`.
-fn hgcd_step_nat(r: &mut HgcdMat, u: &mut Nat, v: &mut Nat) {
-    let (q, rem) = u.div_rem(v).expect("hgcd_step_nat: v > 0");
-    let qi = Int::from(q);
-    // R ← [[0,1],[1,-q]] · R  =  [[c, d], [a - q·c, b - q·d]]
-    let nc = r.a.sub(&qi.mul(&r.c));
-    let nd = r.b.sub(&qi.mul(&r.d));
-    r.a = core::mem::replace(&mut r.c, nc);
-    r.b = core::mem::replace(&mut r.d, nd);
-    *u = core::mem::replace(v, rem);
-}
-
-/// Base case: reduce `(m, n)` to the pair straddling bit length `h`. Uses the
-/// same double/single-word Lehmer windows as [`Nat::gcd_lehmer`] to strip
-/// ~63–126 bits per full-length matrix application (rather than one quotient at
-/// a time), switching to exact single steps near the straddle point so the
-/// window cannot overshoot it. The scalar Lehmer matrix `L = [[a,b],[c,d]]`
-/// (a product of elementary factors) is folded into `R ← L·R`.
+/// Base case: reduce `(m, n)` to the pair straddling bit length `h`. Runs the
+/// in-place double-word Lehmer passes of [`Nat::gcd_lehmer`] (each certified
+/// to keep the full remainder above `2^h`, so the straddle is never
+/// overshot), with exact single division steps where no pass certifies. The
+/// cofactor matrix is accumulated as non-negative magnitudes plus a parity
+/// bit (products of elementary matrices have a checkerboard sign pattern),
+/// column by column with [`lehmer_cofactor_apply`].
 fn hgcd_base(m: &Nat, n: &Nat, h: u64) -> (HgcdMat, Nat, Nat) {
-    let mut r = HgcdMat::identity();
-    let mut u = m.clone();
-    let mut v = n.clone();
-    while !v.is_zero() && v.bit_len() > h {
-        // Near the straddle, take exact single steps (a window could strip past
-        // the ~126-bit-wide target and overshoot the straddle pair).
-        if v.bit_len() <= h + 160 {
-            hgcd_step_nat(&mut r, &mut u, &mut v);
-            continue;
-        }
-        let (a, b, c, d) = if v.limbs.len() >= LEHMER_DW_LIMBS {
-            let shift = u.bit_len() - 126; // v ≥ 3 limbs ⇒ u.bit_len() > 128
-            lehmer_step128(shifted_window(&u, shift), shifted_window(&v, shift))
+    let mut u = m.limbs.clone();
+    let mut v = Vec::with_capacity(u.len());
+    v.extend_from_slice(&n.limbs);
+    v.resize(u.len(), 0);
+    let mut nl = u.len();
+    let cap = nl + 3;
+    let unit = |bit: bool| {
+        let mut w = Vec::with_capacity(cap);
+        w.push(Limb::from(bit));
+        w
+    };
+    // Columns (r11, r21) and (r12, r22) of R = identity.
+    let (mut r11, mut r21, mut r12, mut r22) = (unit(true), unit(false), unit(false), unit(true));
+    let mut odd = false;
+    loop {
+        let vn = sig_len(&v, nl);
+        let vbits = if vn == 0 {
+            0
         } else {
-            let shift = u.bit_len().saturating_sub(63);
-            lehmer_step64(
-                shifted_window(&u, shift) as u64,
-                shifted_window(&v, shift) as u64,
-            )
+            vn as u64 * LIMB_BITS as u64 - v[vn - 1].leading_zeros() as u64
         };
-        if b == 0 {
-            hgcd_step_nat(&mut r, &mut u, &mut v);
-        } else {
-            let nu = lincomb_pos(a, &u, b, &v);
-            let nv = lincomb_pos(c, &u, d, &v);
-            u = nu;
-            v = nv;
-            // R ← L·R, with L the (elementary-product) Lehmer window matrix.
-            let l = HgcdMat {
-                a: Int::from_i128(a),
-                b: Int::from_i128(b),
-                c: Int::from_i128(c),
-                d: Int::from_i128(d),
+        if vbits <= h {
+            break;
+        }
+        let mut mat = None;
+        if nl >= 3 && vn + 1 >= nl {
+            let lz = u[nl - 1].leading_zeros();
+            let p = nl as u64 * LIMB_BITS as u64 - lz as u64 - 128;
+            // Keep every certified remainder ≥ 2^h: y_k ≥ |neg| + 2^(h−p).
+            let lo = if h < p {
+                Some(1)
+            } else if h - p < 127 {
+                Some(1u128 << (h - p))
+            } else {
+                None
             };
-            r = l.mul(&r);
-            debug_assert!(u.cmp_ref(&v) != Ordering::Less, "Lehmer window kept order");
+            if let Some(lo) = lo {
+                mat = lehmer_mat(top128(&u, nl, lz), top128(&v, nl, lz), lo);
+            }
+        }
+        if let Some(mat) = mat {
+            lehmer_apply(&mut u[..nl], &mut v[..nl], &mat);
+            lehmer_cofactor_apply(&mut r11, &mut r21, &mat);
+            lehmer_cofactor_apply(&mut r12, &mut r22, &mat);
+            odd ^= mat.odd;
+            nl = sig_len(&u, nl);
+        } else {
+            let (nn, q) = lehmer_div_step(&mut u, &mut v, nl, vn);
+            nl = nn;
+            lehmer_cofactor_div(&mut r11, &mut r21, &q);
+            lehmer_cofactor_div(&mut r12, &mut r22, &q);
+            odd = !odd;
         }
     }
-    (r, u, v)
+    let int = |mag: Vec<Limb>, neg: bool| {
+        let mut x = Nat { limbs: mag };
+        x.normalize();
+        Int::from_sign_magnitude(if neg { Sign::Negative } else { Sign::Positive }, x)
+    };
+    // Signed R: [[+r11, −r12], [−r21, +r22]] for an even factor count, the
+    // negation for an odd one.
+    let r = HgcdMat {
+        a: int(r11, odd),
+        b: int(r12, !odd),
+        c: int(r21, !odd),
+        d: int(r22, odd),
+    };
+    u.truncate(nl);
+    let mut vv = v;
+    vv.truncate(nl);
+    let mut vv = Nat { limbs: vv };
+    vv.normalize();
+    (r, Nat { limbs: u }, vv)
 }
 
 /// Applies a child cofactor matrix to a full-precision pair using the known
@@ -1933,22 +1898,137 @@ fn hgcd_apply_split(child: &HgcdMat, px: &Nat, py: &Nat, xl: &Int, yl: &Int, k: 
     (hi0.add(&lo0), hi1.add(&lo1))
 }
 
-/// Always-on correctness guard for one Half-GCD reduction: returns `true` iff
+/// Exact correctness check for one Half-GCD reduction: returns `true` iff
 /// `det R = ±1` and `(va, vb) = R·(m, n)` exactly. Those two facts together
-/// *prove* `gcd(va, vb) = gcd(m, n)` — a unimodular map preserves the gcd — so a
-/// `true` result means the reduction is trustworthy even against a latent bug in
-/// [`hgcd`]; a `false` result tells the driver to fall back to the trusted
-/// Lehmer GCD, so a wrong Half-GCD result can never reach `Rational`. Cost is one
-/// matrix–vector product plus a 2×2 determinant at the current operand size —
-/// `O(M(n))`, negligible against the (only-above-10k-limb) Half-GCD it guards,
-/// and it shrinks geometrically down the driver loop, so the whole guard adds
-/// `O(M(n))` overall.
+/// *prove* `gcd(va, vb) = gcd(m, n)` — a unimodular map preserves the gcd.
+/// Costs a matrix–vector product plus a 2×2 determinant (`O(M(n))`), so it is
+/// asserted on every [`hgcd`] return in debug builds and used by the tests;
+/// the release drivers use the `O(n)` residue check
+/// [`hgcd_reduction_ok_fast`].
+#[cfg(any(test, debug_assertions))]
 fn hgcd_reduction_ok(r: &HgcdMat, m: &Nat, n: &Nat, va: &Nat, vb: &Nat) -> bool {
     if !r.a.mul(&r.d).sub(&r.b.mul(&r.c)).abs().is_one() {
         return false;
     }
     let (cva, cvb) = r.mul_vec(&Int::from(m.clone()), &Int::from(n.clone()));
     cva == Int::from(va.clone()) && cvb == Int::from(vb.clone())
+}
+
+/// Mersenne prime modulus of the cheap Half-GCD driver guard.
+const GUARD_P: u64 = (1 << 61) - 1;
+
+/// `x mod (2^61 − 1)` for `x < 2^125`.
+#[inline(always)]
+fn guard_reduce(x: u128) -> u64 {
+    let p = GUARD_P as u128;
+    let x = (x & p) + (x >> 61);
+    let x = ((x & p) + (x >> 61)) as u64;
+    if x >= GUARD_P { x - GUARD_P } else { x }
+}
+
+/// `(x mod 2^64, x mod (2^61 − 1))` of a natural (one linear pass).
+fn guard_residues_nat(x: &Nat) -> (u64, u64) {
+    let lo = x.limbs.first().copied().unwrap_or(0);
+    let mp = x.limbs.iter().rev().fold(0u64, |acc, &l| {
+        guard_reduce(((acc as u128) << 64) | l as u128)
+    });
+    (lo, mp)
+}
+
+/// Signed residues of an [`Int`], as for [`guard_residues_nat`].
+fn guard_residues_int(x: &Int) -> (u64, u64) {
+    let (lo, mp) = guard_residues_nat(&x.magnitude_ref());
+    if x.is_negative() {
+        (lo.wrapping_neg(), if mp == 0 { 0 } else { GUARD_P - mp })
+    } else {
+        (lo, mp)
+    }
+}
+
+/// A value known only by its residues modulo `2^64` and `2^61 − 1` (the pair
+/// [`guard_residues_nat`] produces), with the ring operations the extended
+/// driver needs to track `rhs`'s cofactor without computing it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct GuardRes(u64, u64);
+
+impl GuardRes {
+    const ZERO: GuardRes = GuardRes(0, 0);
+    const ONE: GuardRes = GuardRes(1, 1);
+
+    fn of_int(x: &Int) -> GuardRes {
+        let (a, b) = guard_residues_int(x);
+        GuardRes(a, b)
+    }
+
+    fn of_nat(x: &Nat) -> GuardRes {
+        let (a, b) = guard_residues_nat(x);
+        GuardRes(a, b)
+    }
+
+    fn add(self, o: GuardRes) -> GuardRes {
+        GuardRes(
+            self.0.wrapping_add(o.0),
+            guard_reduce(self.1 as u128 + o.1 as u128),
+        )
+    }
+
+    fn sub(self, o: GuardRes) -> GuardRes {
+        GuardRes(
+            self.0.wrapping_sub(o.0),
+            guard_reduce(self.1 as u128 + (GUARD_P - o.1) as u128),
+        )
+    }
+
+    fn mul(self, o: GuardRes) -> GuardRes {
+        GuardRes(
+            self.0.wrapping_mul(o.0),
+            guard_reduce(self.1 as u128 * o.1 as u128),
+        )
+    }
+}
+
+/// Cheap always-on guard for one Half-GCD reduction in the drivers: checks
+/// `(va, vb) = R·(m, n)` and `det R = ±1` modulo `2^64` and modulo the
+/// Mersenne prime `2^61 − 1`, in `O(n)` — instead of the exact `O(M(n))`
+/// [`hgcd_reduction_ok`] (still asserted on every [`hgcd`] return in debug
+/// builds and by the tests). Any genuine slip in the reduction — a wrong
+/// matrix entry or reduced value — shows up in these residues with
+/// overwhelming probability, and the drivers then fall back to the trusted
+/// Lehmer/Euclid loops; the gcd driver additionally checks exactly that its
+/// result divides both inputs, and the extended driver re-verifies its final
+/// Bézout identity exactly.
+fn hgcd_reduction_ok_fast(r: &HgcdMat, m: &Nat, n: &Nat, va: &Nat, vb: &Nat) -> bool {
+    let (a, b, c, d) = (
+        guard_residues_int(&r.a),
+        guard_residues_int(&r.b),
+        guard_residues_int(&r.c),
+        guard_residues_int(&r.d),
+    );
+    let (m, n, va, vb) = (
+        guard_residues_nat(m),
+        guard_residues_nat(n),
+        guard_residues_nat(va),
+        guard_residues_nat(vb),
+    );
+    // Modulo 2^64 (wrapping arithmetic).
+    let w = |x: u64, y: u64| x.wrapping_mul(y);
+    let det64 = w(a.0, d.0).wrapping_sub(w(b.0, c.0));
+    if det64 != 1 && det64 != u64::MAX {
+        return false;
+    }
+    if w(a.0, m.0).wrapping_add(w(b.0, n.0)) != va.0
+        || w(c.0, m.0).wrapping_add(w(d.0, n.0)) != vb.0
+    {
+        return false;
+    }
+    // Modulo 2^61 − 1.
+    let mm = |x: u64, y: u64| guard_reduce(x as u128 * y as u128);
+    let add = |x: u64, y: u64| guard_reduce(x as u128 + y as u128);
+    let detp = add(mm(a.1, d.1), GUARD_P - mm(b.1, c.1));
+    let want = if det64 == 1 { 1 } else { GUARD_P - 1 };
+    detp == want
+        && add(mm(a.1, m.1), mm(b.1, n.1)) == va.1
+        && add(mm(c.1, m.1), mm(d.1, n.1)) == vb.1
 }
 
 /// Recursive Half-GCD. Precondition: `m > n ≥ 0`. Returns the cofactor matrix
@@ -1967,6 +2047,49 @@ fn hgcd(m: &Nat, n: &Nat) -> (HgcdMat, Nat, Nat) {
         );
     }
     (r, va, vb)
+}
+
+/// The low `k` bits of `x` (`x mod 2^k`), copied straight from the limbs.
+fn low_bits(x: &Nat, k: u64) -> Nat {
+    let full = (k / LIMB_BITS as u64) as usize;
+    let rem = (k % LIMB_BITS as u64) as u32;
+    let take = (full + usize::from(rem != 0)).min(x.limbs.len());
+    let mut limbs = x.limbs[..take].to_vec();
+    if rem != 0 && take == full + 1 {
+        limbs[full] &= (1 << rem) - 1;
+    }
+    let mut out = Nat { limbs };
+    out.normalize();
+    out
+}
+
+/// One Half-GCD reduction step of the drivers, on the top part only: runs
+/// [`hgcd`] on `(a ≫ k, b ≫ k)` and applies the resulting matrix to the full
+/// pair through [`hgcd_apply_split`] (only the low `k` bits are multiplied),
+/// backing up with [`hgcd_make_valid`] if the top-part quotients overshoot.
+/// Returns `(R, va, vb)` with `(va, vb) = R·(a, b)` a genuine consecutive
+/// remainder pair (`va > vb ≥ 0`), or `None` when no reduction was made.
+/// Cheaper per stripped bit than a full-size [`hgcd`] because neither the
+/// second recursive phase nor the final matrix product is needed.
+/// Precondition: `a > b`.
+fn hgcd_reduce_top(a: &Nat, b: &Nat, k: u64) -> Option<(HgcdMat, Nat, Nat)> {
+    let f0 = a.shr(k);
+    let g0 = b.shr(k);
+    if f0.cmp_ref(&g0) != Ordering::Greater {
+        return None;
+    }
+    let (rc, ri, rip1) = hgcd(&f0, &g0);
+    if rc.is_identity() {
+        return None;
+    }
+    let (al, bl) = (Int::from(low_bits(a, k)), Int::from(low_bits(b, k)));
+    let (mut va, mut vb) = hgcd_apply_split(&rc, &ri, &rip1, &al, &bl, k);
+    let mut r = rc;
+    hgcd_make_valid(&mut r, &mut va, &mut vb);
+    if r.is_identity() || va.is_negative() || vb.is_negative() {
+        return None;
+    }
+    Some((r, va.magnitude(), vb.magnitude()))
 }
 
 /// Recursion body for [`hgcd`]; see that wrapper for the checked contract.
@@ -2033,86 +2156,308 @@ fn hgcd_inner(m: &Nat, n: &Nat) -> (HgcdMat, Nat, Nat) {
     (r, va.magnitude(), vb.magnitude())
 }
 
-/// Single-word Lehmer pass: partial Euclid on the leading ~63 bits (`x`, `y`
-/// aligned, `x < 2^63`), accumulating the cofactor matrix `[[a,b],[c,d]]` in
-/// machine words. An i128 quotient would lower to a slow division libcall,
-/// while Lehmer's invariants keep every quantity inside a u64/i64; any sign or
-/// overflow violation simply breaks out, and `b == 0` tells the caller to fall
-/// back to one (always correct) multi-precision division.
-fn lehmer_step64(mut x: u64, mut y: u64) -> (i128, i128, i128, i128) {
-    let (mut a, mut b, mut c, mut d) = (1i64, 0i64, 0i64, 1i64);
-    loop {
-        let (yc, yd) = (y as i128 + c as i128, y as i128 + d as i128);
-        if yc <= 0 || yd <= 0 {
-            break;
-        }
-        // x < 2^63 and |a| ≤ i64::MAX, so x+a fits a u64 when ≥ 0.
-        let (xa, xb) = (x as i128 + a as i128, x as i128 + b as i128);
-        if xa < 0 || xb < 0 {
-            break;
-        }
-        let q = (xa as u64) / (yc as u64);
-        if q != (xb as u64) / (yd as u64) {
-            break; // Lehmer's exactness test failed
-        }
-        let Ok(qi) = i64::try_from(q) else { break };
-        let (Some(nc), Some(nd)) = (
-            qi.checked_mul(c).and_then(|t| a.checked_sub(t)),
-            qi.checked_mul(d).and_then(|t| b.checked_sub(t)),
-        ) else {
-            break;
-        };
-        (a, b) = (c, d);
-        (c, d) = (nc, nd);
-        // ny = x − q·y, non-negative by construction (q equals the true
-        // quotient of x/y because the two bracketing tests agreed).
-        let ny = (x as u128).wrapping_sub(q as u128 * y as u128) as u64;
-        x = y;
-        y = ny;
-    }
-    (a as i128, b as i128, c as i128, d as i128)
+// ---------------------------------------------------------------------------
+// Allocation-free double-word Lehmer (Jebelean's exact-quotient condition).
+//
+// For `A = x·2^p + A₀`, `B = y·2^p + B₀` (`0 ≤ A₀, B₀ < 2^p`), run Euclid on the
+// leading words `(x, y)`, accumulating the product `L` of elementary matrices
+// `E(q) = [[0,1],[1,−q]]`. Its rows have opposite checkerboard sign patterns,
+// so `L·(A, B) = 2^p·(x_k, y_k) + L·(A₀, B₀)` where each low-part term lies
+// strictly between `−2^p·(negative coefficient)` and `+2^p·(positive one)`.
+// Hence (Jebelean, "Improving the multiprecision Euclidean algorithm", 1993)
+//   y_k ≥ |negative entry of row 2|   and   x_k − y_k ≥ |row-1 − row-2 entry|
+// guarantee `L·(A, B) = (A', B')` with `A' > B' > 0`; by Lichtblau's Lemma 3
+// (see the Half-GCD notes below) such a pair is a genuine consecutive
+// remainder pair, so `L` is exactly a prefix of the Euclidean quotient
+// sequence. Only one (usually subtraction-only) quotient is needed per step,
+// and on a 128-bit window the entries stay below 2^64: each pass strips about
+// 64 bits with single-limb multipliers.
+// ---------------------------------------------------------------------------
+
+/// A Lehmer cofactor matrix stored as non-negative magnitudes `[[a1, b1],
+/// [a2, b2]]` plus the parity of its elementary-factor count: for an even count
+/// the signed matrix is `[[a1, −b1], [−a2, b2]]`, for an odd one
+/// `[[−a1, b1], [a2, −b2]]`.
+#[derive(Clone, Copy, Debug)]
+struct LehmerMat {
+    a1: u64,
+    b1: u64,
+    a2: u64,
+    b2: u64,
+    odd: bool,
 }
 
-/// Double-word Lehmer pass: like [`lehmer_step64`] but on the leading
-/// ~126 bits, stripping about twice as many bits per full-length matrix
-/// application. The cofactors are explicitly capped below 2^63 to honour
-/// [`lincomb_pos`]'s bound (the exactness test fails around there anyway).
-fn lehmer_step128(mut x: u128, mut y: u128) -> (i128, i128, i128, i128) {
-    debug_assert!(x >> 126 == 0, "window must leave i128 headroom");
-    let (mut a, mut b, mut c, mut d) = (1i128, 0i128, 0i128, 1i128);
-    loop {
-        // x < 2^126 and |c|, |d| < 2^63, so these sums cannot overflow i128.
-        let (yc, yd) = (y as i128 + c, y as i128 + d);
-        if yc <= 0 || yd <= 0 {
-            break;
-        }
-        let (xa, xb) = (x as i128 + a, x as i128 + b);
-        if xa < 0 || xb < 0 {
-            break;
-        }
-        let q = (xa as u128) / (yc as u128);
-        if q != (xb as u128) / (yd as u128) {
-            break; // Lehmer's exactness test failed
-        }
-        let Ok(qi) = i128::try_from(q) else { break };
-        let (Some(nc), Some(nd)) = (
-            qi.checked_mul(c).and_then(|t| a.checked_sub(t)),
-            qi.checked_mul(d).and_then(|t| b.checked_sub(t)),
-        ) else {
-            break;
-        };
-        if nc.unsigned_abs() >> 62 != 0 || nd.unsigned_abs() >> 62 != 0 {
-            break; // keep the matrix inside lincomb_pos's |coefficient| < 2^63
-        }
-        (a, b) = (c, d);
-        (c, d) = (nc, nd);
-        // Exact for the same bracketing reason as the single-word pass, and
-        // q·y ≤ x < 2^126 keeps the product inside u128.
-        let ny = x.wrapping_sub(q.wrapping_mul(y));
-        x = y;
-        y = ny;
+/// `(⌊x/y⌋, x mod y)` for `x ≥ y > 0`, trying the (by far most common, Gauss–
+/// Kuzmin) quotients 1–3 by subtraction before paying for a division.
+#[inline(always)]
+fn lehmer_divrem(x: u128, y: u128) -> (u128, u128) {
+    let r = x - y;
+    if r < y {
+        return (1, r);
     }
-    (a, b, c, d)
+    let r = r - y;
+    if r < y {
+        return (2, r);
+    }
+    let r = r - y;
+    if r < y {
+        return (3, r);
+    }
+    if x >> 64 == 0 {
+        let (x, y) = (x as u64, y as u64);
+        let q = x / y;
+        return (q as u128, (x - q * y) as u128);
+    }
+    // Estimate from the leading 64 bits with one hardware word division (a
+    // u128 division is a software routine). `⌊x_t/(y_t+1)⌋ ≤ ⌊x/y⌋`, and with
+    // y_t ≥ 2^32 it undershoots by at most ~2, fixed by subtraction.
+    let s = x.leading_zeros();
+    let xt = ((x << s) >> 64) as u64;
+    let yt = ((y << s) >> 64) as u64;
+    if yt >> 32 != 0 {
+        let mut q = (xt / yt.saturating_add(1)) as u128;
+        let mut r = x - q * y;
+        while r >= y {
+            r -= y;
+            q += 1;
+        }
+        return (q, r);
+    }
+    let q = x / y;
+    (q, x - q * y)
+}
+
+/// One double-word Lehmer pass on aligned leading windows `x ≥ y` of `A ≥ B`
+/// (see the section comment). Returns `None` when not even one quotient can be
+/// certified (the caller then takes one full division step).
+///
+/// With `lo > 0` each accepted step additionally guarantees the new full
+/// remainder exceeds `2^p·lo` (requiring `y_k ≥ |neg| + lo`), which lets the
+/// Half-GCD base case stop exactly at its straddle point.
+fn lehmer_mat(mut x: u128, mut y: u128, lo: u128) -> Option<LehmerMat> {
+    let (mut a1, mut b1, mut a2, mut b2) = (1u64, 0u64, 0u64, 1u64);
+    let mut odd = false;
+    let mut any = false;
+    while y != 0 {
+        let (q, r) = lehmer_divrem(x, y);
+        if q >> 64 != 0 {
+            break;
+        }
+        // Magnitudes add (the rows have opposite sign patterns); the products
+        // fit u128 since q, a2, b2 < 2^64.
+        let q = q as u64 as u128;
+        let na2 = a1 as u128 + q * a2 as u128;
+        let nb2 = b1 as u128 + q * b2 as u128;
+        if (na2 | nb2) >> 64 != 0 {
+            break;
+        }
+        // Jebelean's condition for the new pair (y, r) and new parity.
+        let ok = if odd {
+            r >= na2 + lo && y - r >= b2 as u128 + nb2
+        } else {
+            r >= nb2 + lo && y - r >= a2 as u128 + na2
+        };
+        if !ok {
+            break;
+        }
+        (a1, b1, a2, b2) = (a2, b2, na2 as u64, nb2 as u64);
+        (x, y) = (y, r);
+        odd = !odd;
+        any = true;
+    }
+    any.then_some(LehmerMat {
+        a1,
+        b1,
+        a2,
+        b2,
+        odd,
+    })
+}
+
+/// In place: `(u, v) ← (p·X − q·Y, r·Y − s·X)` with `(X, Y) = (u, v)`, or
+/// `(v, u)` when `SWAP`. Both results must be non-negative and fit the slice
+/// (guaranteed for a certified [`LehmerMat`]). Two carry chains per output,
+/// the borrow folded into the subtrahend's carry.
+#[inline(always)]
+fn lehmer_kernel<const SWAP: bool>(u: &mut [Limb], v: &mut [Limb], p: u64, q: u64, r: u64, s: u64) {
+    let (mut cp1, mut cn1, mut cp2, mut cn2) = (0u128, 0u128, 0u128, 0u128);
+    let (p, q, r, s) = (p as u128, q as u128, r as u128, s as u128);
+    for (ui, vi) in u.iter_mut().zip(v.iter_mut()) {
+        let (x, y) = if SWAP { (*vi, *ui) } else { (*ui, *vi) };
+        let (x, y) = (x as u128, y as u128);
+        let t = p * x + cp1;
+        let w = q * y + cn1;
+        let (o1, b1) = (t as Limb).overflowing_sub(w as Limb);
+        cp1 = t >> LIMB_BITS;
+        cn1 = (w >> LIMB_BITS) + b1 as u128;
+        let t = r * y + cp2;
+        let w = s * x + cn2;
+        let (o2, b2) = (t as Limb).overflowing_sub(w as Limb);
+        cp2 = t >> LIMB_BITS;
+        cn2 = (w >> LIMB_BITS) + b2 as u128;
+        *ui = o1;
+        *vi = o2;
+    }
+    debug_assert!(cp1 == cn1 && cp2 == cn2, "Lehmer matrix left a carry");
+}
+
+/// Applies a certified [`LehmerMat`] to the operand pair in place:
+/// `(u, v) ← L·(u, v)` (equal-length slices, `v` zero-padded).
+fn lehmer_apply(u: &mut [Limb], v: &mut [Limb], m: &LehmerMat) {
+    if m.odd {
+        // (−a1·u + b1·v, a2·u − b2·v)
+        lehmer_kernel::<true>(u, v, m.b1, m.a1, m.a2, m.b2);
+    } else {
+        // (a1·u − b1·v, −a2·u + b2·v)
+        lehmer_kernel::<false>(u, v, m.a1, m.b1, m.b2, m.a2);
+    }
+}
+
+/// Cofactor magnitudes update `(s0, s1) ← (a1·s0 + b1·s1, a2·s0 + b2·s1)` in
+/// place (the signed cofactors alternate in sign exactly like the matrix rows,
+/// so the magnitudes only ever add). Grows both vectors by the final carry.
+fn lehmer_cofactor_apply(s0: &mut Vec<Limb>, s1: &mut Vec<Limb>, m: &LehmerMat) {
+    let (a1, b1, a2, b2) = (m.a1 as u128, m.b1 as u128, m.a2 as u128, m.b2 as u128);
+    let (mut c0, mut c1) = (0u128, 0u128);
+    for (x, y) in s0.iter_mut().zip(s1.iter_mut()) {
+        let (xv, yv) = (*x as u128, *y as u128);
+        // a·x + carry < 2^128, then + b·y on the low word only: the carry stays
+        // below 2^65, keeping every sum inside u128.
+        let t = a1 * xv + c0;
+        let w = b1 * yv + (t as Limb as u128);
+        *x = w as Limb;
+        c0 = (t >> LIMB_BITS) + (w >> LIMB_BITS);
+        let t = a2 * xv + c1;
+        let w = b2 * yv + (t as Limb as u128);
+        *y = w as Limb;
+        c1 = (t >> LIMB_BITS) + (w >> LIMB_BITS);
+    }
+    while c0 != 0 || c1 != 0 {
+        s0.push(c0 as Limb);
+        s1.push(c1 as Limb);
+        c0 >>= LIMB_BITS;
+        c1 >>= LIMB_BITS;
+    }
+}
+
+/// The top 128 bits of the `n`-limb value `w` (`n ≥ 3`), shifted left by `s`
+/// (the leading-zero count of the larger operand's top limb, so that operand's
+/// window has its top bit at position 127; the other operand is read at the
+/// same alignment).
+#[inline(always)]
+fn top128(w: &[Limb], n: usize, s: u32) -> u128 {
+    let hi = ((w[n - 1] as u128) << LIMB_BITS) | w[n - 2] as u128;
+    if s == 0 {
+        hi
+    } else {
+        (hi << s) | (w[n - 3] >> (LIMB_BITS - s)) as u128
+    }
+}
+
+/// Significant length of `w[..n]` (drops zero high limbs).
+#[inline(always)]
+fn sig_len(w: &[Limb], mut n: usize) -> usize {
+    while n > 0 && w[n - 1] == 0 {
+        n -= 1;
+    }
+    n
+}
+
+/// Reads limbs as a `u128` (`w.len() ≤ 2`).
+#[inline(always)]
+fn limbs_u128(w: &[Limb]) -> u128 {
+    w.iter()
+        .rev()
+        .fold(0u128, |acc, &l| (acc << LIMB_BITS) | l as u128)
+}
+
+/// Exact Euclid on two words `x ≥ y`, accumulating a [`LehmerMat`] for as long
+/// as its entries fit a limb. Returns the matrix (or `None` if the very first
+/// quotient is already ≥ 2^64) and the reduced pair.
+fn euclid_mat_u128(mut x: u128, mut y: u128) -> (Option<LehmerMat>, u128, u128) {
+    let (mut a1, mut b1, mut a2, mut b2) = (1u64, 0u64, 0u64, 1u64);
+    let mut odd = false;
+    let mut any = false;
+    while y != 0 {
+        let (q, r) = lehmer_divrem(x, y);
+        if q >> 64 != 0 {
+            break;
+        }
+        let q = q as u64 as u128;
+        let na2 = a1 as u128 + q * a2 as u128;
+        let nb2 = b1 as u128 + q * b2 as u128;
+        if (na2 | nb2) >> 64 != 0 {
+            break;
+        }
+        (a1, b1, a2, b2) = (a2, b2, na2 as u64, nb2 as u64);
+        (x, y) = (y, r);
+        odd = !odd;
+        any = true;
+    }
+    let m = any.then_some(LehmerMat {
+        a1,
+        b1,
+        a2,
+        b2,
+        odd,
+    });
+    (m, x, y)
+}
+
+/// One full Euclidean division step on the in-place Lehmer buffers:
+/// `(u, v) ← (v, u mod v)` (`u[..n] ≥ v[..n]`, `v` has `vn` significant limbs).
+/// Returns the new length (`vn`) and the quotient. Used when a Lehmer pass
+/// cannot certify a quotient (one too large for a word, or a lopsided pair).
+fn lehmer_div_step(u: &mut [Limb], v: &mut [Limb], n: usize, vn: usize) -> (usize, Nat) {
+    let mut a = Nat {
+        limbs: u[..n].to_vec(),
+    };
+    a.normalize();
+    let b = Nat {
+        limbs: v[..vn].to_vec(),
+    };
+    let (q, r) = a.div_rem(&b).expect("v is non-zero");
+    u[..vn].copy_from_slice(&v[..vn]);
+    u[vn..n].fill(0);
+    v[..n].fill(0);
+    v[..r.limbs.len()].copy_from_slice(&r.limbs);
+    (vn, q)
+}
+
+/// Cofactor magnitudes for one explicit quotient `q`:
+/// `(s0, s1) ← (s1, s0 + q·s1)`, keeping both vectors the same length.
+fn lehmer_cofactor_div(s0: &mut Vec<Limb>, s1: &mut Vec<Limb>, q: &Nat) {
+    let mut a = Nat {
+        limbs: core::mem::take(s0),
+    };
+    a.normalize();
+    let mut b = Nat {
+        limbs: core::mem::take(s1),
+    };
+    b.normalize();
+    let ns1 = a.add(&q.mul(&b));
+    *s0 = b.limbs;
+    *s1 = ns1.limbs;
+    let len = s0.len().max(s1.len());
+    s0.resize(len, 0);
+    s1.resize(len, 0);
+}
+
+/// Euclid's gcd on two words (`u128` Lehmer-free: subtraction-first quotients,
+/// then a single-word binary GCD once both fit a limb).
+fn u128_gcd_euclid(mut x: u128, mut y: u128) -> u128 {
+    if x < y {
+        core::mem::swap(&mut x, &mut y);
+    }
+    while y >> LIMB_BITS != 0 {
+        let (_, r) = lehmer_divrem(x, y);
+        (x, y) = (y, r);
+    }
+    if y == 0 {
+        return x;
+    }
+    let r = (x % y) as u64;
+    u64_gcd(y as u64, r) as u128
 }
 
 /// Compares two normalized little-endian limb slices as naturals.
@@ -2810,8 +3155,9 @@ impl Nat {
 
     /// Returns the greatest common divisor of `self` and `rhs`.
     ///
-    /// Small operands use Stein's binary GCD; large ones use Lehmer's algorithm,
-    /// which advances several Euclidean steps per multi-precision operation.
+    /// Word-size operands use a binary GCD, larger ones Lehmer's algorithm
+    /// (~64 bits per in-place pass), and very large ones the subquadratic
+    /// Half-GCD driver.
     /// `gcd(0, n) == gcd(n, 0) == n`, and `gcd(0, 0) == 0`.
     pub fn gcd(&self, rhs: &Nat) -> Nat {
         if self.is_zero() {
@@ -2841,11 +3187,12 @@ impl Nat {
         self.gcd_lehmer(rhs)
     }
 
-    /// Subquadratic GCD: a Lehmer-style loop driven by the recursive Half-GCD
-    /// ([`hgcd`]). Each iteration replaces `(a, b)` by the remainder-sequence
-    /// pair straddling `2^{bit_len(a)/2}` (halving the operand size in
-    /// `O(M(n))`), so the whole GCD costs `O(M(n)·log n)`. The residual small
-    /// pair is finished with [`Nat::gcd_lehmer`]. Precondition: both non-zero.
+    /// Subquadratic GCD: a Lehmer-style loop driven by the recursive Half-GCD.
+    /// Each iteration reduces `(a, b)` by a Half-GCD of its top part
+    /// ([`hgcd_reduce_top`]) to a consecutive remainder pair a constant
+    /// fraction shorter, in `O(M(n)·log n)`, so the whole GCD costs
+    /// `O(M(n)·log² n)` at worst. The residual small pair is finished with
+    /// [`Nat::gcd_lehmer`]. Precondition: both non-zero.
     fn gcd_hgcd(&self, rhs: &Nat) -> Nat {
         // The Half-GCD path carries an always-on correctness guard. If it ever
         // trips (a latent reduction bug), fall back to the trusted Lehmer GCD so
@@ -2874,11 +3221,16 @@ impl Nat {
                 a = core::mem::replace(&mut b, r);
                 continue;
             }
-            let (r, va, vb) = hgcd(&a, &b);
-            // Always-on guard: `det R = ±1` and `(va, vb) = R·(a, b)` prove this
-            // reduction preserved the gcd. If it fails, bail so the caller falls
-            // back to the trusted Lehmer GCD (a wrong result cannot escape).
-            if !hgcd_reduction_ok(&r, &a, &b, &va, &vb) {
+            let k = a.bit_len() * HGCD_SPLIT_NUM / HGCD_SPLIT_DEN;
+            let Some((r, va, vb)) = hgcd_reduce_top(&a, &b, k) else {
+                let (_, r) = a.div_rem(&b).expect("b is non-zero");
+                a = core::mem::replace(&mut b, r);
+                continue;
+            };
+            // Always-on guard: `det R = ±1` and `(va, vb) = R·(a, b)` (checked
+            // on residues) mean this reduction preserved the gcd. If it fails,
+            // bail so the caller falls back to the trusted Lehmer GCD.
+            if !hgcd_reduction_ok_fast(&r, &a, &b, &va, &vb) {
                 return None;
             }
             if vb.bit_len() >= b.bit_len() {
@@ -2905,82 +3257,102 @@ impl Nat {
     }
 
     /// Extended GCD via the Half-GCD driver, on non-negative operands. Returns
-    /// `(g, x, y)` with `g = self·x + rhs·y`, `g = gcd(self, rhs) ≥ 0`.
+    /// `(g, x)` with `g = gcd(self, rhs) ≥ 0` and `x·self ≡ g (mod rhs)`.
     ///
     /// Uses the production floor ([`HGCD_EXTGCD_FLOOR`]): the Half-GCD reductions
     /// run until the smaller operand drops below it, then the residual is
-    /// finished with exact Euclidean steps. Returns `None` if the always-on
-    /// per-reduction guard trips, so the caller can fall back to plain Euclid.
+    /// finished by the extended Lehmer loop. Returns `None` if a guard trips,
+    /// so the caller can fall back to the trusted Lehmer loop.
     ///
     /// The cofactor `x` is *a* valid Bézout coefficient — when `g = 1` it is the
     /// unique modular inverse mod `rhs`, which is all [`Int::modinv`] needs. It
-    /// is **not** guaranteed to be the minimal pair plain extended Euclid
-    /// returns: when `gcd(self, rhs) > 1` the Half-GCD's unimodular matrix may
-    /// differ from Euclid's partial-quotient product by a kernel term (still
-    /// `det = ±1`), so this must not back a bit-identical [`Int::extended_gcd`].
-    pub(crate) fn extgcd_hgcd(&self, rhs: &Nat) -> Option<(Nat, Int, Int)> {
+    /// is **not** guaranteed to be the minimal one plain extended Euclid
+    /// returns, so [`Int::extended_gcd`] reduces it to the canonical cofactor.
+    pub(crate) fn extgcd_hgcd(&self, rhs: &Nat) -> Option<(Nat, Int)> {
         self.extgcd_hgcd_floor(rhs, HGCD_EXTGCD_FLOOR)
     }
 
-    /// [`Nat::extgcd_hgcd`] with an explicit limb `floor`. The accumulated
-    /// cofactor matrix `R` (invariant `(u, v) = R·(self, rhs)`) is a product of
-    /// elementary Euclidean quotient matrices `E(q)`, so `g = R.a·self + R.b·rhs`
-    /// is an exact Bézout identity. The `floor` seam lets the differential tests
-    /// force the Half-GCD path (and its full recursion) on medium operands where
-    /// a plain-Euclid oracle is cheap. Precondition: none (handles zero, equal
-    /// and unordered operands).
-    pub(crate) fn extgcd_hgcd_floor(&self, rhs: &Nat, floor: usize) -> Option<(Nat, Int, Int)> {
+    /// [`Nat::extgcd_hgcd`] with an explicit limb `floor`. Only `self`'s
+    /// cofactor column is tracked: with `(u, v) ≡ (s0, s1)·self (mod rhs)`,
+    /// each reduction `(u, v) ← R·(u, v)` maps `(s0, s1) ← R·(s0, s1)` (four
+    /// products instead of a full matrix product). The `floor` seam lets the
+    /// differential tests force the Half-GCD path (and its full recursion) on
+    /// medium operands where a plain-Euclid oracle is cheap. Handles zero,
+    /// equal and unordered operands.
+    pub(crate) fn extgcd_hgcd_floor(&self, rhs: &Nat, floor: usize) -> Option<(Nat, Int)> {
+        if rhs.is_zero() {
+            return Some((self.clone(), Int::ONE));
+        }
+        if self.is_zero() {
+            return Some((rhs.clone(), Int::ZERO));
+        }
         let floor = floor.max(3);
-        // Invariant throughout: (u, v) = R·(self, rhs), with R a product of
-        // elementary matrices E(q) = [[0,1],[1,-q]] (so det R = ±1), matching
-        // plain extended Euclid's accumulated cofactor matrix step for step.
-        let mut r = HgcdMat::identity();
         let mut u = self.clone();
         let mut v = rhs.clone();
-        // Plain Euclid's first step, when self < rhs, is q = 0 (a swap); mirror
-        // it so the accumulated matrix agrees from the very first factor.
+        // Invariant: (u, v) = (s0, s1)·self + (t0, t1)·rhs. The `t` column is
+        // tracked only by residues ([`GuardRes`]), enough to verify the final
+        // Bézout identity in O(n) instead of a full product and division.
+        let (mut s0, mut s1) = (Int::ONE, Int::ZERO);
+        let (mut t0, mut t1) = (GuardRes::ZERO, GuardRes::ONE);
         if u.cmp_ref(&v) == Ordering::Less {
-            hgcd_step_nat(&mut r, &mut u, &mut v);
+            core::mem::swap(&mut u, &mut v);
+            core::mem::swap(&mut s0, &mut s1);
+            core::mem::swap(&mut t0, &mut t1);
         }
         while v.limbs.len() >= floor {
             let h = u.bit_len().div_ceil(2);
-            // Unbalanced (Half-GCD a no-op) or equal operands (`hgcd` needs
-            // `u > v` strictly): one exact Euclidean step makes progress.
-            if v.bit_len() <= h || u.cmp_ref(&v) != Ordering::Greater {
-                hgcd_step_nat(&mut r, &mut u, &mut v);
+            let reduced = if v.bit_len() <= h || u.cmp_ref(&v) != Ordering::Greater {
+                None
+            } else {
+                hgcd_reduce_top(&u, &v, u.bit_len() * HGCD_SPLIT_NUM / HGCD_SPLIT_DEN)
+            };
+            let Some((rc, va, vb)) = reduced else {
+                // Unbalanced, equal, or no top-part progress: one exact
+                // Euclidean step.
+                let (q, r) = u.div_rem(&v).expect("v is non-zero");
+                u = core::mem::replace(&mut v, r);
+                let qr = GuardRes::of_nat(&q);
+                let ns1 = s0.sub(&s1.mul(&Int::from(q)));
+                s0 = core::mem::replace(&mut s1, ns1);
+                let nt1 = t0.sub(t1.mul(qr));
+                t0 = core::mem::replace(&mut t1, nt1);
                 continue;
-            }
-            let (rc, va, vb) = hgcd(&u, &v);
-            // Always-on guard: `det rc = ±1` and `(va, vb) = rc·(u, v)`. A wrong
-            // reduction can never reach a Bézout cofactor — bail and let the
-            // caller fall back to the trusted Euclidean loop.
-            if !hgcd_reduction_ok(&rc, &u, &v, &va, &vb) {
+            };
+            // Always-on guard (residues of `det rc = ±1`, `(va, vb) = rc·(u, v)`):
+            // bail to the trusted Lehmer loop if it trips.
+            if !hgcd_reduction_ok_fast(&rc, &u, &v, &va, &vb) {
                 return None;
             }
-            if vb.bit_len() >= v.bit_len() {
-                // Defensive: force progress if a level somehow made none.
-                hgcd_step_nat(&mut r, &mut u, &mut v);
-            } else {
-                r = rc.mul(&r);
-                u = va;
-                v = vb;
-            }
+            (s0, s1) = rc.mul_vec(&s0, &s1);
+            let (ra, rb, rcc, rd) = (
+                GuardRes::of_int(&rc.a),
+                GuardRes::of_int(&rc.b),
+                GuardRes::of_int(&rc.c),
+                GuardRes::of_int(&rc.d),
+            );
+            (t0, t1) = (ra.mul(t0).add(rb.mul(t1)), rcc.mul(t0).add(rd.mul(t1)));
+            u = va;
+            v = vb;
         }
-        // Finish the small residual with exact Euclidean steps, still folding
-        // each quotient into the cofactor matrix.
-        while !v.is_zero() {
-            hgcd_step_nat(&mut r, &mut u, &mut v);
-        }
-        // (u, 0) = R·(self, rhs)  ⇒  g = u = R.a·self + R.b·rhs, with R.a, R.b
-        // the identical (minimal Euclidean) Bézout cofactors. Guard against a
-        // stray sign/bookkeeping slip the per-reduction check would not catch.
-        let check =
-            r.a.mul(&Int::from(self.clone()))
-                .add(&r.b.mul(&Int::from(rhs.clone())));
-        if check != Int::from(u.clone()) {
+        let (g, x, t) = if v.is_zero() {
+            (u, s0, t0)
+        } else {
+            // g = x'·u + y'·v  ⇒  g = (x'·s0 + y'·s1)·self + (x'·t0 + y'·t1)·rhs.
+            let (g, xp, yp) = u.extgcd_lehmer_full(&v);
+            let t = GuardRes::of_int(&xp)
+                .mul(t0)
+                .add(GuardRes::of_int(&yp).mul(t1));
+            (g, xp.mul(&s0).add(&yp.mul(&s1)), t)
+        };
+        // Always-on final check of the Bézout identity g = x·self + t·rhs on
+        // residues (a slip in the cofactor bookkeeping cannot pass unnoticed).
+        let lhs = GuardRes::of_int(&x)
+            .mul(GuardRes::of_nat(self))
+            .add(t.mul(GuardRes::of_nat(rhs)));
+        if lhs != GuardRes::of_nat(&g) {
             return None;
         }
-        Some((u, r.a, r.b))
+        Some((g, x))
     }
 
     /// Stein's binary GCD (no division). Precondition: both operands non-zero.
@@ -3009,54 +3381,47 @@ impl Nat {
         u.shl(shift)
     }
 
-    /// Lehmer's GCD (Knuth TAOCP §4.5.2, Algorithm L): use the leading words to
-    /// derive a 2×2 cofactor matrix in machine precision, then apply it to the
-    /// full operands, doing far fewer multi-precision divisions than plain
-    /// Euclid. Large operands run the partial Euclid on a double-word window
-    /// (~63 bits stripped per pass instead of ~31, halving the full-length
-    /// matrix applications). Precondition: both operands non-zero.
+    /// Lehmer's GCD (Knuth TAOCP §4.5.2, Algorithm L) with Jebelean's exact
+    /// quotient condition: the leading 128 bits yield a single-limb cofactor
+    /// matrix ([`lehmer_mat`], ~64 bits per pass), applied to both operands in
+    /// place ([`lehmer_apply`]) — no allocation per pass. A pass that cannot
+    /// certify a quotient (a huge quotient) takes one full division instead.
+    /// Precondition: both operands non-zero.
     fn gcd_lehmer(&self, rhs: &Nat) -> Nat {
-        let mut u = self.clone();
-        let mut v = rhs.clone();
-        if u.cmp_ref(&v) == Ordering::Less {
-            core::mem::swap(&mut u, &mut v);
-        }
-        while v.limbs.len() > 1 {
-            // Leading bits of u, and of v at the same alignment.
-            let (a, b, c, d) = if v.limbs.len() >= LEHMER_DW_LIMBS {
-                let shift = u.bit_len() - 126; // v ≥ 3 limbs, so u.bit_len() > 128
-                lehmer_step128(shifted_window(&u, shift), shifted_window(&v, shift))
+        let (big, small) = if self.cmp_ref(rhs) == Ordering::Less {
+            (rhs, self)
+        } else {
+            (self, rhs)
+        };
+        let mut u = big.limbs.clone();
+        let mut v = Vec::with_capacity(u.len());
+        v.extend_from_slice(&small.limbs);
+        v.resize(u.len(), 0);
+        let mut n = u.len();
+        loop {
+            // Invariant: u[..n] ≥ v[..n], u[n-1] ≠ 0.
+            let vn = sig_len(&v, n);
+            if vn == 0 {
+                u.truncate(n);
+                return Nat { limbs: u };
+            }
+            if n <= 2 {
+                return Nat::from_u128(u128_gcd_euclid(limbs_u128(&u[..n]), limbs_u128(&v[..n])));
+            }
+            let m = if vn + 1 >= n {
+                let s = u[n - 1].leading_zeros();
+                lehmer_mat(top128(&u, n, s), top128(&v, n, s), 0)
             } else {
-                let shift = u.bit_len().saturating_sub(63);
-                lehmer_step64(
-                    shifted_window(&u, shift) as u64,
-                    shifted_window(&v, shift) as u64,
-                )
+                None
             };
-
-            if b == 0 {
-                // No machine-precision progress: one full division step.
-                let (_, r) = u.div_rem(&v).expect("v is non-zero");
-                u = core::mem::replace(&mut v, r);
+            if let Some(m) = m {
+                lehmer_apply(&mut u[..n], &mut v[..n], &m);
+                n = sig_len(&u, n);
+                debug_assert!(cmp_limbs(&u[..n], &v[..sig_len(&v, n)]) == Ordering::Greater);
             } else {
-                // Apply the matrix to the full operands (result stays positive),
-                // borrowing `u`/`v` rather than cloning them into `Int`.
-                let nu = lincomb_pos(a, &u, b, &v);
-                let nv = lincomb_pos(c, &u, d, &v);
-                u = nu;
-                v = nv;
-                if u.cmp_ref(&v) == Ordering::Less {
-                    core::mem::swap(&mut u, &mut v);
-                }
+                n = lehmer_div_step(&mut u, &mut v, n, vn).0;
             }
         }
-        // v now fits a single limb: finish in machine words.
-        if v.is_zero() {
-            return u;
-        }
-        let vr = v.limbs[0];
-        let ur = u.divmod_small(vr).1;
-        Nat::from_u64(u64_gcd(vr, ur))
     }
 
     /// Returns `(g, x)` with `g = gcd(self, rhs)` and `x·self ≡ g (mod rhs)`
@@ -3064,7 +3429,7 @@ impl Nat {
     /// operands and Lehmer's algorithm otherwise. Precondition: both non-zero.
     pub(crate) fn extgcd_cofactor(&self, rhs: &Nat) -> (Nat, Int) {
         if self.limbs.len().min(rhs.limbs.len()) >= HGCD_MODINV_THRESHOLD
-            && let Some((g, x, _)) = self.extgcd_hgcd(rhs)
+            && let Some((g, x)) = self.extgcd_hgcd(rhs)
         {
             return (g, x);
         }
@@ -3074,68 +3439,123 @@ impl Nat {
     /// Extended Lehmer GCD: returns `(g, x)` with `g = gcd(self, rhs)` and
     /// `x·self ≡ g (mod rhs)` — *a* Bézout cofactor of `self`, not normalized.
     /// Only `self`'s cofactor is tracked (the caller recovers the other with
-    /// one exact division), applying each scalar Lehmer matrix to the full
-    /// operands and to the cofactor pair. Precondition: both non-zero.
+    /// one exact division). The cofactor pair alternates in sign exactly like
+    /// the Euclidean matrix rows, so only its magnitudes are stored (plus a
+    /// parity bit) and every Lehmer matrix is applied to them as a non-negative
+    /// matrix, in place. Precondition: both non-zero.
     pub(crate) fn extgcd_lehmer(&self, rhs: &Nat) -> (Nat, Int) {
+        let (g, x, _) = self.extgcd_lehmer_impl::<false>(rhs);
+        (g, x)
+    }
+
+    /// Extended Lehmer GCD tracking both cofactors: `(g, x, y)` with
+    /// `g = x·self + y·rhs`, the cofactors being exactly those of the plain
+    /// extended Euclidean algorithm (Lehmer's certified matrices reproduce its
+    /// quotient sequence). Precondition: both non-zero.
+    pub(crate) fn extgcd_lehmer_full(&self, rhs: &Nat) -> (Nat, Int, Int) {
+        self.extgcd_lehmer_impl::<true>(rhs)
+    }
+
+    /// Body of [`Nat::extgcd_lehmer`] / [`Nat::extgcd_lehmer_full`]; `rhs`'s
+    /// cofactor is tracked (and returned, else zero) only when `BOTH`.
+    fn extgcd_lehmer_impl<const BOTH: bool>(&self, rhs: &Nat) -> (Nat, Int, Int) {
         debug_assert!(!self.is_zero() && !rhs.is_zero());
-        // Invariants: u ≡ x0·self, v ≡ x1·self (mod rhs).
-        let mut u = self.clone();
-        let mut v = rhs.clone();
-        let (mut x0, mut x1) = (Int::ONE, Int::ZERO);
-        if u.cmp_ref(&v) == Ordering::Less {
-            core::mem::swap(&mut u, &mut v);
-            core::mem::swap(&mut x0, &mut x1);
-        }
-        let lin = |a: i128, x: &Int, b: i128, y: &Int| -> Int {
-            let mut r = x.mul(&Int::from_i128(a));
-            r += &y.mul(&Int::from_i128(b));
-            r
+        // Invariants: u = ±(s0·self − t0·rhs), v = ∓(s1·self − t1·rhs) — the
+        // signed cofactor matrix [[s0, t0], [s1, t1]] has a checkerboard sign
+        // pattern: s0 ≥ 0, s1 ≤ 0 when `odd` is false, the reverse when true,
+        // and each t opposite to its s. Only magnitudes are stored.
+        let swapped = self.cmp_ref(rhs) == Ordering::Less;
+        let (big, small) = if swapped { (rhs, self) } else { (self, rhs) };
+        let mut u = big.limbs.clone();
+        let mut v = Vec::with_capacity(u.len());
+        v.extend_from_slice(&small.limbs);
+        v.resize(u.len(), 0);
+        let mut n = u.len();
+        // Initial matrix: identity, or after Euclid's q = 0 swap step
+        // [[0, 1], [1, 0]] with odd parity.
+        // Cofactor magnitudes never exceed the smaller operand (plus the
+        // transient carry limbs), so one up-front capacity avoids regrowth.
+        let cap = small.limbs.len() + 3;
+        let cof = |bit: bool| {
+            let mut w = Vec::with_capacity(cap);
+            w.push(Limb::from(bit));
+            w
         };
-        while v.limbs.len() > 1 {
-            let (a, b, c, d) = if v.limbs.len() >= LEHMER_DW_LIMBS {
-                let shift = u.bit_len() - 126;
-                lehmer_step128(shifted_window(&u, shift), shifted_window(&v, shift))
-            } else {
-                let shift = u.bit_len().saturating_sub(63);
-                lehmer_step64(
-                    shifted_window(&u, shift) as u64,
-                    shifted_window(&v, shift) as u64,
-                )
-            };
-            if b == 0 {
-                let (q, r) = u.div_rem(&v).expect("v is non-zero");
-                u = core::mem::replace(&mut v, r);
-                let nx = x0.sub(&x1.mul(&Int::from(q)));
-                x0 = core::mem::replace(&mut x1, nx);
-            } else {
-                let nu = lincomb_pos(a, &u, b, &v);
-                let nv = lincomb_pos(c, &u, d, &v);
-                let nx0 = lin(a, &x0, b, &x1);
-                let nx1 = lin(c, &x0, d, &x1);
-                (u, v, x0, x1) = (nu, nv, nx0, nx1);
-                if u.cmp_ref(&v) == Ordering::Less {
-                    core::mem::swap(&mut u, &mut v);
-                    core::mem::swap(&mut x0, &mut x1);
+        let mut s0 = cof(!swapped);
+        let mut s1 = cof(swapped);
+        let (mut t0, mut t1) = if BOTH {
+            (cof(swapped), cof(!swapped))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut odd = swapped;
+        loop {
+            let vn = sig_len(&v, n);
+            if vn == 0 {
+                break;
+            }
+            if n <= 2 {
+                // Exact word-size Euclid, folded into the cofactors in
+                // single-limb matrix chunks.
+                let (mut x, mut y) = (limbs_u128(&u[..n]), limbs_u128(&v[..n]));
+                while y != 0 {
+                    let (m, nx, ny) = euclid_mat_u128(x, y);
+                    if let Some(m) = m {
+                        lehmer_cofactor_apply(&mut s0, &mut s1, &m);
+                        if BOTH {
+                            lehmer_cofactor_apply(&mut t0, &mut t1, &m);
+                        }
+                        odd ^= m.odd;
+                        (x, y) = (nx, ny);
+                    } else {
+                        let q = x / y;
+                        (x, y) = (y, x - q * y);
+                        let q = Nat::from_u128(q);
+                        lehmer_cofactor_div(&mut s0, &mut s1, &q);
+                        if BOTH {
+                            lehmer_cofactor_div(&mut t0, &mut t1, &q);
+                        }
+                        odd = !odd;
+                    }
                 }
+                u.clear();
+                u.extend_from_slice(&Nat::from_u128(x).limbs);
+                n = u.len();
+                break;
+            }
+            let m = if vn + 1 >= n {
+                let s = u[n - 1].leading_zeros();
+                lehmer_mat(top128(&u, n, s), top128(&v, n, s), 0)
+            } else {
+                None
+            };
+            if let Some(m) = m {
+                lehmer_apply(&mut u[..n], &mut v[..n], &m);
+                lehmer_cofactor_apply(&mut s0, &mut s1, &m);
+                if BOTH {
+                    lehmer_cofactor_apply(&mut t0, &mut t1, &m);
+                }
+                odd ^= m.odd;
+                n = sig_len(&u, n);
+            } else {
+                let (nn, q) = lehmer_div_step(&mut u, &mut v, n, vn);
+                n = nn;
+                lehmer_cofactor_div(&mut s0, &mut s1, &q);
+                if BOTH {
+                    lehmer_cofactor_div(&mut t0, &mut t1, &q);
+                }
+                odd = !odd;
             }
         }
-        if v.is_zero() {
-            return (u, x0);
-        }
-        // One division brings both into a single limb, then finish with a
-        // machine-word Euclid accumulating the matrix (entries ≤ 2^64 in size).
-        let vr = v.limbs[0];
-        let (q, ur) = u.divmod_small(vr);
-        let nx = x0.sub(&x1.mul(&Int::from(q)));
-        x0 = core::mem::replace(&mut x1, nx);
-        let (mut p, mut r) = (vr, ur);
-        let (mut a, mut b, mut c, mut d) = (1i128, 0i128, 0i128, 1i128);
-        while r != 0 {
-            let q = (p / r) as i128;
-            (a, b, c, d) = (c, d, a - q * c, b - q * d);
-            (p, r) = (r, p % r);
-        }
-        (Nat::from_u64(p), lin(a, &x0, b, &x1))
+        u.truncate(n);
+        let signed = |mag: Vec<Limb>, neg: bool| {
+            let mut x = Nat { limbs: mag };
+            x.normalize();
+            Int::from_sign_magnitude(if neg { Sign::Negative } else { Sign::Positive }, x)
+        };
+        let x = signed(s0, odd);
+        let y = if BOTH { signed(t0, !odd) } else { Int::ZERO };
+        (Nat { limbs: u }, x, y)
     }
 
     /// Returns bit `i` (0 = least significant), or `false` past the top.
@@ -6374,6 +6794,161 @@ mod tests {
         assert_eq!(a.gcd_lehmer(&b), common);
     }
 
+    /// Structured operand pairs that stress the double-word Lehmer pass:
+    /// huge quotients (uncertifiable windows), identical leading words,
+    /// Fibonacci neighbours (all quotients 1), powers of two, near-equal
+    /// operands and planted common factors, across 1–70 limbs.
+    fn lehmer_structured_pairs(next: &mut dyn FnMut() -> u64) -> Vec<(Nat, Nat)> {
+        let build = |cnt: usize, f: &mut dyn FnMut() -> u64| {
+            let limbs: Vec<Limb> = (0..cnt).map(|_| f()).collect();
+            Nat::from_limbs(&limbs)
+        };
+        let mut out = Vec::new();
+        for la in [1usize, 2, 3, 4, 5, 8, 17, 33, 70] {
+            for lb in [1usize, 2, 3, 4, 9, 33, 70] {
+                let a = build(la, next);
+                let b = build(lb, next);
+                out.push((a.clone(), b.clone()));
+                // Huge first quotient: a·2^k + small.
+                out.push((b.shl(64 * la as u64 + 5).add(&a), b.clone()));
+                // Shared leading words, different tails.
+                let top = build(3, next).shl(64 * la as u64);
+                out.push((top.add(&a), top.add(&build(la, next))));
+                // Near-equal.
+                out.push((a.add(&Nat::one()), a.clone()));
+                // Planted common factor (gcd > 1).
+                let f = build(1 + lb / 3, next);
+                out.push((a.mul(&f), b.mul(&f)));
+                // Power-of-two content on both.
+                out.push((a.shl(70), b.shl(130)));
+            }
+        }
+        // Consecutive Fibonacci numbers of several sizes.
+        let (mut f0, mut f1) = (Nat::zero(), Nat::one());
+        for i in 0..3000 {
+            let f2 = f0.add(&f1);
+            f0 = core::mem::replace(&mut f1, f2);
+            if i % 250 == 7 {
+                out.push((f1.clone(), f0.clone()));
+            }
+        }
+        out.retain(|(a, b)| !a.is_zero() && !b.is_zero());
+        out
+    }
+
+    #[test]
+    fn lehmer_structured_matches_binary_gcd() {
+        let mut next = hgcd_rng(0x0bad_cafe_1234_5678);
+        for (a, b) in lehmer_structured_pairs(&mut next) {
+            let g = a.gcd_binary(&b);
+            assert_eq!(a.gcd_lehmer(&b), g, "gcd_lehmer {a:?} {b:?}");
+            assert_eq!(b.gcd_lehmer(&a), g, "gcd_lehmer swapped");
+            assert_eq!(a.gcd(&b), g, "dispatched gcd");
+        }
+    }
+
+    #[test]
+    fn extgcd_lehmer_matches_euclid_cofactors() {
+        // The extended Lehmer loop must reproduce plain extended Euclid's
+        // (minimal) cofactors exactly, for both orders and gcd > 1.
+        let mut next = hgcd_rng(0x5eed_e47e_0dd5_0001);
+        let mut pairs = lehmer_structured_pairs(&mut next);
+        for _ in 0..300 {
+            let la = 1 + (next() % 40) as usize;
+            let lb = 1 + (next() % 40) as usize;
+            let a = hgcd_build(la, &mut next);
+            let b = hgcd_build(lb, &mut next);
+            if !a.is_zero() && !b.is_zero() {
+                pairs.push((a, b));
+            }
+        }
+        for (a, b) in pairs {
+            let (ai, bi) = (Int::from(a.clone()), Int::from(b.clone()));
+            let (eg, ex, ey) = ai.extended_gcd_euclid(&bi);
+            let (g, x, y) = a.extgcd_lehmer_full(&b);
+            assert_eq!(Int::from(g.clone()), eg, "g");
+            assert_eq!((&x, &y), (&ex, &ey), "cofactors {a:?} {b:?}");
+            let (g1, x1) = a.extgcd_lehmer(&b);
+            assert_eq!((g1, x1), (g, x), "single-cofactor variant");
+        }
+    }
+
+    #[test]
+    fn int_extended_gcd_structured_matches_euclid() {
+        // Exercises the tracked-cofactor fast path and its normalization
+        // fallback (gcd > 1, |b| = 2g, ...) for every sign combination.
+        let mut next = hgcd_rng(0x1e47_0000_5eed_0002);
+        let mut pairs = lehmer_structured_pairs(&mut next);
+        pairs.push((Nat::from_u64(6), Nat::from_u64(4)));
+        pairs.push((Nat::from_u64(2), Nat::from_u64(7)));
+        pairs.push((Nat::from_u64(10), Nat::from_u64(4)));
+        for (a, b) in pairs {
+            for (sa, sb) in [(1i64, 1i64), (-1, 1), (1, -1), (-1, -1)] {
+                let ai = Int::from(a.clone()).mul(&Int::from_i64(sa));
+                let bi = Int::from(b.clone()).mul(&Int::from_i64(sb));
+                assert_eq!(
+                    ai.extended_gcd(&bi),
+                    ai.extended_gcd_euclid(&bi),
+                    "{ai:?} {bi:?}"
+                );
+                assert_eq!(
+                    bi.extended_gcd(&ai),
+                    bi.extended_gcd_euclid(&ai),
+                    "{bi:?} {ai:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lehmer_divrem_matches_native() {
+        let mut next = hgcd_rng(0x0123_4567_89ab_cdef);
+        for i in 0..200_000u32 {
+            let x = ((next() as u128) << 64 | next() as u128) >> (next() % 128);
+            let y = ((next() as u128) << 64 | next() as u128) >> (next() % 128);
+            let (x, y) = if x >= y { (x, y) } else { (y, x) };
+            if y == 0 {
+                continue;
+            }
+            // Bias some cases towards small quotients and near-full words.
+            let y = if i % 3 == 0 {
+                (x >> (1 + next() % 6)).max(1)
+            } else {
+                y
+            };
+            assert_eq!(lehmer_divrem(x, y), (x / y, x % y), "{x} / {y}");
+        }
+    }
+
+    #[test]
+    fn hgcd_fast_guard_rejects_corruption() {
+        let mut next = hgcd_rng(0x9a4d_0000_0000_0001);
+        for _ in 0..50 {
+            let m = hgcd_build(12, &mut next);
+            let n = hgcd_build(11, &mut next);
+            let (m, n) = if m > n { (m, n) } else { (n, m) };
+            let (r, va, vb) = hgcd(&m, &n);
+            assert!(hgcd_reduction_ok_fast(&r, &m, &n, &va, &vb));
+            assert!(!hgcd_reduction_ok_fast(
+                &r,
+                &m,
+                &n,
+                &va.add(&Nat::one()),
+                &vb
+            ));
+            assert!(!hgcd_reduction_ok_fast(
+                &r,
+                &m,
+                &n,
+                &va,
+                &vb.add(&Nat::one().shl(300))
+            ));
+            let mut bad = r.clone();
+            bad.a = bad.a.add(&Int::ONE);
+            assert!(!hgcd_reduction_ok_fast(&bad, &m, &n, &va, &vb));
+        }
+    }
+
     // Deterministic xorshift helper for the Half-GCD tests.
     fn hgcd_rng(mut state: u64) -> impl FnMut() -> u64 {
         move || {
@@ -6501,7 +7076,7 @@ mod tests {
     #[test]
     fn hgcd_base_boundary_real() {
         // The real 128-limb base: sizes straddling it so both the base case
-        // (with the 126-bit Lehmer window + lincomb_pos) and one recursion level
+        // (with the in-place double-word Lehmer pass) and one recursion level
         // are exercised, checked bit-for-bit against Lehmer.
         let mut next = hgcd_rng(0xa5a5_5a5a_c3c3_3c3c);
         for _ in 0..24 {
@@ -6717,7 +7292,7 @@ mod tests {
 
         // Consecutive Fibonacci numbers are coprime (worst case for Euclid).
         let (mut f0, mut f1) = (Nat::zero(), Nat::one());
-        for _ in 0..12000 {
+        for _ in 0..40000 {
             let f2 = f0.add(&f1);
             f0 = core::mem::replace(&mut f1, f2);
         }
@@ -6999,6 +7574,16 @@ mod tests {
         Some(x.rem_euclid(&Int::from(m.clone())).magnitude())
     }
 
+    /// `x·a ≡ g (mod b)`, or `x·a = g` exactly when `b = 0`.
+    fn bezout_cofactor_ok(a: &Nat, b: &Nat, g: &Nat, x: &Int) -> bool {
+        let d = x.mul(&Int::from(a.clone())).sub(&Int::from(g.clone()));
+        if b.is_zero() {
+            d.is_zero()
+        } else {
+            d.rem_euclid(&Int::from(b.clone())).is_zero()
+        }
+    }
+
     /// Half-GCD extended-GCD driver invariants, on non-negative operands, with
     /// the recursion base shrunk so tiny inputs still drive the full recursion.
     /// The Bézout cofactor need not be Euclid's minimal one (the Half-GCD matrix
@@ -7021,14 +7606,11 @@ mod tests {
                     a = a.mul(&g);
                     b = b.mul(&g);
                 }
-                let (g, x, y) = a
+                let (g, x) = a
                     .extgcd_hgcd_floor(&b, 3)
                     .expect("extgcd guard tripped — cofactor invariant violated");
-                // Exact Bézout identity g = a·x + b·y.
-                let lhs = x
-                    .mul(&Int::from(a.clone()))
-                    .add(&y.mul(&Int::from(b.clone())));
-                assert_eq!(lhs, Int::from(g.clone()), "iter {iter}: Bézout");
+                // Bézout congruence x·a ≡ g (mod b) (equality when b = 0).
+                assert!(bezout_cofactor_ok(&a, &b, &g, &x), "iter {iter}: Bézout");
                 // g is the true gcd (independent Lehmer oracle).
                 let expect_g = if b.is_zero() {
                     a.clone()
@@ -7071,11 +7653,8 @@ mod tests {
             let big = |c: usize, f: &mut dyn FnMut() -> u64| hgcd_build(c, f);
             // Every structured pair must satisfy the driver's guarantees.
             let check = |a: &Nat, b: &Nat| {
-                let (g, x, y) = a.extgcd_hgcd_floor(b, 3).expect("guard");
-                let lhs = x
-                    .mul(&Int::from(a.clone()))
-                    .add(&y.mul(&Int::from(b.clone())));
-                assert_eq!(lhs, Int::from(g.clone()), "Bézout");
+                let (g, x) = a.extgcd_hgcd_floor(b, 3).expect("guard");
+                assert!(bezout_cofactor_ok(a, b, &g, &x), "Bézout");
                 let expect_g = if b.is_zero() {
                     a.clone()
                 } else if a.is_zero() {
@@ -7122,7 +7701,6 @@ mod tests {
 
     #[test]
     fn modinv_dispatch_matches_euclid() {
-        use crate::int::Sign;
         // Exercise the *public* `Int::modinv` at the production threshold so real
         // dispatch runs the Half-GCD driver; must be bit-identical to Euclid, for
         // every sign combination of `a` and `modulus`.

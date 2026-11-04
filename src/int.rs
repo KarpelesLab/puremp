@@ -902,10 +902,11 @@ impl Int {
     /// or `|b| = 2g`, `y = sgn(b)` when `self = 0` or `|self| = 2g`, and
     /// `(0, 0, 0)` for `self = b = 0`.
     ///
-    /// Any Bézout pair is reduced to that canonical one, so the work is done
-    /// by Lehmer's algorithm (and the subquadratic Half-GCD driver on large
-    /// operands), tracking only `self`'s cofactor; `y` then follows from one
-    /// exact division.
+    /// The work is done by Lehmer's algorithm, whose cofactors are plain
+    /// extended Euclid's (already canonical in the common case), or on large
+    /// operands by the subquadratic Half-GCD driver tracking only `self`'s
+    /// cofactor, which is reduced to the canonical one; `y` then follows from
+    /// one exact division.
     pub fn extended_gcd(&self, b: &Int) -> (Int, Int, Int) {
         let (sa, sb) = (self.signum(), b.signum());
         let (ma, mb) = (self.magnitude_ref(), b.magnitude_ref());
@@ -915,7 +916,29 @@ impl Int {
         if sa == 0 || ma == mb {
             return (b.abs(), Int::ZERO, Int::from_i64(sb as i64));
         }
+        // Below the Half-GCD threshold, Lehmer reproduces plain extended
+        // Euclid's cofactors, which are already canonical whenever
+        // 2·|x| < |b|/g (always so for coprime operands, bar tiny edge cases):
+        // then `y` is the tracked one and no normalization is needed. That
+        // canonical pair is unique, so the output is identical either way.
+        if ma.as_limbs().len().min(mb.as_limbs().len()) < crate::nat::HGCD_MODINV_THRESHOLD {
+            let (g, x, y) = ma.extgcd_lehmer_full(&mb);
+            if g.is_one() && x.magnitude_ref().shl(1) < *mb {
+                let x = if sa < 0 { -x } else { x };
+                let y = if sb < 0 { -y } else { y };
+                return (Int::from(g), x, y);
+            }
+            return Self::extended_gcd_normalize(self, b, g, x);
+        }
         let (g, x) = ma.extgcd_cofactor(&mb);
+        Self::extended_gcd_normalize(self, b, g, x)
+    }
+
+    /// Reduces any Bézout cofactor `x` (`x·|self| ≡ g (mod |b|)`) to the
+    /// canonical pair returned by [`Int::extended_gcd`].
+    fn extended_gcd_normalize(&self, b: &Int, g: Nat, x: Int) -> (Int, Int, Int) {
+        let sa = self.signum();
+        let mb = b.magnitude_ref();
         // x·|a| ≡ g (mod |b|): the canonical cofactor is the residue of x mod
         // m = |b|/g in (−m/2, m/2] (only m = 2 can reach m/2, the `|b| = 2g`
         // case, where it gives 1 as required).

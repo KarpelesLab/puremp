@@ -33,6 +33,14 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ### Performance
 
+- *(nat)* `Nat::mul`/`Nat::square` are 1.1–1.9× faster from ~1000 bits up:
+  an interleaved `addmul_2` basecase with short carry chains, unrolled
+  carry-flag add/sub loops, allocation-free Toom-3/Toom-3.2/Toom-4 (and
+  Toom-3/Toom-4 squaring) on limb slices with one shared scratch buffer,
+  block-split unbalanced products, radix-4 NTT butterflies, and NTT lengths
+  that wrap a few top coefficients (fixed up exactly) instead of padding to
+  the next size step; crossovers retuned (Toom-3 from ~96 limbs, NTT from
+  ~2000)
 - *(nat)* `Nat::modpow` (odd moduli) and `Nat::modpow_sec`/`Int::modpow_sec`
   use new Montgomery kernels (finely integrated product scanning, constant
   flow, no per-step allocation); `modpow` also switches to sliding windows and

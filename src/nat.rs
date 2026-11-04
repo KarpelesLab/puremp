@@ -21,18 +21,19 @@ use crate::error::{Error, Result};
 use crate::int::{Int, Sign};
 use crate::limb::{LIMB_BITS, Limb, adc, mac, sbb};
 
-// Multiplication crossovers, tuned from `measure_mul_crossovers` (see the test
-// module) and a random-operand product benchmark, with the addmul_2 schoolbook
-// loop and the allocation-free subtractive Karatsuba: Karatsuba from ~32 limbs
-// (squaring, whose schoolbook does half the products, from ~128), Toom-3 from
-// ~640, Toom-4 from ~6k.
+// Multiplication crossovers, tuned on x86-64 (Zen 5) from
+// `measure_mul_crossovers` (see the test module) and a random-operand product
+// benchmark, with the interleaved addmul_2 basecase and the allocation-free
+// slice Karatsuba/Toom ladder: Karatsuba from ~28 limbs, Toom-3 from ~96,
+// Toom-4 from ~280; squaring keeps its half-product schoolbook up to ~100
+// limbs, then Toom-3 (~100) and Toom-4 (~300) squaring.
 // The NTT hand-off is decided per-shape by `ntt_worthwhile` rather than a
-// single size threshold (see `measure_ntt_paths`); in practice it takes over
-// from roughly 800–1300 limbs, so the Toom stages mostly serve as the fallback
-// for the shapes it declines. Re-measure per platform to retune.
+// single size threshold (see `measure_ntt_paths`/`measure_ntt_unbalanced`);
+// it takes over from roughly 1800–2000 limbs. Re-measure per platform to
+// retune.
 
 /// Operands with fewer than this many limbs use schoolbook multiplication.
-const KARATSUBA_THRESHOLD: usize = 32;
+const KARATSUBA_THRESHOLD: usize = 28;
 
 /// Squarings of fewer than this many limbs use the symmetric schoolbook
 /// square. It roughly halves the limb products, so it holds out against
@@ -41,10 +42,19 @@ const KARATSUBA_THRESHOLD: usize = 32;
 const KARATSUBA_SQR_THRESHOLD: usize = 128;
 
 /// Operands with at least this many limbs use Toom-3 (above Karatsuba).
-const TOOM3_THRESHOLD: usize = 640;
+const TOOM3_THRESHOLD: usize = 96;
 
 /// Operands with at least this many limbs use Toom-4 (above Toom-3).
-const TOOM4_THRESHOLD: usize = 6000;
+const TOOM4_THRESHOLD: usize = 280;
+
+/// Squarings of at least this many limbs use Toom-3 squaring.
+const TOOM3_SQR_THRESHOLD: usize = 100;
+
+/// Squarings of at least this many limbs use Toom-4 squaring.
+const TOOM4_SQR_THRESHOLD: usize = 300;
+
+/// Products whose shorter operand has fewer limbs never use the NTT.
+const NTT_MIN_LIMBS: usize = 500;
 
 /// Number of limbs below which the Half-GCD recursion stops and reduces the
 /// pair with the in-place double-word Lehmer base case (`hgcd_base`). The
@@ -304,19 +314,147 @@ fn mp_dit_stage(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
     }
 }
 
+/// Two consecutive decimation-in-frequency stages (`len`, then `len/2`) over
+/// every `len`-point block of `a`, fused into one pass: each group of four
+/// points `j, j + q, j + 2q, j + 3q` (`q = len/4`) goes through both
+/// stages' butterflies in registers. The arithmetic is exactly that of two
+/// [`mp_dif_stage`] calls (same twiddles, same lazy bounds), with half the
+/// loads and stores. Inputs and outputs in `[0, 2p)`.
+#[inline]
+fn mp_dif_stage4(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
+    let q = len / 4;
+    let p2 = 2 * p;
+    if q == 1 {
+        // Stages 4 and 2: twiddles ω_4^0 = 1, ω_4^1 = tw[3], ω_2^0 = 1.
+        let w3 = tw[3];
+        for blk in a.as_chunks_mut::<4>().0 {
+            let [x0, x1, x2, x3] = *blk;
+            let y0 = mp_csub(x0 + x2, p2);
+            let y2 = mp_csub(x0 + p2 - x2, p2);
+            let y1 = mp_csub(x1 + x3, p2);
+            let y3 = mp_mul(x1 + p2 - x3, w3, p, pinv);
+            *blk = [
+                mp_csub(y0 + y1, p2),
+                mp_csub(y0 + p2 - y1, p2),
+                mp_csub(y2 + y3, p2),
+                mp_csub(y2 + p2 - y3, p2),
+            ];
+        }
+        return;
+    }
+    let (w1, w2) = (&tw[q..2 * q], &tw[2 * q..len]);
+    let (w2a, w2b) = w2.split_at(q);
+    for blk in a.chunks_exact_mut(len) {
+        let (b01, b23) = blk.split_at_mut(2 * q);
+        let (b0, b1) = b01.split_at_mut(q);
+        let (b2, b3) = b23.split_at_mut(q);
+        let rows = b0
+            .iter_mut()
+            .zip(b1.iter_mut())
+            .zip(b2.iter_mut())
+            .zip(b3.iter_mut());
+        let tws = w1.iter().zip(w2a).zip(w2b);
+        for ((((x0, x1), x2), x3), ((&t1, &ta), &tb)) in rows.zip(tws) {
+            let (u0, u1, u2, u3) = (*x0, *x1, *x2, *x3);
+            // Stage len: (j, j + 2q) by ω^j, (j + q, j + 3q) by ω^(j+q).
+            let y0 = mp_csub(u0 + u2, p2);
+            let y2 = mp_mul(u0 + p2 - u2, ta, p, pinv);
+            let y1 = mp_csub(u1 + u3, p2);
+            let y3 = mp_mul(u1 + p2 - u3, tb, p, pinv);
+            // Stage len/2: (j, j + q) and (j + 2q, j + 3q), both by ω_{len/2}^j.
+            *x0 = mp_csub(y0 + y1, p2);
+            *x1 = mp_mul(y0 + p2 - y1, t1, p, pinv);
+            *x2 = mp_csub(y2 + y3, p2);
+            *x3 = mp_mul(y2 + p2 - y3, t1, p, pinv);
+        }
+    }
+}
+
+/// Two consecutive decimation-in-time stages (`len/2`, then `len`) over every
+/// `len`-point block of `a`, fused into one pass (the mirror image of
+/// [`mp_dif_stage4`]): exactly the arithmetic of two [`mp_dit_stage`] calls.
+/// Inputs and outputs in `[0, 4p)`.
+#[inline]
+fn mp_dit_stage4(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
+    let q = len / 4;
+    let p2 = 2 * p;
+    // One DIT butterfly with twiddle w (y·w = −y·ω^-k, as in mp_dit_stage).
+    let bfly = |x: u64, y: u64, w: u64| {
+        let u = mp_csub(x, p2);
+        let t = mp_mul(y, w, p, pinv);
+        (u + p2 - t, u + t)
+    };
+    // Unit-twiddle butterfly (k = 0).
+    let bfly1 = |x: u64, y: u64| {
+        let u = mp_csub(x, p2);
+        let t = mp_csub(y, p2);
+        (u + t, u + p2 - t)
+    };
+    // Stage len/2 reads tw[len/2 − j] (j ≥ 1), stage len reads tw[len − k].
+    let (wh, wl) = (&tw[q + 1..2 * q], &tw[2 * q + 1..len]);
+    for blk in a.chunks_exact_mut(len) {
+        let (b01, b23) = blk.split_at_mut(2 * q);
+        let (b0, b1) = b01.split_at_mut(q);
+        let (b2, b3) = b23.split_at_mut(q);
+        // j = 0: unit twiddles in stage len/2 and for the (0, 2q) pair.
+        {
+            let (y0, y1) = bfly1(b0[0], b1[0]);
+            let (y2, y3) = bfly1(b2[0], b3[0]);
+            let (z0, z2) = bfly1(y0, y2);
+            // Pair (q, 3q) at stage len: k = q, twiddle tw[len − q].
+            let (z1, z3) = bfly(y1, y3, tw[len - q]);
+            b0[0] = z0;
+            b1[0] = z1;
+            b2[0] = z2;
+            b3[0] = z3;
+        }
+        let rows = b0[1..]
+            .iter_mut()
+            .zip(b1[1..].iter_mut())
+            .zip(b2[1..].iter_mut())
+            .zip(b3[1..].iter_mut());
+        // For j = 1..q: stage len/2 twiddle tw[2q − j] (wh reversed); stage
+        // len twiddles tw[4q − j] (wl reversed, first q − 1 entries from the
+        // top) and tw[3q − j].
+        let tws = wh
+            .iter()
+            .rev()
+            .zip(wl[q..].iter().rev())
+            .zip(wl[..q - 1].iter().rev());
+        for ((((x0, x1), x2), x3), ((&th, &ta), &tb)) in rows.zip(tws) {
+            let (y0, y1) = bfly(*x0, *x1, th);
+            let (y2, y3) = bfly(*x2, *x3, th);
+            let (z0, z2) = bfly(y0, y2, ta);
+            let (z1, z3) = bfly(y1, y3, tb);
+            *x0 = z0;
+            *x1 = z1;
+            *x2 = z2;
+            *x3 = z3;
+        }
+    }
+}
 /// Runs the DIF stages `len, len/2, …, 2` over every `len`-point block of `a`:
-/// breadth-first while blocks exceed [`MP_BLOCK`], then depth-first per block.
+/// breadth-first while blocks exceed [`MP_BLOCK`], then depth-first per block,
+/// two stages per pass ([`mp_dif_stage4`]) wherever two remain.
 fn mp_dif(a: &mut [u64], mut len: usize, tw: &[u64], p: u64, pinv: u64) {
     while len > MP_BLOCK {
-        mp_dif_stage(a, len, tw, p, pinv);
-        len /= 2;
+        if len / 2 > MP_BLOCK {
+            mp_dif_stage4(a, len, tw, p, pinv);
+            len /= 4;
+        } else {
+            mp_dif_stage(a, len, tw, p, pinv);
+            len /= 2;
+        }
     }
     if len >= 2 {
         for blk in a.chunks_exact_mut(len) {
             let mut l = len;
-            while l >= 2 {
-                mp_dif_stage(blk, l, tw, p, pinv);
-                l /= 2;
+            while l >= 4 {
+                mp_dif_stage4(blk, l, tw, p, pinv);
+                l /= 4;
+            }
+            if l == 2 {
+                mp_dif_stage(blk, 2, tw, p, pinv);
             }
         }
     }
@@ -328,20 +466,29 @@ fn mp_dit(a: &mut [u64], len: usize, tw: &[u64], p: u64, pinv: u64) {
     let blk_len = len.min(MP_BLOCK);
     if blk_len >= 2 {
         for blk in a.chunks_exact_mut(blk_len) {
-            let mut l = 2;
-            while l <= blk_len {
-                mp_dit_stage(blk, l, tw, p, pinv);
-                l *= 2;
+            // `done`: the block size the stages so far have covered.
+            let mut done = 1;
+            if blk_len.trailing_zeros() % 2 == 1 {
+                mp_dit_stage(blk, 2, tw, p, pinv);
+                done = 2;
+            }
+            while done * 4 <= blk_len {
+                mp_dit_stage4(blk, done * 4, tw, p, pinv);
+                done *= 4;
             }
         }
     }
-    let mut l = blk_len * 2;
-    while l <= len {
-        mp_dit_stage(a, l, tw, p, pinv);
-        l *= 2;
+    let mut done = blk_len;
+    while done * 2 <= len {
+        if done * 4 <= len {
+            mp_dit_stage4(a, done * 4, tw, p, pinv);
+            done *= 4;
+        } else {
+            mp_dit_stage(a, done * 2, tw, p, pinv);
+            done *= 2;
+        }
     }
 }
-
 /// Powers `ω_n^k·2^64 mod p` (`0 ≤ k < n`) of a primitive `n`-th root, for
 /// the radix-3 stage of an `n = 3m`-point transform: it reads `ω^j`, `ω^2j`
 /// and their inverses `ω^(n−j)`, `ω^(n−2j)`, and the cube roots of unity
@@ -433,14 +580,19 @@ fn mp_inverse(a: &mut [u64], tw: &[u64], pow3: &[u64], pr: &MpPrime) {
     let (y0, rest) = a.split_at_mut(m);
     let (y1, y2) = rest.split_at_mut(m);
     // As in the forward stage: canonical inputs keep every sum under 4p.
-    for j in 0..m {
-        let z0 = mp_csub(mp_csub(y0[j], 2 * p), p);
-        let z1 = mp_csub(mp_mul(y1[j], pow3[(n - j) % n], p, pinv), p);
-        let z2 = mp_csub(mp_mul(y2[j], pow3[(n - 2 * j) % n], p, pinv), p);
+    // Untwisting by ω^-j and ω^-2j reads pow3[n − j] and pow3[n − 2j]
+    // (pow3[0] for j = 0), walked downwards.
+    let inv1 = core::iter::once(&pow3[0]).chain(pow3[n - m + 1..].iter().rev());
+    let inv2 = core::iter::once(&pow3[0]).chain(pow3[n - 2 * m + 2..n - 1].iter().rev().step_by(2));
+    let rows = y0.iter_mut().zip(y1.iter_mut()).zip(y2.iter_mut());
+    for (((u0, u1), u2), (&w1, &w2)) in rows.zip(inv1.zip(inv2)) {
+        let z0 = mp_csub(mp_csub(*u0, 2 * p), p);
+        let z1 = mp_csub(mp_mul(*u1, w1, p, pinv), p);
+        let z2 = mp_csub(mp_mul(*u2, w2, p, pinv), p);
         let t = mp_mul(z1 + p - z2, w3_inv, p, pinv);
-        y0[j] = z0 + z1 + z2;
-        y1[j] = z0 + p - z2 + t;
-        y2[j] = z0 + 3 * p - z1 - t;
+        *u0 = z0 + z1 + z2;
+        *u1 = z0 + p - z2 + t;
+        *u2 = z0 + 3 * p - z1 - t;
     }
 }
 
@@ -458,6 +610,96 @@ fn mp_shape(len: usize) -> Option<usize> {
     ((pow2_part as u64) <= 1u64 << MP_MAX_LOG2).then_some(n)
 }
 
+/// Exact number of limb products [`mp_wrapped_coeffs`] spends on the top `s`
+/// coefficients of an `la × lb` product (the `u`-th from the top has
+/// `min(u + 1, la, lb)` terms).
+fn mp_wrap_products(s: usize, la: usize, lb: usize) -> usize {
+    let m = la.min(lb);
+    if s <= m {
+        s * (s + 1) / 2
+    } else {
+        m * (m + 1) / 2 + (s - m) * m
+    }
+}
+
+/// Chooses the transform length for an `la × lb` product (`len = la + lb − 1`
+/// coefficients): either the [`mp_shape`] length that holds every
+/// coefficient, or a shorter `2^k`/`3·2^k` length `n ≥ max(la, lb)` whose
+/// cyclic convolution wraps the top `len − n` coefficients onto the bottom
+/// ones. Those few top coefficients involve only the top limbs of each
+/// operand, so they are computed exactly by a small schoolbook
+/// ([`mp_wrapped_coeffs`]) and subtracted back out — far cheaper than a
+/// transform 1.33–1.5× longer when `len` lands just past a size step. The
+/// choice minimizes a measured cycle estimate (see below). Returns
+/// `(n, wrapped)` with `wrapped = len − n` or 0. A `square` runs two thirds
+/// of the transforms, so the wrap correction must be correspondingly smaller
+/// to pay off.
+fn mp_plan(la: usize, lb: usize, square: bool) -> Option<(usize, usize)> {
+    let len = la + lb - 1;
+    let full = mp_shape(len)?;
+    // Measured (x86-64, Zen 5): about 23 cycles per n·log₂n for the whole
+    // three-prime product (about two thirds of that for a square), 12% more
+    // for 3·2^k lengths, and about 2.6 cycles per wrapped limb product.
+    let per = if square { 155 } else { 230 };
+    let cost = |n: usize| {
+        let c = per * n as u64 * u64::from(usize::BITS - 1 - n.leading_zeros());
+        if n.is_multiple_of(3) {
+            c * 112 / 100
+        } else {
+            c
+        }
+    };
+    let mut best = (full, 0usize);
+    let mut best_cost = cost(full);
+    let floor = la.max(lb).max(len / 2 + 1);
+    let mut cand = full;
+    loop {
+        // Next smaller length of the 2^k / 3·2^k family.
+        cand = if cand % 3 == 0 {
+            cand / 3 * 2
+        } else if cand >= 4 {
+            cand / 4 * 3
+        } else {
+            break;
+        };
+        // (Radix-3 lengths need a power-of-two part of at least 2.)
+        if cand < floor || cand < 4 {
+            break;
+        }
+        let s = len - cand;
+        let c = cost(cand) + 26 * mp_wrap_products(s, la, lb) as u64;
+        if c < best_cost {
+            best = (cand, s);
+            best_cost = c;
+        }
+    }
+    Some(best)
+}
+
+/// The top `s` coefficients `c_{len−s} … c_{len−1}` of the limb convolution of
+/// `a` and `b` (`len = a.len() + b.len() − 1`), exactly, as 192-bit values
+/// `(low 128 bits, high 64 bits)`.
+fn mp_wrapped_coeffs(a: &[Limb], b: &[Limb], s: usize) -> Vec<(u128, u64)> {
+    let len = a.len() + b.len() - 1;
+    (len - s..len)
+        .map(|k| {
+            // a's indices i with 0 ≤ k − i < b.len().
+            let i0 = (k + 1).saturating_sub(b.len());
+            let i1 = (k + 1).min(a.len());
+            // Low and high product halves summed separately: each sum is a
+            // plain add/adc pair and cannot overflow 128 bits.
+            let (mut lo, mut hi) = (0u128, 0u128);
+            for (&x, &y) in a[i0..i1].iter().zip(b[k + 1 - i1..=k - i0].iter().rev()) {
+                let p = x as u128 * y as u128;
+                lo += (p as u64) as u128;
+                hi += p >> 64;
+            }
+            let (v, o) = lo.overflowing_add(hi << 64);
+            (v, (hi >> 64) as u64 + u64::from(o))
+        })
+        .collect()
+}
+
 /// Three-prime NTT multiplication (see the section comment above): the
 /// convolution of the limb vectors modulo each prime, recombined by Garner's
 /// CRT and carry-propagated straight into the result limbs.
@@ -467,11 +709,13 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
         return Nat::zero();
     }
     let out_len = la + lb;
-    // `la + lb − 1` coefficients; a cyclic length at least that avoids wrap.
-    let Some(n) = mp_shape(out_len - 1) else {
+    // `la + lb − 1` coefficients; the top `wrap` of them fold onto the bottom
+    // of the cyclic convolution and are corrected during recombination.
+    let square = core::ptr::eq(a, b) || a.limbs == b.limbs;
+    let Some((n, wrap)) = mp_plan(la, lb, square) else {
         return a.mul_toom4(b);
     };
-    let square = core::ptr::eq(a, b) || a.limbs == b.limbs;
+    let wrapped = mp_wrapped_coeffs(&a.limbs, &b.limbs, wrap);
     // Power-of-two sub-transform length (n itself, or n/3 under a radix-3 stage).
     let radix3 = n % 3 == 0;
     let m = if radix3 { n / 3 } else { n };
@@ -521,11 +765,34 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
     // high part < 2^128, so three limbs never overflow.
     let (mut c0, mut c1) = (0u64, 0u64);
     let [res1, res2, res3] = &res;
-    let coeffs = res1.iter().zip(res2).zip(res3).take(out_len - 1);
-    for ((&x1, &x2), &x3) in coeffs {
-        let r1 = mp_csub(mp_mul(x1, s1, p1, q1.pinv), p1);
-        let r2 = mp_csub(mp_mul(x2, s2, p2, q2.pinv), p2);
-        let r3 = mp_csub(mp_mul(x3, s3, p3, q3.pinv), p3);
+    // `h mod p` for a wrapped 192-bit coefficient.
+    let rem = |&(lo, hi): &(u128, u64), p: u64| -> u64 {
+        let p = p as u128;
+        let r = (((hi as u128 % p) << 64) | (lo >> 64)) % p;
+        (((r << 64) | (lo as u64) as u128) % p) as u64
+    };
+    let residues = |k: usize| {
+        (
+            mp_csub(mp_mul(res1[k], s1, p1, q1.pinv), p1),
+            mp_csub(mp_mul(res2[k], s2, p2, q2.pinv), p2),
+            mp_csub(mp_mul(res3[k], s3, p3, q3.pinv), p3),
+        )
+    };
+    // Residue k < wrap also holds the wrapped c_{n+k}; take it back out.
+    let fixed: Vec<(u64, u64, u64)> = wrapped
+        .iter()
+        .enumerate()
+        .map(|(k, h)| {
+            let (r1, r2, r3) = residues(k);
+            (
+                mp_csub(r1 + p1 - rem(h, p1), p1),
+                mp_csub(r2 + p2 - rem(h, p2), p2),
+                mp_csub(r3 + p3 - rem(h, p3), p3),
+            )
+        })
+        .collect();
+    let plain = (wrapped.len()..n.min(out_len - 1)).map(residues);
+    for (r1, r2, r3) in fixed.into_iter().chain(plain) {
         // x ≡ r1 (p1): x12 = r1 + p1·v2 with v2 = (r2 − r1)/p1 mod p2.
         // (r1 < p1 < 2·p2, so r2 + 2·p2 − r1 > 0 and < 4·p2.)
         let v2 = mp_csub(mp_mul(r2 + 2 * p2 - r1, inv_p1_mod_p2, p2, q2.pinv), p2);
@@ -543,6 +810,14 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
         c0 = m as u64;
         c1 = ((hi >> 64) + (m >> 64)) as u64;
     }
+    // The wrapped top coefficients, already exact.
+    for &(lo, hi) in &wrapped {
+        let s = c0 as u128 + (lo as u64) as u128;
+        let m = c1 as u128 + (lo >> 64) + (s >> 64);
+        out.push(s as u64);
+        c0 = m as u64;
+        c1 = hi + (m >> 64) as u64;
+    }
     out.push(c0);
     debug_assert_eq!(c1, 0, "three-prime product overflowed");
     let mut r = Nat { limbs: out };
@@ -552,34 +827,36 @@ fn mul_ntt(a: &Nat, b: &Nat) -> Nat {
 
 /// Decides whether the three-prime NTT beats the Karatsuba/Toom ladder for a
 /// product of the given operand sizes (in limbs). The transform length (see
-/// [`mp_shape`]) steps through `2^k` and `3·2^k`, so the NTT's cost is a step
+/// [`mp_plan`]) steps through `2^k` and `3·2^k`, so the NTT's cost is a step
 /// function of the input size: on short transforms it wins only while the
-/// transform is well filled, and from 4096 points on it wins outright. Squares
-/// compete with Karatsuba squaring (about two thirds of a general product) and
-/// need a fuller transform. A small operand keeps Karatsuba's `la·lb^0.585`
-/// cost below the transform's `(la + lb)·log(la + lb)`, hence the floor on the
-/// shorter side, raised for very long transforms. (Cutoffs measured on x86-64
-/// (Zen 5); re-measure per platform to retune.)
+/// transform is well filled (and not by too large a wrap correction), and
+/// from 4096 points on it wins outright. A small operand keeps the Toom
+/// ladder's cost below the transform's `(la + lb)·log(la + lb)`, hence the
+/// floor on the shorter side, raised for very long transforms. (Cutoffs
+/// measured on x86-64 (Zen 5) with `measure_ntt_paths` /
+/// `measure_ntt_unbalanced`; re-measure per platform to retune.)
 fn ntt_worthwhile(la: usize, lb: usize, square: bool) -> bool {
     let min = la.min(lb);
-    if min < 500 {
+    if min < NTT_MIN_LIMBS {
         return false;
     }
-    let len = la + lb - 1;
-    let Some(n) = mp_shape(len) else {
+    let Some((n, _)) = mp_plan(la, lb, square) else {
         return false;
     };
     if min < 1000 && n > 1 << 16 {
         return false;
     }
-    // Percentage of the transform the product fills (> 66 by construction).
-    let fill = (len as u64 * 100 / n as u64) as u32;
-    match (n, square) {
-        (..=1024, _) | (1536, true) => false,
-        (1536, false) => fill >= 88,
-        (2048, true) => fill >= 80,
-        (3072, false) => fill >= 75,
-        (3072, true) => fill >= 83,
+    // Coefficients per transform point, in percent: above 100 when the plan
+    // wraps (the excess is computed by the quadratic wrap correction).
+    let fill = ((la + lb - 1) as u64 * 100 / n as u64) as u32;
+    match n {
+        ..=3072 => false,
+        // A short side below ~700 limbs keeps the block-split Toom ahead
+        // until the transform is long.
+        _ if min < 700 && n < 8192 => false,
+        // ... and while a wrap correction stays modest.
+        4096 => fill >= if square { 85 } else { 93 } && fill <= 112,
+        6144 => fill >= if square { 85 } else { 88 } && fill <= 112,
         _ => true,
     }
 }
@@ -1369,23 +1646,6 @@ fn modpow_windowed(base: Nat, one: Nat, exp: &Nat, mulmod: impl Fn(&Nat, &Nat) -
     result.expect("bits > 0 guarantees at least one window")
 }
 
-/// Recombines Toom coefficients `Σ cᵢ·2^(64·k·i)` into a single [`Nat`], writing
-/// each (non-negative) coefficient at whole-limb offset `k·i` with carry
-/// propagation. Cheaper than a chain of `mul_2k`/`add`.
-fn recombine_coeffs(product_limbs: usize, k: usize, coeffs: &[crate::int::Int]) -> Nat {
-    let mut out = alloc::vec![0 as Limb; product_limbs + 2];
-    for (i, c) in coeffs.iter().enumerate() {
-        debug_assert!(!c.is_negative(), "toom coefficient is negative");
-        let mag = c.magnitude();
-        if !mag.is_zero() {
-            add_at(&mut out, i * k, mag.as_limbs());
-        }
-    }
-    let mut n = Nat { limbs: out };
-    n.normalize();
-    n
-}
-
 /// `x`'s limbs zero-padded to exactly `n` (`x` must fit).
 fn padded(x: &Nat, n: usize) -> Vec<Limb> {
     debug_assert!(
@@ -1441,37 +1701,8 @@ fn sqr_into(a: &[Limb], t: &mut [Limb]) {
         let p = a0 as DLimb * a1 as DLimb;
         add_at(t, 2 * i + 1, &[p as Limb, (p >> LIMB_BITS) as Limb]);
         // Both rows' shared tail a[i+2..] lands at base position 2i+2.
-        let b = &a[i + 2..];
-        let rn = b.len();
-        let mut ph0: Limb = 0;
-        let mut pl1: Limb = 0;
-        let mut ph1: Limb = 0;
-        let mut ph1p: Limb = 0;
-        let mut carry: Limb = 0;
-        let row = &mut t[2 * i + 2..i + n + 2];
-        for (o, &bj) in row.iter_mut().zip(b) {
-            let p0 = a0 as DLimb * bj as DLimb;
-            let p1 = a1 as DLimb * bj as DLimb;
-            let acc = *o as DLimb
-                + (p0 as Limb) as DLimb
-                + ph0 as DLimb
-                + pl1 as DLimb
-                + ph1p as DLimb
-                + carry as DLimb;
-            *o = acc as Limb;
-            carry = (acc >> LIMB_BITS) as Limb;
-            ph0 = (p0 >> LIMB_BITS) as Limb;
-            ph1p = ph1;
-            pl1 = p1 as Limb;
-            ph1 = (p1 >> LIMB_BITS) as Limb;
-        }
-        if rn > 0 {
-            let acc =
-                row[rn] as DLimb + ph0 as DLimb + pl1 as DLimb + ph1p as DLimb + carry as DLimb;
-            row[rn] = acc as Limb;
-            let top = row[rn + 1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
-            row[rn + 1] = top as Limb;
-            debug_assert_eq!(top >> LIMB_BITS, 0, "square top carry escaped");
+        if i + 2 < n {
+            addmul2_row(&mut t[2 * i + 2..i + n + 2], &a[i + 2..], a0, a1);
         }
         i += 2;
     }
@@ -1641,20 +1872,150 @@ impl MontCtx {
 /// carry. `out` must be large enough to hold the result (including any carry).
 #[inline]
 fn add_at(out: &mut [Limb], offset: usize, val: &[Limb]) {
-    let mut carry = 0u128;
-    let dst = &mut out[offset..offset + val.len()];
-    for (o, &v) in dst.iter_mut().zip(val) {
-        let s = *o as u128 + v as u128 + carry;
-        *o = s as Limb;
-        carry = s >> LIMB_BITS;
+    add_in_place(&mut out[offset..], val);
+}
+
+/// `x + y + carry` on limbs with a boolean carry in and out. Chained, these
+/// paired overflow flags lower to a single `adc` chain.
+#[inline(always)]
+fn adc_b(x: Limb, y: Limb, carry: bool) -> (Limb, bool) {
+    let (r, c1) = x.overflowing_add(y);
+    let (r, c2) = r.overflowing_add(Limb::from(carry));
+    (r, c1 | c2)
+}
+
+/// `x − y − borrow` on limbs with a boolean borrow in and out (lowers to
+/// an `sbb` chain).
+#[inline(always)]
+fn sbb_b(x: Limb, y: Limb, borrow: bool) -> (Limb, bool) {
+    let (r, b1) = x.overflowing_sub(y);
+    let (r, b2) = r.overflowing_sub(Limb::from(borrow));
+    (r, b1 | b2)
+}
+
+/// `out[i] = f(x[i], y[i], flag)` over equal-length slices with a carried
+/// flag, four limbs per iteration so the flag stays in the CPU's carry bit
+/// inside each group (it is only materialized once per four limbs).
+#[inline(always)]
+fn carry_chain3(
+    out: &mut [Limb],
+    x: &[Limb],
+    y: &[Limb],
+    f: impl Fn(Limb, Limb, bool) -> (Limb, bool),
+) -> bool {
+    debug_assert!(out.len() == x.len() && x.len() == y.len());
+    let mut c = false;
+    let (o4, ot) = out.as_chunks_mut::<4>();
+    let (x4, xt) = x.as_chunks::<4>();
+    let (y4, yt) = y.as_chunks::<4>();
+    for ((o, a), b) in o4.iter_mut().zip(x4).zip(y4) {
+        let (r0, c0) = f(a[0], b[0], c);
+        let (r1, c1) = f(a[1], b[1], c0);
+        let (r2, c2) = f(a[2], b[2], c1);
+        let (r3, c3) = f(a[3], b[3], c2);
+        *o = [r0, r1, r2, r3];
+        c = c3;
     }
-    let mut i = offset + val.len();
-    while carry != 0 {
-        let s = out[i] as u128 + carry;
-        out[i] = s as Limb;
-        carry = s >> LIMB_BITS;
-        i += 1;
+    for ((o, &a), &b) in ot.iter_mut().zip(xt).zip(yt) {
+        let (r, c1) = f(a, b, c);
+        *o = r;
+        c = c1;
     }
+    c
+}
+
+/// In-place form of [`carry_chain3`]: `dst[i] = f(dst[i], src[i], flag)`
+/// over `src.len()` limbs.
+#[inline(always)]
+fn carry_chain2(
+    dst: &mut [Limb],
+    src: &[Limb],
+    f: impl Fn(Limb, Limb, bool) -> (Limb, bool),
+) -> bool {
+    let dst = &mut dst[..src.len()];
+    let mut c = false;
+    let (d4, dt) = dst.as_chunks_mut::<4>();
+    let (s4, st) = src.as_chunks::<4>();
+    for (d, s) in d4.iter_mut().zip(s4) {
+        let (r0, c0) = f(d[0], s[0], c);
+        let (r1, c1) = f(d[1], s[1], c0);
+        let (r2, c2) = f(d[2], s[2], c1);
+        let (r3, c3) = f(d[3], s[3], c2);
+        *d = [r0, r1, r2, r3];
+        c = c3;
+    }
+    for (d, &s) in dt.iter_mut().zip(st) {
+        let (r, c1) = f(*d, s, c);
+        *d = r;
+        c = c1;
+    }
+    c
+}
+
+/// `dst[..src.len()] += src`, returning the carry out (`dst.len() ≥
+/// src.len()`).
+#[inline]
+fn add_n(dst: &mut [Limb], src: &[Limb]) -> bool {
+    carry_chain2(dst, src, adc_b)
+}
+
+/// `dst[..src.len()] −= src`, returning the borrow out (`dst.len() ≥
+/// src.len()`).
+#[inline]
+fn sub_n(dst: &mut [Limb], src: &[Limb]) -> bool {
+    carry_chain2(dst, src, sbb_b)
+}
+
+/// `out = x − y` for equal-length slices, returning the borrow out.
+#[inline]
+fn sub_n3(out: &mut [Limb], x: &[Limb], y: &[Limb]) -> bool {
+    carry_chain3(out, x, y, sbb_b)
+}
+
+/// `out = x + y` for equal-length slices, returning the carry out.
+#[inline]
+fn add_n3(out: &mut [Limb], x: &[Limb], y: &[Limb]) -> bool {
+    carry_chain3(out, x, y, adc_b)
+}
+/// Propagates a carry of 1 into `dst`, returning whether it ran off the end.
+#[inline]
+fn incr(dst: &mut [Limb]) -> bool {
+    for d in dst.iter_mut() {
+        let (r, c) = d.overflowing_add(1);
+        *d = r;
+        if !c {
+            return false;
+        }
+    }
+    true
+}
+
+/// Propagates a borrow of 1 out of `dst`, returning whether it ran off the end.
+#[inline]
+fn decr(dst: &mut [Limb]) -> bool {
+    for d in dst.iter_mut() {
+        let (r, b) = d.overflowing_sub(1);
+        *d = r;
+        if !b {
+            return false;
+        }
+    }
+    true
+}
+
+/// `dst += src` (`dst.len() ≥ src.len()`); the sum must fit in `dst`.
+#[inline]
+fn add_in_place(dst: &mut [Limb], src: &[Limb]) {
+    let carry = add_n(dst, src) && incr(&mut dst[src.len()..]);
+    debug_assert!(!carry, "add_in_place carry escaped");
+}
+
+/// Subtracts `src` from `dst` in place (`dst -= src`); requires `dst >= src`
+/// as numbers and `dst.len() >= src.len()`.
+#[inline]
+fn sub_in_place(dst: &mut [Limb], src: &[Limb]) {
+    let borrow = sub_n(dst, src) && decr(&mut dst[src.len()..]);
+    debug_assert!(!borrow, "sub_in_place borrow escaped: dst < src");
 }
 
 // ---------------------------------------------------------------------------
@@ -2644,8 +3005,9 @@ impl Nat {
         Some(n)
     }
 
-    /// Returns `self · rhs`, dispatching by operand size along a
-    /// schoolbook → Karatsuba → Toom-3 → Toom-4 → NTT ladder.
+    /// Returns `self · rhs`, dispatching by operand shape along a
+    /// schoolbook → Karatsuba → Toom-3 (or Toom-3.2 / block split for
+    /// unbalanced operands) → Toom-4 → NTT ladder.
     pub fn mul(&self, rhs: &Nat) -> Nat {
         if self.is_zero() || rhs.is_zero() {
             return Nat::zero();
@@ -2662,162 +3024,49 @@ impl Nat {
         let min_len = self.limbs.len().min(rhs.limbs.len());
         if min_len < KARATSUBA_THRESHOLD {
             self.mul_schoolbook(rhs)
-        } else if min_len < TOOM3_THRESHOLD {
-            self.mul_karatsuba(rhs)
         } else if ntt_worthwhile(self.limbs.len(), rhs.limbs.len(), false) {
             mul_ntt(self, rhs)
-        } else if min_len < TOOM4_THRESHOLD {
-            self.mul_toom3(rhs)
         } else {
-            self.mul_toom4(rhs)
+            let (a, b) = order_by_len(&self.limbs, &rhs.limbs);
+            product_with(a, b, |out, scratch| mul_slices(a, b, out, scratch))
         }
     }
 
-    /// Toom-4 multiplication: seven quarter-size products evaluated at
-    /// {0, 1, −1, 2, −2, 3, ∞} and interpolated. Asymptotically `O(n^1.404)`.
+    /// Toom-4 multiplication at the top level (seven quarter-size products,
+    /// see [`toom4_into`]), falling back to the general slice dispatcher when
+    /// the operands are too unbalanced for a four-way split. Kept callable
+    /// directly so tests and crossover measurements can force the path.
     fn mul_toom4(&self, rhs: &Nat) -> Nat {
-        use crate::int::Int;
-
-        let n = self.limbs.len().max(rhs.limbs.len());
-        let k = n.div_ceil(4);
-        let part = |x: &Nat, i: usize| -> Int {
-            let l = x.limbs.len();
-            let lo = i * k;
-            if lo >= l {
-                Int::ZERO
+        let (a, b) = order_by_len(&self.limbs, &rhs.limbs);
+        product_with(a, b, |out, scratch| {
+            if b.len() > 3 * a.len().div_ceil(4) {
+                toom4_into(a, b, out, scratch);
             } else {
-                Int::from(Nat::from_limbs(&x.limbs[lo..(lo + k).min(l)]))
+                mul_slices(a, b, out, scratch);
             }
-        };
-        let three = Int::from_i64(3);
-        let nine = Int::from_i64(9);
-        let twenty_seven = Int::from_i64(27);
-
-        // Evaluate a polynomial's four digits at the seven points.
-        let eval = |x: &Nat| -> [Int; 7] {
-            let (d0, d1, d2, d3) = (part(x, 0), part(x, 1), part(x, 2), part(x, 3));
-            let even1 = d0.add(&d2); // d0 + d2
-            let odd1 = d1.add(&d3); // d1 + d3
-            let p1 = even1.add(&odd1); // x(1)
-            let pm1 = even1.sub(&odd1); // x(-1)
-            let even2 = d0.add(&d2.mul_2k(2)); // d0 + 4 d2
-            let odd2 = d1.mul_2k(1).add(&d3.mul_2k(3)); // 2 d1 + 8 d3
-            let p2 = even2.add(&odd2); // x(2)
-            let pm2 = even2.sub(&odd2); // x(-2)
-            let p3 = d0
-                .add(&d1.mul(&three))
-                .add(&d2.mul(&nine))
-                .add(&d3.mul(&twenty_seven)); // x(3)
-            [d0, p1, pm1, p2, pm2, p3, d3]
-        };
-        let ea = eval(self);
-        let eb = eval(rhs);
-        // Pointwise products at 0, 1, −1, 2, −2, 3, ∞.
-        let v: [Int; 7] = core::array::from_fn(|i| ea[i].mul(&eb[i]));
-        let (v0, v1, vm1, v2, vm2, v3, vinf) = (&v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]);
-
-        // Interpolate c0..c6 (all divisions exact).
-        let two = Int::from_i64(2);
-        let c0 = v0.clone();
-        let c6 = vinf.clone();
-        let e1 = v1.add(vm1).div_exact(&two).sub(&c0).sub(&c6); // c2 + c4
-        let o1 = v1.sub(vm1).div_exact(&two); // c1 + c3 + c5
-        let e2 = v2
-            .add(vm2)
-            .div_exact(&two)
-            .sub(&c0)
-            .sub(&c6.mul(&Int::from_i64(64))); // 4c2 + 16c4
-        let o2h = v2.sub(vm2).div_exact(&Int::from_i64(4)); // c1 + 4c3 + 16c5
-        let c4 = e2
-            .sub(&e1.mul(&Int::from_i64(4)))
-            .div_exact(&Int::from_i64(12));
-        let c2 = e1.sub(&c4);
-        let f = o2h.sub(&o1).div_exact(&three); // c3 + 5c5
-        let g = v3
-            .sub(&c0)
-            .sub(&c2.mul(&nine))
-            .sub(&c4.mul(&Int::from_i64(81)))
-            .sub(&c6.mul(&Int::from_i64(729)))
-            .div_exact(&three); // c1 + 9c3 + 81c5
-        let h = g.sub(&o1).div_exact(&Int::from_i64(8)); // c3 + 10c5
-        let c5 = h.sub(&f).div_exact(&Int::from_i64(5));
-        let c3 = f.sub(&c5.mul(&Int::from_i64(5)));
-        let c1 = o1.sub(&c3).sub(&c5);
-
-        recombine_coeffs(
-            self.limbs.len() + rhs.limbs.len(),
-            k,
-            &[c0, c1, c2, c3, c4, c5, c6],
-        )
+        })
     }
 
-    /// Toom-3 multiplication: five half-third-size products, evaluated at the
-    /// points {0, 1, −1, 2, ∞} and interpolated (signed intermediates use
-    /// [`Int`]). Asymptotically `O(n^1.465)`.
+    /// Toom-3 multiplication at the top level (five third-size products, see
+    /// [`toom3_into`]), falling back to the general slice dispatcher when the
+    /// operands are too unbalanced for a three-way split.
+    #[cfg(test)]
     fn mul_toom3(&self, rhs: &Nat) -> Nat {
-        use crate::int::Int;
-
-        let n = self.limbs.len().max(rhs.limbs.len());
-        let k = n.div_ceil(3);
-
-        // Split a value into its base-2^(64k) digits a0 + a1·B + a2·B², as Int.
-        let part = |x: &Nat, lo: usize, hi: usize| -> Int {
-            let l = x.limbs.len();
-            if lo >= l {
-                Int::ZERO
+        let (a, b) = order_by_len(&self.limbs, &rhs.limbs);
+        product_with(a, b, |out, scratch| {
+            if b.len() > 2 * a.len().div_ceil(3) {
+                toom3_into(a, b, out, scratch);
             } else {
-                Int::from(Nat::from_limbs(&x.limbs[lo..hi.min(l)]))
+                mul_slices(a, b, out, scratch);
             }
-        };
-        let (a0, a1, a2) = (
-            part(self, 0, k),
-            part(self, k, 2 * k),
-            part(self, 2 * k, 3 * k),
-        );
-        let (b0, b1, b2) = (
-            part(rhs, 0, k),
-            part(rhs, k, 2 * k),
-            part(rhs, 2 * k, 3 * k),
-        );
-
-        // Evaluate a(x), b(x) at 1, −1, 2 (0 and ∞ are a0/a2 directly).
-        let pa = a0.add(&a2);
-        let (pm1, p1) = (pa.sub(&a1), pa.add(&a1));
-        let p2 = p1.add(&a2).mul_2k(1).sub(&a0);
-        let qb = b0.add(&b2);
-        let (qm1, q1) = (qb.sub(&b1), qb.add(&b1));
-        let q2 = q1.add(&b2).mul_2k(1).sub(&b0);
-
-        // Pointwise products (these recurse through the dispatcher).
-        let r0 = a0.mul(&b0);
-        let r1 = p1.mul(&q1);
-        let rm1 = pm1.mul(&qm1);
-        let r2 = p2.mul(&q2);
-        let rinf = a2.mul(&b2);
-
-        // Interpolate the coefficients c0..c4 (exact divisions by 2 and 6).
-        let two = Int::from_i64(2);
-        let c0 = r0;
-        let c4 = rinf;
-        let c2 = r1.add(&rm1).div_exact(&two).sub(&c0).sub(&c4);
-        let s = r1.sub(&rm1).div_exact(&two);
-        let t = r2
-            .sub(&c0)
-            .sub(&c2.mul(&Int::from_i64(4)))
-            .sub(&c4.mul(&Int::from_i64(16)))
-            .sub(&s.mul(&two));
-        let c3 = t.div_exact(&Int::from_i64(6));
-        let c1 = s.sub(&c3);
-
-        // The final coefficients are the (non-negative) product-polynomial
-        // coefficients; recombine them at whole-limb offsets `i·k` directly.
-        recombine_coeffs(self.limbs.len() + rhs.limbs.len(), k, &[c0, c1, c2, c3, c4])
+        })
     }
-
     /// Quadratic schoolbook (long) multiplication (see [`mul_into_schoolbook`]).
     fn mul_schoolbook(&self, rhs: &Nat) -> Nat {
         let mut out = alloc::vec![0 as Limb; self.limbs.len() + rhs.limbs.len()];
-        mul_into_schoolbook(&self.limbs, &rhs.limbs, &mut out);
+        // Already zeroed: rows over the longer operand directly.
+        let (long, short) = order_by_len(&self.limbs, &rhs.limbs);
+        mul_into_schoolbook(short, long, &mut out);
         let mut n = Nat { limbs: out };
         n.normalize();
         n
@@ -2825,15 +3074,13 @@ impl Nat {
 }
 
 /// Quadratic schoolbook (long) multiplication of `a·b` into the zeroed buffer
-/// `out` (`out.len() == a.len() + b.len()`); accumulates on top of whatever is
-/// already there (the buffer being zeroed makes it a plain product).
+/// `out` (`out.len() == a.len() + b.len()`).
 ///
-/// The main loop is an `addmul_2`: each pass adds two multiplier limbs'
-/// worth of products (`out += (a₀ + a₁·2^64)·b`), halving the passes over
-/// `out` and keeping two independent limb products in flight per iteration
-/// instead of one serial multiply-accumulate chain.
+/// The main loop is an `addmul_2` ([`addmul2_row`]): each pass adds two
+/// multiplier limbs' worth of products (`out += (a₀ + a₁·2^64)·b`), halving
+/// the passes over `out` and keeping two independent limb products in flight
+/// per iteration instead of one serial multiply-accumulate chain.
 fn mul_into_schoolbook(a: &[Limb], b: &[Limb], out: &mut [Limb]) {
-    use crate::limb::DLimb;
     debug_assert_eq!(out.len(), a.len() + b.len());
     let rn = b.len();
     if a.is_empty() || rn == 0 {
@@ -2841,38 +3088,7 @@ fn mul_into_schoolbook(a: &[Limb], b: &[Limb], out: &mut [Limb]) {
     }
     let mut i = 0;
     while i + 2 <= a.len() {
-        let (a0, a1) = (a[i], a[i + 1]);
-        // Position i+j collects lo(a0·b[j]) + hi(a0·b[j−1]) + lo(a1·b[j−1])
-        // + hi(a1·b[j−2]) + carry: five limb-sized terms, so the u128
-        // accumulator cannot overflow and the carry out is at most 4.
-        let mut ph0: Limb = 0; // hi(a0·b[j−1])
-        let mut pl1: Limb = 0; // lo(a1·b[j−1])
-        let mut ph1: Limb = 0; // hi(a1·b[j−1])
-        let mut ph1p: Limb = 0; // hi(a1·b[j−2])
-        let mut carry: Limb = 0;
-        let row = &mut out[i..i + rn + 2];
-        for (o, &bj) in row.iter_mut().zip(b) {
-            let p0 = a0 as DLimb * bj as DLimb;
-            let p1 = a1 as DLimb * bj as DLimb;
-            let acc = *o as DLimb
-                + (p0 as Limb) as DLimb
-                + ph0 as DLimb
-                + pl1 as DLimb
-                + ph1p as DLimb
-                + carry as DLimb;
-            *o = acc as Limb;
-            carry = (acc >> LIMB_BITS) as Limb;
-            ph0 = (p0 >> LIMB_BITS) as Limb;
-            ph1p = ph1;
-            pl1 = p1 as Limb;
-            ph1 = (p1 >> LIMB_BITS) as Limb;
-        }
-        // Flush the pipeline into the two limbs above the row.
-        let acc = row[rn] as DLimb + ph0 as DLimb + pl1 as DLimb + ph1p as DLimb + carry as DLimb;
-        row[rn] = acc as Limb;
-        let top = row[rn + 1] as DLimb + ph1 as DLimb + (acc >> LIMB_BITS);
-        row[rn + 1] = top as Limb;
-        debug_assert_eq!(top >> LIMB_BITS, 0, "schoolbook top carry escaped");
+        addmul2_row(&mut out[i..i + rn + 2], b, a[i], a[i + 1]);
         i += 2;
     }
     if i < a.len() {
@@ -2889,48 +3105,79 @@ fn mul_into_schoolbook(a: &[Limb], b: &[Limb], out: &mut [Limb]) {
     }
 }
 
+/// Basecase product: writes `a·b` into `out` (`out.len() == a.len() +
+/// b.len()`, previous contents ignored), as `addmul_2` rows over the longer
+/// operand (fewer, longer rows amortize the per-row setup and flush).
+fn mul_basecase(a: &[Limb], b: &[Limb], out: &mut [Limb]) {
+    out.fill(0);
+    let (long, short) = order_by_len(a, b);
+    mul_into_schoolbook(short, long, out);
+}
+/// The `addmul_2` kernel: `row += (a0 + a1·2^64)·b` with
+/// `row.len() == b.len() + 2` (the sum must fit in `row`).
+///
+/// Two interleaved `addmul_1` rows with a one-limb lag: at position `j` the
+/// first row adds `a0·b[j]` (plus its carry `c0`), and the second row adds
+/// `a1·b[j−1]` (plus its carry `c1`) on top of that result before it is
+/// stored. Each row's carry is its own two-instruction loop-carried chain
+/// (the incoming carry is added last, after the carry-independent
+/// `product + limb` sum), so the two chains overlap, and each product costs
+/// one multiply and two add-with-carry pairs.
+#[inline(always)]
+fn addmul2_row(row: &mut [Limb], b: &[Limb], a0: Limb, a1: Limb) {
+    use crate::limb::DLimb;
+    let rn = b.len();
+    debug_assert_eq!(row.len(), rn + 2);
+    let (mut c0, mut c1, mut bprev): (Limb, Limb, Limb) = (0, 0, 0);
+    // `p·q + x < 2^128` for limbs p, q, x, so the products-plus-limb sums
+    // cannot overflow; the carries are added with explicit overflow flags so
+    // LLVM keeps them at the end of each sum.
+    let mut step = |o: &mut Limb, bj: Limb| {
+        let w0 = a0 as DLimb * bj as DLimb + *o as DLimb;
+        let (s0, k0) = (w0 as Limb).overflowing_add(c0);
+        c0 = (w0 >> LIMB_BITS) as Limb + Limb::from(k0);
+        let w1 = a1 as DLimb * bprev as DLimb + s0 as DLimb;
+        let (s1, k1) = (w1 as Limb).overflowing_add(c1);
+        c1 = (w1 >> LIMB_BITS) as Limb + Limb::from(k1);
+        *o = s1;
+        bprev = bj;
+    };
+    // Two positions per iteration (halves the loop overhead).
+    let (rows2, row_tail) = row[..rn].as_chunks_mut::<2>();
+    let (bs2, b_tail) = b.as_chunks::<2>();
+    for (o, bj) in rows2.iter_mut().zip(bs2) {
+        let [o0, o1] = o;
+        step(o0, bj[0]);
+        step(o1, bj[1]);
+    }
+    if let (Some(o), Some(&bj)) = (row_tail.first_mut(), b_tail.first()) {
+        step(o, bj);
+    }
+    // Position rn: the first row's carry, the second row's last product and
+    // carry; position rn + 1: what overflows from those.
+    let t0 = row[rn] as DLimb + c0 as DLimb;
+    let t1 = a1 as DLimb * bprev as DLimb + (t0 as Limb) as DLimb + c1 as DLimb;
+    row[rn] = t1 as Limb;
+    let top = row[rn + 1] as DLimb + (t0 >> LIMB_BITS) + (t1 >> LIMB_BITS);
+    row[rn + 1] = top as Limb;
+    debug_assert_eq!(top >> LIMB_BITS, 0, "addmul_2 top carry escaped");
+}
 /// Sums `a + b` into `out`, which must be exactly `max(len) + 1` limbs; every
 /// limb of `out` is written (the top limb is the 0/1 carry).
 fn add_full(a: &[Limb], b: &[Limb], out: &mut [Limb]) {
     let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
     debug_assert_eq!(out.len(), long.len() + 1);
-    let mut carry = 0;
     let (head, tail) = out.split_at_mut(short.len());
-    for ((o, &x), &y) in head.iter_mut().zip(long).zip(short) {
-        let (s, c) = adc(x, y, carry);
-        *o = s;
-        carry = c;
-    }
+    let mut carry = add_n3(head, &long[..short.len()], short);
     let (mid, last) = tail.split_at_mut(long.len() - short.len());
-    for (o, &x) in mid.iter_mut().zip(&long[short.len()..]) {
-        let (s, c) = adc(x, 0, carry);
-        *o = s;
-        carry = c;
+    mid.copy_from_slice(&long[short.len()..]);
+    if carry {
+        carry = incr(mid);
     }
-    last[0] = carry;
+    last[0] = Limb::from(carry);
 }
-
-/// Subtracts `src` from `dst` in place (`dst -= src`); requires `dst >= src`
-/// as numbers and `dst.len() >= src.len()`.
-fn sub_in_place(dst: &mut [Limb], src: &[Limb]) {
-    let mut borrow = 0;
-    let (head, tail) = dst.split_at_mut(src.len());
-    for (d, &s) in head.iter_mut().zip(src) {
-        let (r, b) = sbb(*d, s, borrow);
-        *d = r;
-        borrow = b;
-    }
-    let mut it = tail.iter_mut();
-    while borrow != 0 {
-        let d = it.next().expect("sub_in_place borrow escaped: dst < src");
-        let (r, b) = sbb(*d, 0, borrow);
-        *d = r;
-        borrow = b;
-    }
-}
-
-/// Karatsuba multiplication of `a·b` into the zeroed buffer `out`
-/// (`out.len() == a.len() + b.len()`), using `scratch` for every intermediate —
+/// Karatsuba multiplication of `a·b` into `out` (`out.len() == a.len() +
+/// b.len()`, previous contents ignored), using `scratch` for every intermediate —
 /// no per-node allocation. `z0` and `z2` land directly in the disjoint halves
 /// of `out`; only the middle term needs scratch space.
 ///
@@ -2941,7 +3188,7 @@ fn sub_in_place(dst: &mut [Limb], src: &[Limb]) {
 fn kara_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
     debug_assert_eq!(out.len(), a.len() + b.len());
     if a.len().min(b.len()) < KARATSUBA_THRESHOLD {
-        mul_into_schoolbook(a, b, out);
+        mul_basecase(a, b, out);
         return;
     }
     let h = a.len().max(b.len()).div_ceil(2);
@@ -2952,7 +3199,10 @@ fn kara_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
     let have_z2 = !a1.is_empty() && !b1.is_empty();
     kara_into(a0, b0, &mut out[..z0_len], scratch);
     if have_z2 {
+        out[z0_len..2 * h].fill(0);
         kara_into(a1, b1, &mut out[2 * h..], scratch);
+    } else {
+        out[z0_len..].fill(0);
     }
     // da = |a0 − a1|, db = |b0 − b1|, zm = da·db.
     let (da, rest) = scratch.split_at_mut(a0.len());
@@ -2960,7 +3210,6 @@ fn kara_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
     let neg = abs_diff_into(a0, a1, da) != abs_diff_into(b0, b1, db);
     let (zm, rest) = rest.split_at_mut(z0_len);
     let (t, rest) = rest.split_at_mut(z0_len + 1);
-    zm.fill(0);
     kara_into(da, db, zm, rest);
     // t = z0 + z2 ∓ zm = a0·b1 + a1·b0 (non-negative, fits z0_len + 1 limbs).
     let z2_len = if have_z2 { a1.len() + b1.len() } else { 0 };
@@ -2983,24 +3232,30 @@ fn abs_diff_into(x: &[Limb], y: &[Limb], out: &mut [Limb]) -> bool {
     // x < y only if x has nothing above y's length and loses at the highest
     // differing limb.
     let (xl, xh) = x.split_at(y.len());
-    let x_less = xh.iter().all(|&l| l == 0)
-        && xl
-            .iter()
-            .rev()
-            .zip(y.iter().rev())
-            .find(|(p, q)| p != q)
-            .is_some_and(|(p, q)| p < q);
-    let (big, small) = if x_less { (y, xl) } else { (x, y) };
-    let mut borrow = 0;
-    for (i, o) in out.iter_mut().enumerate() {
-        let bv = big.get(i).copied().unwrap_or(0);
-        let sv = small.get(i).copied().unwrap_or(0);
-        let (r, bo) = sbb(bv, sv, borrow);
-        *o = r;
-        borrow = bo;
+    let x_less = xh.iter().all(|&l| l == 0) && padded_less(xl, y);
+    let (ol, oh) = out.split_at_mut(y.len());
+    if x_less {
+        // x's high part is zero; so is the result's.
+        sub_n3(ol, y, xl);
+        oh.fill(0);
+    } else {
+        let borrow = sub_n3(ol, xl, y);
+        oh.copy_from_slice(xh);
+        let escaped = borrow && decr(oh);
+        debug_assert!(!escaped);
     }
-    debug_assert_eq!(borrow, 0);
     x_less
+}
+
+/// Whether `x < y` for equal-length slices (most significant limb last).
+#[inline]
+fn padded_less(x: &[Limb], y: &[Limb]) -> bool {
+    debug_assert_eq!(x.len(), y.len());
+    x.iter()
+        .rev()
+        .zip(y.iter().rev())
+        .find(|(p, q)| p != q)
+        .is_some_and(|(p, q)| p < q)
 }
 
 /// Karatsuba squaring of `a` into the zeroed buffer `out`
@@ -3030,6 +3285,7 @@ fn kara_sqr_into(a: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
 /// Scratch size sufficient for [`kara_into`]/[`kara_sqr_into`] on operands of
 /// at most `n` limbs each: each level consumes `≤ 3n + 6` limbs and recurses on
 /// `≤ n/2 + 2`.
+#[cfg(test)]
 fn kara_scratch_len(n: usize) -> usize {
     let mut need = 0;
     let mut m = n;
@@ -3040,22 +3296,660 @@ fn kara_scratch_len(n: usize) -> usize {
     need
 }
 
+// --- Slice-based Toom-Cook ---
+//
+// Every Toom node evaluates its operands, recurses on the pointwise products
+// through [`mul_slices`]/[`sqr_slices`] and interpolates, all inside the
+// caller's output buffer plus one shared scratch slice: no allocation below
+// the top level. The interpolation sequences follow Bodrato's approach
+// ("Towards optimal Toom-Cook multiplication", WAIFI 2007; Brent &
+// Zimmermann, MCA §1.3.3): exact divisions by 2 (shifts) and by 3 or 5
+// (Hensel division by a single-limb inverse), every intermediate a
+// non-negative integer, only the values at negative points carrying a sign.
+
+/// Scratch size sufficient for [`mul_slices`]/[`sqr_slices`] on operands of
+/// at most `n` limbs: every node (Karatsuba, Toom-3/3.2/4 or the unbalanced
+/// block split) uses at most `6m + 64` limbs at size `m` and recurses at most
+/// to `m/2 + 2`.
+fn toom_scratch_len(n: usize) -> usize {
+    let mut need = 0;
+    let mut m = n;
+    while m >= KARATSUBA_THRESHOLD {
+        need += 6 * m + 64;
+        m = m / 2 + 2;
+    }
+    need
+}
+
+/// Orders two limb slices as `(longer, shorter)`.
+fn order_by_len<'a>(a: &'a [Limb], b: &'a [Limb]) -> (&'a [Limb], &'a [Limb]) {
+    if a.len() >= b.len() { (a, b) } else { (b, a) }
+}
+
+/// Runs a slice product `f(out, scratch)` into a fresh `a.len() + b.len()`
+/// limb buffer with a [`toom_scratch_len`] scratch, returning the result.
+fn product_with(a: &[Limb], b: &[Limb], f: impl FnOnce(&mut [Limb], &mut [Limb])) -> Nat {
+    let mut out = alloc::vec![0 as Limb; a.len() + b.len()];
+    let mut scratch = alloc::vec![0 as Limb; toom_scratch_len(a.len().max(b.len()))];
+    f(&mut out, &mut scratch);
+    let mut n = Nat { limbs: out };
+    n.normalize();
+    n
+}
+
+/// Writes `a·b` into `out` (`out.len() == a.len() + b.len()`, previous
+/// contents ignored), choosing schoolbook, Karatsuba, Toom-3, Toom-3.2,
+/// Toom-4 or a block split of the longer operand by shape. `scratch` must
+/// hold [`toom_scratch_len`]`(max(len))` limbs.
+fn mul_slices(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    let (a, b) = order_by_len(a, b);
+    let (la, lb) = (a.len(), b.len());
+    debug_assert_eq!(out.len(), la + lb);
+    if lb < KARATSUBA_THRESHOLD {
+        mul_basecase(a, b, out);
+    } else if la >= 2 * lb {
+        mul_unbalanced_into(a, b, out, scratch);
+    } else if lb < TOOM3_THRESHOLD {
+        kara_into(a, b, out, scratch);
+    } else if lb >= TOOM4_THRESHOLD && lb > 3 * la.div_ceil(4) {
+        toom4_into(a, b, out, scratch);
+    } else if lb > 2 * la.div_ceil(3) {
+        toom3_into(a, b, out, scratch);
+    } else {
+        toom32_into(a, b, out, scratch);
+    }
+}
+
+/// Writes `a²` into `out` (`out.len() == 2·a.len()`, previous contents
+/// ignored), by symmetric schoolbook, Karatsuba, Toom-3 or Toom-4 squaring.
+fn sqr_slices(a: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    let n = a.len();
+    debug_assert_eq!(out.len(), 2 * n);
+    // Checked from the top: with the current tuning Toom-3 squaring takes
+    // over straight from the symmetric schoolbook, so Karatsuba squaring
+    // only serves the Montgomery path.
+    if n >= TOOM4_SQR_THRESHOLD {
+        toom4_sqr_into(a, out, scratch);
+    } else if n >= TOOM3_SQR_THRESHOLD {
+        toom3_sqr_into(a, out, scratch);
+    } else if n >= KARATSUBA_SQR_THRESHOLD {
+        out.fill(0);
+        kara_sqr_into(a, out, scratch);
+    } else {
+        out.fill(0);
+        sqr_into(a, out);
+    }
+}
+
+/// `a·b` for `a.len() ≥ 2·b.len()`: `a` is cut into `b.len()`-limb blocks,
+/// each multiplied by `b` as a balanced product and added in at its offset
+/// (a trailing short block recurses as the transposed unbalanced product).
+fn mul_unbalanced_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    let lb = b.len();
+    let (first, mut rest) = a.split_at(lb);
+    mul_slices(first, b, &mut out[..2 * lb], scratch);
+    out[2 * lb..].fill(0);
+    let mut off = lb;
+    while !rest.is_empty() {
+        let (chunk, tail) = rest.split_at(rest.len().min(lb));
+        let (tmp, sub) = scratch.split_at_mut(chunk.len() + lb);
+        mul_slices(chunk, b, tmp, sub);
+        add_at(out, off, trim_limbs(tmp));
+        off += chunk.len();
+        rest = tail;
+    }
+}
+
+/// `x` without its zero high limbs.
+fn trim_limbs(x: &[Limb]) -> &[Limb] {
+    &x[..x.iter().rposition(|&l| l != 0).map_or(0, |i| i + 1)]
+}
+
+/// `dst = src − dst` for equal-length slices with `src ≥ dst`.
+fn rsub_in_place(dst: &mut [Limb], src: &[Limb]) {
+    debug_assert_eq!(dst.len(), src.len());
+    let borrow = carry_chain2(dst, src, |d, s, b| sbb_b(s, d, b));
+    debug_assert!(!borrow, "rsub_in_place: src < dst");
+}
+
+/// `x = |x − y|` (`x.len() ≥ y.len()`, values compared as unnormalized
+/// little-endian numbers), returning whether `x < y` held.
+fn abs_diff_in_place(x: &mut [Limb], y: &[Limb]) -> bool {
+    let (xl, xh) = x.split_at_mut(y.len());
+    let x_less = xh.iter().all(|&l| l == 0) && padded_less(xl, y);
+    if x_less {
+        rsub_in_place(xl, y);
+    } else {
+        sub_in_place(x, y);
+    }
+    x_less
+}
+
+/// `dst[i] = f(dst[i], (src·2^s)[i], flag)` for `i ≤ src.len()` (the last
+/// position takes the bits shifted out of `src`, when `dst` has room for
+/// them), four limbs per iteration; returns the outgoing flag. `0 < s < 64`.
+#[inline(always)]
+fn lsh_chain(
+    dst: &mut [Limb],
+    src: &[Limb],
+    s: u32,
+    f: impl Fn(Limb, Limb, bool) -> (Limb, bool),
+) -> bool {
+    debug_assert!(s > 0 && s < LIMB_BITS);
+    let n = src.len();
+    let r = LIMB_BITS - s;
+    let mut prev: Limb = 0;
+    let mut c = false;
+    let (d4, dt) = dst[..n].as_chunks_mut::<4>();
+    let (s4, st) = src.as_chunks::<4>();
+    for (d, x) in d4.iter_mut().zip(s4) {
+        let v0 = (x[0] << s) | (prev >> r);
+        let v1 = (x[1] << s) | (x[0] >> r);
+        let v2 = (x[2] << s) | (x[1] >> r);
+        let v3 = (x[3] << s) | (x[2] >> r);
+        prev = x[3];
+        let (r0, c0) = f(d[0], v0, c);
+        let (r1, c1) = f(d[1], v1, c0);
+        let (r2, c2) = f(d[2], v2, c1);
+        let (r3, c3) = f(d[3], v3, c2);
+        *d = [r0, r1, r2, r3];
+        c = c3;
+    }
+    for (d, &x) in dt.iter_mut().zip(st) {
+        let (rr, c1) = f(*d, (x << s) | (prev >> r), c);
+        prev = x;
+        *d = rr;
+        c = c1;
+    }
+    let spill = prev >> r;
+    match dst.get_mut(n) {
+        Some(d) => {
+            let (rr, c1) = f(*d, spill, c);
+            *d = rr;
+            c1
+        }
+        None => {
+            debug_assert_eq!(spill, 0);
+            c
+        }
+    }
+}
+
+/// `dst += src·2^s` for `0 < s < 64`; the sum must fit in `dst`.
+fn add_lsh_in_place(dst: &mut [Limb], src: &[Limb], s: u32) {
+    let n = src.len();
+    let carry = lsh_chain(dst, src, s, adc_b) && incr(dst.get_mut(n + 1..).unwrap_or_default());
+    debug_assert!(!carry, "add_lsh_in_place carry escaped");
+}
+
+/// `dst −= src·2^s` for `0 < s < 64`; requires `dst ≥ src·2^s`.
+fn sub_lsh_in_place(dst: &mut [Limb], src: &[Limb], s: u32) {
+    let n = src.len();
+    let borrow = lsh_chain(dst, src, s, sbb_b) && decr(dst.get_mut(n + 1..).unwrap_or_default());
+    debug_assert!(!borrow, "sub_lsh_in_place: dst < src·2^s");
+}
+
+/// `x <<= s` in place for `0 < s < 64`; the bits shifted out must be zero.
+fn shl_in_place(x: &mut [Limb], s: u32) {
+    debug_assert!(s > 0 && s < LIMB_BITS);
+    let r = LIMB_BITS - s;
+    let mut carry: Limb = 0;
+    let (x4, xt) = x.as_chunks_mut::<4>();
+    for l in x4.iter_mut() {
+        let [a, b, c, d] = *l;
+        *l = [
+            (a << s) | carry,
+            (b << s) | (a >> r),
+            (c << s) | (b >> r),
+            (d << s) | (c >> r),
+        ];
+        carry = d >> r;
+    }
+    for l in xt.iter_mut() {
+        let v = *l;
+        *l = (v << s) | carry;
+        carry = v >> r;
+    }
+    debug_assert_eq!(carry, 0, "shl_in_place dropped bits");
+}
+
+/// `x >>= 1` in place; the low bit must be zero (exact halving).
+fn shr1_in_place(x: &mut [Limb]) {
+    debug_assert!(x.first().is_none_or(|&l| l & 1 == 0), "inexact halving");
+    let n = x.len();
+    for i in 0..n.saturating_sub(1) {
+        x[i] = (x[i] >> 1) | (x[i + 1] << (LIMB_BITS - 1));
+    }
+    if let Some(last) = x.last_mut() {
+        *last >>= 1;
+    }
+}
+/// `d^-1 mod 2^64` for odd `d`, by Newton's iteration (compile-time).
+const fn inv_limb_const(d: Limb) -> Limb {
+    let mut inv = d; // correct to 3 bits for odd d
+    let mut i = 0;
+    while i < 5 {
+        inv = inv.wrapping_mul(2u64.wrapping_sub(d.wrapping_mul(inv)));
+        i += 1;
+    }
+    inv
+}
+
+/// An exact small odd divisor with its inverse modulo `2^64`.
+#[derive(Clone, Copy)]
+struct ExactDivisor {
+    d: Limb,
+    inv: Limb,
+}
+
+impl ExactDivisor {
+    const fn new(d: Limb) -> Self {
+        ExactDivisor {
+            d,
+            inv: inv_limb_const(d),
+        }
+    }
+
+    /// One Hensel step: the quotient limb for `x` given the incoming borrow,
+    /// and the outgoing borrow.
+    #[inline(always)]
+    fn step(self, x: Limb, borrow: Limb) -> (Limb, Limb) {
+        let (s, b1) = x.overflowing_sub(borrow);
+        let q = s.wrapping_mul(self.inv);
+        let hi = ((q as u128 * self.d as u128) >> LIMB_BITS) as Limb;
+        (q, hi + Limb::from(b1))
+    }
+}
+
+const DIV3: ExactDivisor = ExactDivisor::new(3);
+const DIV9: ExactDivisor = ExactDivisor::new(9);
+const DIV15: ExactDivisor = ExactDivisor::new(15);
+
+/// `x /= d` in place for a small odd `d` dividing `x` exactly: Hensel
+/// (low-to-high) exact division, one multiply per limb and no trial
+/// quotients (MCA §1.4.7).
+fn divexact_in_place(x: &mut [Limb], d: ExactDivisor) {
+    let mut borrow: Limb = 0;
+    for l in x.iter_mut() {
+        let (q, b) = d.step(*l, borrow);
+        *l = q;
+        borrow = b;
+    }
+    debug_assert_eq!(borrow, 0, "inexact small division");
+}
+
+/// Two independent exact divisions `x /= dx`, `y /= dy` (equal lengths) in
+/// one loop, so their latency-bound borrow chains overlap.
+fn divexact_pair(x: &mut [Limb], dx: ExactDivisor, y: &mut [Limb], dy: ExactDivisor) {
+    debug_assert_eq!(x.len(), y.len());
+    let (mut bx, mut by): (Limb, Limb) = (0, 0);
+    for (u, v) in x.iter_mut().zip(y.iter_mut()) {
+        let (q, b) = dx.step(*u, bx);
+        *u = q;
+        bx = b;
+        let (q, b) = dy.step(*v, by);
+        *v = q;
+        by = b;
+    }
+    debug_assert!(bx == 0 && by == 0, "inexact small division");
+}
+/// `x *= m` in place for a single-limb `m`; the product must fit.
+fn mul_small_in_place(x: &mut [Limb], m: Limb) {
+    let mut carry = 0;
+    for l in x.iter_mut() {
+        let (lo, hi) = mac(0, *l, m, carry);
+        *l = lo;
+        carry = hi;
+    }
+    debug_assert_eq!(carry, 0, "mul_small_in_place overflow");
+}
+
+/// Copies `src` into the low limbs of `dst` and zeroes the rest.
+fn copy_padded(dst: &mut [Limb], src: &[Limb]) {
+    let (lo, hi) = dst.split_at_mut(src.len());
+    lo.copy_from_slice(src);
+    hi.fill(0);
+}
+
+/// Replaces `x` by `(x + y)/2` and `y` by `(x − y)/2` (equal lengths,
+/// `x ≥ y`, both sums even). Used to split the values at `±t` into their
+/// even and odd parts.
+fn half_sum_diff(x: &mut [Limb], y: &mut [Limb]) {
+    rsub_in_place(y, x); // y = x − y
+    shl_in_place(x, 1);
+    sub_in_place(x, y); // x = 2x − (x − y) = x + y
+    shr1_in_place(x);
+    shr1_in_place(y);
+}
+
+/// Toom-3 evaluation of `x0 + x1·t + x2·t²` (`x0`, `x1` of `k` limbs, `x2`
+/// of at most `k`) into `k + 1`-limb buffers: `e1 = x(1)`, `em1 = |x(−1)|`
+/// and, when given, `e2 = x(2)`. Returns whether `x(−1) < 0`.
+fn toom3_eval(
+    x0: &[Limb],
+    x1: &[Limb],
+    x2: &[Limb],
+    e1: &mut [Limb],
+    em1: &mut [Limb],
+    e2: Option<&mut [Limb]>,
+) -> bool {
+    add_full(x0, x2, em1); // x0 + x2
+    e1.copy_from_slice(em1);
+    add_in_place(e1, x1);
+    let neg = abs_diff_in_place(em1, x1);
+    if let Some(e2) = e2 {
+        // x(2) = 2·(x(1) + x2) − x0.
+        e2.copy_from_slice(e1);
+        add_in_place(e2, x2);
+        shl_in_place(e2, 1);
+        sub_in_place(e2, x0);
+    }
+    neg
+}
+
+/// Toom-3 interpolation. On entry `out[..2k]` holds `v0`, `out[4k..]` holds
+/// `v∞`, and the `2k + 2`-limb buffers hold `w1 = v(1)`, `wm1 = |v(−1)|`
+/// (negative iff `neg`) and `w2 = v(2)`. Leaves the full product in `out`.
+fn toom3_interp(
+    out: &mut [Limb],
+    k: usize,
+    w1: &mut [Limb],
+    wm1: &mut [Limb],
+    neg: bool,
+    w2: &mut [Limb],
+) {
+    // w2 = (v(2) − v(−1))/3 = c1 + c2 + 3c3 + 5c4.
+    if neg {
+        add_in_place(w2, wm1);
+    } else {
+        sub_in_place(w2, wm1);
+    }
+    divexact_in_place(w2, DIV3);
+    // wm1 = (v(1) − v(−1))/2 = c1 + c3.
+    if neg {
+        add_in_place(wm1, w1);
+    } else {
+        rsub_in_place(wm1, w1);
+    }
+    shr1_in_place(wm1);
+    let (lo, vinf) = out.split_at_mut(4 * k);
+    let v0 = &lo[..2 * k];
+    // w1 = v(1) − c0 = c1 + c2 + c3 + c4.
+    sub_in_place(w1, v0);
+    // w2 = (w2 − w1)/2 − 2c4 = c3.
+    sub_in_place(w2, w1);
+    shr1_in_place(w2);
+    sub_lsh_in_place(w2, vinf, 1);
+    // w1 = w1 − (c1 + c3) − c4 = c2.
+    sub_in_place(w1, wm1);
+    sub_in_place(w1, vinf);
+    // wm1 = (c1 + c3) − c3 = c1.
+    sub_in_place(wm1, w2);
+    lo[2 * k..].fill(0);
+    add_at(out, k, trim_limbs(wm1));
+    add_at(out, 2 * k, trim_limbs(w1));
+    add_at(out, 3 * k, trim_limbs(w2));
+}
+
+/// Toom-3 product `a·b` into `out` for `a.len() ≥ b.len() > 2·⌈a.len()/3⌉`:
+/// five products of about a third of the size, at the points
+/// `0, 1, −1, 2, ∞`.
+fn toom3_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    let k = a.len().div_ceil(3);
+    debug_assert!(a.len() >= b.len() && b.len() > 2 * k);
+    let (a0, a1, a2) = (&a[..k], &a[k..2 * k], &a[2 * k..]);
+    let (b0, b1, b2) = (&b[..k], &b[k..2 * k], &b[2 * k..]);
+    let (ea1, s) = scratch.split_at_mut(k + 1);
+    let (eam1, s) = s.split_at_mut(k + 1);
+    let (ea2, s) = s.split_at_mut(k + 1);
+    let (eb1, s) = s.split_at_mut(k + 1);
+    let (ebm1, s) = s.split_at_mut(k + 1);
+    let (eb2, s) = s.split_at_mut(k + 1);
+    let (w1, s) = s.split_at_mut(2 * k + 2);
+    let (wm1, s) = s.split_at_mut(2 * k + 2);
+    let (w2, rest) = s.split_at_mut(2 * k + 2);
+    let na = toom3_eval(a0, a1, a2, ea1, eam1, Some(&mut *ea2));
+    let nb = toom3_eval(b0, b1, b2, eb1, ebm1, Some(&mut *eb2));
+    mul_slices(ea1, eb1, w1, rest);
+    mul_slices(eam1, ebm1, wm1, rest);
+    mul_slices(ea2, eb2, w2, rest);
+    let (lo, hi) = out.split_at_mut(4 * k);
+    mul_slices(a0, b0, &mut lo[..2 * k], rest);
+    mul_slices(a2, b2, hi, rest);
+    toom3_interp(out, k, w1, wm1, na != nb, w2);
+}
+
+/// Toom-3 squaring of `a` into `out` (`a.len() ≥ 3`).
+fn toom3_sqr_into(a: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    let k = a.len().div_ceil(3);
+    let (a0, a1, a2) = (&a[..k], &a[k..2 * k], &a[2 * k..]);
+    let (e1, s) = scratch.split_at_mut(k + 1);
+    let (em1, s) = s.split_at_mut(k + 1);
+    let (e2, s) = s.split_at_mut(k + 1);
+    let (w1, s) = s.split_at_mut(2 * k + 2);
+    let (wm1, s) = s.split_at_mut(2 * k + 2);
+    let (w2, rest) = s.split_at_mut(2 * k + 2);
+    toom3_eval(a0, a1, a2, e1, em1, Some(&mut *e2));
+    sqr_slices(e1, w1, rest);
+    sqr_slices(em1, wm1, rest);
+    sqr_slices(e2, w2, rest);
+    let (lo, hi) = out.split_at_mut(4 * k);
+    sqr_slices(a0, &mut lo[..2 * k], rest);
+    sqr_slices(a2, hi, rest);
+    toom3_interp(out, k, w1, wm1, false, w2);
+}
+
+/// Toom-3.2 product `a·b` into `out` for `⌈a.len()/3⌉ < b.len() ≤
+/// 2·⌈a.len()/3⌉`: `a` in three parts and `b` in two, four products at the
+/// points `0, 1, −1, ∞`.
+fn toom32_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    let k = a.len().div_ceil(3);
+    debug_assert!(b.len() > k && b.len() <= 2 * k);
+    let (a0, a1, a2) = (&a[..k], &a[k..2 * k], &a[2 * k..]);
+    let (b0, b1) = b.split_at(k);
+    let (ea1, s) = scratch.split_at_mut(k + 1);
+    let (eam1, s) = s.split_at_mut(k + 1);
+    let (eb1, s) = s.split_at_mut(k + 1);
+    let (ebm1, s) = s.split_at_mut(k + 1);
+    let (w1, s) = s.split_at_mut(2 * k + 2);
+    let (wm1, rest) = s.split_at_mut(2 * k + 2);
+    let na = toom3_eval(a0, a1, a2, ea1, eam1, None);
+    add_full(b0, b1, eb1);
+    copy_padded(ebm1, b0);
+    let nb = abs_diff_in_place(ebm1, b1);
+    mul_slices(ea1, eb1, w1, rest);
+    mul_slices(eam1, ebm1, wm1, rest);
+    let (lo, vinf) = out.split_at_mut(3 * k);
+    mul_slices(a0, b0, &mut lo[..2 * k], rest);
+    mul_slices(a2, b1, vinf, rest);
+    // (w1, wm1) = (c0 + c2, c1 + c3) from v(±1).
+    half_sum_diff(w1, wm1);
+    let (even, odd) = if na != nb { (wm1, w1) } else { (w1, wm1) };
+    sub_in_place(even, &lo[..2 * k]);
+    sub_in_place(odd, vinf);
+    lo[2 * k..].fill(0);
+    add_at(out, k, trim_limbs(odd));
+    add_at(out, 2 * k, trim_limbs(even));
+}
+
+/// Toom-4 evaluation of `x0 + x1·t + x2·t² + x3·t³` (`x0..x2` of `k` limbs,
+/// `x3` of at most `k`) into `k + 1`-limb buffers `e = [x(1), |x(−1)|, x(2),
+/// |x(−2)|, 8·x(1/2)]`, using the two `k + 1`-limb temporaries `t`, `u`.
+/// Returns the signs of `x(−1)` and `x(−2)`.
+fn toom4_eval(
+    x: [&[Limb]; 4],
+    e: [&mut [Limb]; 5],
+    t: &mut [Limb],
+    u: &mut [Limb],
+) -> (bool, bool) {
+    let [x0, x1, x2, x3] = x;
+    let [e1, em1, e2, em2, eh] = e;
+    // ±1: (x0 + x2) ± (x1 + x3).
+    add_full(x0, x2, t);
+    add_full(x1, x3, u);
+    e1.copy_from_slice(t);
+    add_in_place(e1, u);
+    em1.copy_from_slice(t);
+    let n1 = abs_diff_in_place(em1, u);
+    // ±2: (x0 + 4·x2) ± 2·(x1 + 4·x3).
+    copy_padded(t, x0);
+    add_lsh_in_place(t, x2, 2);
+    copy_padded(u, x1);
+    add_lsh_in_place(u, x3, 2);
+    shl_in_place(u, 1);
+    e2.copy_from_slice(t);
+    add_in_place(e2, u);
+    em2.copy_from_slice(t);
+    let n2 = abs_diff_in_place(em2, u);
+    // 8·x(1/2) = ((2·x0 + x1)·2 + x2)·2 + x3.
+    copy_padded(eh, x0);
+    shl_in_place(eh, 1);
+    add_in_place(eh, x1);
+    shl_in_place(eh, 1);
+    add_in_place(eh, x2);
+    shl_in_place(eh, 1);
+    add_in_place(eh, x3);
+    (n1, n2)
+}
+
+/// Toom-4 interpolation. On entry `out[..2k]` holds `v0`, `out[6k..]` holds
+/// `v∞`, and the `2k + 2`-limb buffers hold `w = [v(1), |v(−1)|, v(2),
+/// |v(−2)|, 64·v(1/2)]` with the signs `neg1`, `neg2` of `v(−1)`, `v(−2)`.
+/// Leaves the full product in `out`.
+fn toom4_interp(out: &mut [Limb], k: usize, w: [&mut [Limb]; 5], neg1: bool, neg2: bool) {
+    let [w1, wm1, w2, wm2, wh] = w;
+    let (lo, vinf) = out.split_at_mut(6 * k);
+    let v0 = &lo[..2 * k];
+    // Even/odd parts at 1: e1 = c0 + c2 + c4 + c6, o1 = c1 + c3 + c5.
+    half_sum_diff(w1, wm1);
+    let (e1, o1) = if neg1 { (wm1, w1) } else { (w1, wm1) };
+    // At 2: e2 = c0 + 4c2 + 16c4 + 64c6, o2 = 2·(c1 + 4c3 + 16c5).
+    half_sum_diff(w2, wm2);
+    let (e2, o2) = if neg2 { (wm2, w2) } else { (w2, wm2) };
+    shr1_in_place(o2);
+    // e1 = c2 + c4; e2 = (e2 − c0 − 64c6)/4 − e1 = 3c4.
+    sub_in_place(e1, v0);
+    sub_in_place(e1, vinf);
+    sub_in_place(e2, v0);
+    sub_lsh_in_place(e2, vinf, 6);
+    shr1_in_place(e2);
+    shr1_in_place(e2);
+    sub_in_place(e2, e1);
+    // wh = (64·v(1/2) − 64c0 − c6 + 4·(3c4) − 16·(c2 + c4))/2
+    //    = (64·v(1/2) − 64c0 − 16c2 − 4c4 − c6)/2 = 16c1 + 4c3 + c5,
+    // using 3c4 before its division (each step stays non-negative).
+    sub_lsh_in_place(wh, v0, 6);
+    sub_in_place(wh, vinf);
+    add_lsh_in_place(wh, e2, 2);
+    sub_lsh_in_place(wh, e1, 4);
+    shr1_in_place(wh);
+    // o2 = F = 3c3 + 15c5, wh = G = 15c1 + 3c3, o1 = 15·o1 − F − G = 9c3.
+    sub_in_place(o2, o1);
+    sub_in_place(wh, o1);
+    mul_small_in_place(o1, 15);
+    sub_in_place(o1, o2);
+    sub_in_place(o1, wh);
+    // c4 = 3c4/3 and c3 = 9c3/9, as one interleaved pass; then c2.
+    divexact_pair(e2, DIV3, o1, DIV9);
+    sub_in_place(e1, e2);
+    // c5 = (F − 3c3)/15, c1 = (G − 3c3)/15.
+    sub_lsh_in_place(o2, o1, 1);
+    sub_in_place(o2, o1);
+    sub_lsh_in_place(wh, o1, 1);
+    sub_in_place(wh, o1);
+    divexact_pair(o2, DIV15, wh, DIV15);
+    let (c1, c2, c3, c4, c5) = (&*wh, &*e1, &*o1, &*e2, &*o2);
+    lo[2 * k..].fill(0);
+    add_at(out, k, trim_limbs(c1));
+    add_at(out, 2 * k, trim_limbs(c2));
+    add_at(out, 3 * k, trim_limbs(c3));
+    add_at(out, 4 * k, trim_limbs(c4));
+    add_at(out, 5 * k, trim_limbs(c5));
+}
+
+/// Splits `x` into four `k`-limb parts (the last one shorter).
+fn quarters(x: &[Limb], k: usize) -> [&[Limb]; 4] {
+    [&x[..k], &x[k..2 * k], &x[2 * k..3 * k], &x[3 * k..]]
+}
+
+/// Toom-4 product `a·b` into `out` for `a.len() ≥ b.len() > 3·⌈a.len()/4⌉`:
+/// seven products of about a quarter of the size, at the points
+/// `0, ±1, ±2, 1/2, ∞`.
+fn toom4_into(a: &[Limb], b: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    let k = a.len().div_ceil(4);
+    debug_assert!(a.len() >= b.len() && b.len() > 3 * k);
+    let (xa, xb) = (quarters(a, k), quarters(b, k));
+    let (ea, s) = scratch.split_at_mut(5 * (k + 1));
+    let (eb, s) = s.split_at_mut(5 * (k + 1));
+    let (t, s) = s.split_at_mut(k + 1);
+    let (u, s) = s.split_at_mut(k + 1);
+    let (w, rest) = s.split_at_mut(5 * (2 * k + 2));
+    let mut ea: [&mut [Limb]; 5] = split5(ea);
+    let mut eb: [&mut [Limb]; 5] = split5(eb);
+    let ea_r = ea.each_mut().map(|x| &mut **x);
+    let (na1, na2) = toom4_eval(xa, ea_r, t, u);
+    let eb_r = eb.each_mut().map(|x| &mut **x);
+    let (nb1, nb2) = toom4_eval(xb, eb_r, t, u);
+    let mut w: [&mut [Limb]; 5] = split5(w);
+    for i in 0..5 {
+        mul_slices(ea[i], eb[i], &mut *w[i], rest);
+    }
+    let (lo, hi) = out.split_at_mut(6 * k);
+    mul_slices(xa[0], xb[0], &mut lo[..2 * k], rest);
+    mul_slices(xa[3], xb[3], hi, rest);
+    let w_r = w.each_mut().map(|x| &mut **x);
+    toom4_interp(out, k, w_r, na1 != nb1, na2 != nb2);
+}
+
+/// Toom-4 squaring of `a` into `out` (`a.len() ≥ 4`).
+fn toom4_sqr_into(a: &[Limb], out: &mut [Limb], scratch: &mut [Limb]) {
+    let k = a.len().div_ceil(4);
+    let xa = quarters(a, k);
+    let (ea, s) = scratch.split_at_mut(5 * (k + 1));
+    let (t, s) = s.split_at_mut(k + 1);
+    let (u, s) = s.split_at_mut(k + 1);
+    let (w, rest) = s.split_at_mut(5 * (2 * k + 2));
+    let mut ea: [&mut [Limb]; 5] = split5(ea);
+    let ea_r = ea.each_mut().map(|x| &mut **x);
+    toom4_eval(xa, ea_r, t, u);
+    let mut w: [&mut [Limb]; 5] = split5(w);
+    for i in 0..5 {
+        sqr_slices(ea[i], &mut *w[i], rest);
+    }
+    let (lo, hi) = out.split_at_mut(6 * k);
+    sqr_slices(xa[0], &mut lo[..2 * k], rest);
+    sqr_slices(xa[3], hi, rest);
+    let w_r = w.each_mut().map(|x| &mut **x);
+    toom4_interp(out, k, w_r, false, false);
+}
+
+/// Splits `x` into five equal consecutive parts.
+fn split5(x: &mut [Limb]) -> [&mut [Limb]; 5] {
+    let m = x.len() / 5;
+    let (p0, x) = x.split_at_mut(m);
+    let (p1, x) = x.split_at_mut(m);
+    let (p2, x) = x.split_at_mut(m);
+    let (p3, p4) = x.split_at_mut(m);
+    [p0, p1, p2, p3, p4]
+}
+
 impl Nat {
-    /// Returns `self²`, using a symmetric schoolbook or Karatsuba squaring
-    /// (roughly half the limb multiplications of the general `mul`), or the
-    /// NTT where its two-transform squaring wins (per the internal
-    /// `ntt_worthwhile` shape heuristic).
+    /// Returns `self²`, using a symmetric schoolbook squaring (roughly half
+    /// the limb multiplications of the general `mul`), Toom-3/Toom-4
+    /// squaring, or the NTT where its two-transform squaring wins (per the
+    /// internal `ntt_worthwhile` shape heuristic).
     pub fn square(&self) -> Nat {
         let n = self.limbs.len();
         if n == 0 {
             return Nat::zero();
         }
-        if n < KARATSUBA_SQR_THRESHOLD {
+        if n < KARATSUBA_SQR_THRESHOLD.min(TOOM3_SQR_THRESHOLD) {
             self.square_schoolbook()
         } else if ntt_worthwhile(n, n, true) {
             mul_ntt(self, self)
         } else {
-            self.square_karatsuba()
+            let a = &self.limbs[..];
+            product_with(a, a, |out, scratch| sqr_slices(a, out, scratch))
         }
     }
 
@@ -3070,6 +3964,7 @@ impl Nat {
 
     /// Karatsuba squaring: three half-size squarings, run as a slice recursion
     /// into one output buffer with one shared scratch allocation.
+    #[cfg(test)]
     fn square_karatsuba(&self) -> Nat {
         let n = self.limbs.len();
         if n < KARATSUBA_SQR_THRESHOLD {
@@ -3086,6 +3981,7 @@ impl Nat {
     /// Karatsuba multiplication: three half-size products instead of four, run
     /// as a slice recursion into one output buffer with one shared scratch
     /// allocation (see [`kara_into`]) instead of ~9 `Vec`s per node.
+    #[cfg(test)]
     fn mul_karatsuba(&self, rhs: &Nat) -> Nat {
         if self.limbs.len().min(rhs.limbs.len()) < KARATSUBA_THRESHOLD {
             return self.mul_schoolbook(rhs);
@@ -6087,6 +6983,202 @@ mod tests {
         }
     }
 
+    /// Independent reference product: one plain multiply-accumulate row per
+    /// limb of `a` (no `addmul_2`, no recursion).
+    fn naive_product(a: &[Limb], b: &[Limb]) -> Vec<Limb> {
+        let mut out = alloc::vec![0; a.len() + b.len()];
+        for (i, &x) in a.iter().enumerate() {
+            let mut carry = 0;
+            for (j, &y) in b.iter().enumerate() {
+                let (lo, hi) = mac(out[i + j], x, y, carry);
+                out[i + j] = lo;
+                carry = hi;
+            }
+            out[i + b.len()] = carry;
+        }
+        out
+    }
+
+    #[test]
+    fn basecase_kernels_match_naive() {
+        // The addmul_2 row kernel (via the basecase product, the accumulating
+        // schoolbook and the symmetric square) on every small shape, with
+        // random, all-ones and sparse limbs: all-ones maximizes the pending
+        // value and deferred carries of both interleaved rows.
+        let mut state = 0xb45e_ca5e_0000_0001u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for la in 1..=20usize {
+            for lb in 1..=20usize {
+                for mode in 0..3 {
+                    let mut mk = |n: usize| -> Vec<Limb> {
+                        (0..n)
+                            .map(|_| match mode {
+                                0 => next(),
+                                1 => Limb::MAX,
+                                _ => [0, Limb::MAX, 1, next()][(next() >> 62) as usize],
+                            })
+                            .collect()
+                    };
+                    let (a, b) = (mk(la), mk(lb));
+                    let want = naive_product(&a, &b);
+                    let mut out = alloc::vec![Limb::MAX; la + lb];
+                    mul_basecase(&a, &b, &mut out);
+                    assert_eq!(out, want, "basecase {la}x{lb} mode {mode}");
+                    let mut out = alloc::vec![0; la + lb];
+                    mul_into_schoolbook(&a, &b, &mut out);
+                    assert_eq!(out, want, "schoolbook {la}x{lb} mode {mode}");
+                    let mut sq = alloc::vec![0; 2 * la];
+                    sqr_into(&a, &mut sq);
+                    assert_eq!(sq, naive_product(&a, &a), "square {la} mode {mode}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slice_toom_matches_schoolbook() {
+        // Every slice Toom kernel called directly on random and edge-heavy
+        // shapes (all-ones / zero limbs drive the evaluation signs and the
+        // interpolation carries to their extremes), plus the dispatcher on
+        // shapes that select each path, against the schoolbook reference.
+        let mut state = 0x7007_c00c_5eed_1234u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut limbs = |n: usize, mode: u64| -> Vec<Limb> {
+            (0..n)
+                .map(|_| {
+                    let r = next();
+                    match mode {
+                        0 => r,
+                        1 => Limb::MAX,
+                        2 => [0, Limb::MAX, 1, r][(r >> 62) as usize],
+                        _ => r & 0xFF,
+                    }
+                })
+                .collect()
+        };
+        let reference = naive_product;
+        type Kernel = fn(&[Limb], &[Limb], &mut [Limb], &mut [Limb]);
+        type Shape = fn(usize, usize) -> bool;
+        let kernels: [(&str, Kernel, Shape); 4] = [
+            ("toom3", toom3_into, |la, lb| lb > 2 * la.div_ceil(3)),
+            ("toom32", toom32_into, |la, lb| {
+                lb > la.div_ceil(3) && lb <= 2 * la.div_ceil(3)
+            }),
+            ("toom4", toom4_into, |la, lb| lb > 3 * la.div_ceil(4)),
+            ("slices", mul_slices, |_, _| true),
+        ];
+        for round in 0..600usize {
+            let la = 4 + round * 7 % 300;
+            let lb = 1 + (round * 13 + round / 3) % la;
+            let mode = (round % 4) as u64;
+            let (a, b) = (limbs(la, mode), limbs(lb, (mode + round as u64 / 4) % 4));
+            let want = reference(&a, &b);
+            for (name, kernel, ok) in &kernels {
+                if !ok(la, lb) {
+                    continue;
+                }
+                let mut out = alloc::vec![Limb::MAX; la + lb];
+                // Small shapes call the kernels below their dispatch sizes,
+                // where `toom_scratch_len` does not budget for them.
+                let mut scratch = alloc::vec![Limb::MAX; toom_scratch_len(la) + 8 * la + 64];
+                kernel(&a, &b, &mut out, &mut scratch);
+                assert_eq!(out, want, "{name} {la}x{lb} mode {mode}");
+            }
+            for (name, kernel, ok) in [
+                (
+                    "toom3 sqr",
+                    toom3_sqr_into as fn(&[Limb], &mut [Limb], &mut [Limb]),
+                    la > 2 * la.div_ceil(3),
+                ),
+                ("toom4 sqr", toom4_sqr_into, la > 3 * la.div_ceil(4)),
+                ("sqr slices", sqr_slices, true),
+            ] {
+                if !ok {
+                    continue;
+                }
+                let want = reference(&a, &a);
+                let mut out = alloc::vec![Limb::MAX; 2 * la];
+                let mut scratch = alloc::vec![Limb::MAX; toom_scratch_len(la) + 8 * la + 64];
+                kernel(&a, &mut out, &mut scratch);
+                assert_eq!(out, want, "{name} {la} mode {mode}");
+            }
+        }
+        // Through `Nat::mul`/`Nat::square` on shapes picking each path:
+        // Karatsuba, Toom-3, Toom-3.2, Toom-4, block split, and the squaring
+        // ladder.
+        for &(la, lb) in &[
+            (60usize, 50usize),
+            (TOOM3_THRESHOLD, TOOM3_THRESHOLD),
+            (200, 190),
+            (300, 170),
+            (TOOM4_THRESHOLD + 5, TOOM4_THRESHOLD),
+            (450, 449),
+            (480, 300),
+            (900, 100),
+            (1000, 333),
+            (2000, 450),
+        ] {
+            for mode in 0..3 {
+                let (a, b) = (limbs(la, mode), limbs(lb, mode));
+                let (na, nb) = (Nat::from_limbs(&a), Nat::from_limbs(&b));
+                let want = Nat::from_limbs(&reference(&a, &b));
+                assert_eq!(na.mul(&nb), want, "mul {la}x{lb} mode {mode}");
+                assert_eq!(nb.mul(&na), want, "mul {lb}x{la} mode {mode}");
+                let sq = Nat::from_limbs(&reference(&a, &a));
+                assert_eq!(na.square(), sq, "square {la} mode {mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn ntt_wrapped_lengths_match_schoolbook() {
+        // Shapes whose coefficient count lands just past a 2^k / 3·2^k step
+        // run a shorter cyclic transform and correct the wrapped top
+        // coefficients exactly; check those against schoolbook, including
+        // all-ones limbs (largest wrapped coefficients) and unbalanced shapes.
+        let mut state = 0x5151_7e57_0dd5_eed5u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let rand = |cnt: usize, f: &mut dyn FnMut() -> u64| {
+            let limbs: Vec<Limb> = (0..cnt).map(|_| f()).collect();
+            Nat::from_limbs(&limbs)
+        };
+        let ones = |cnt: usize| Nat::from_limbs(&alloc::vec![Limb::MAX; cnt]);
+        for &(la, lb) in &[
+            (5usize, 5usize),
+            (40, 40),
+            (782, 782),
+            (800, 760),
+            (1563, 1563),
+            (1600, 1500),
+            (2000, 1100),
+            (1500, 100),
+        ] {
+            let (n, wrap) = mp_plan(la, lb, false).unwrap();
+            assert!(wrap > 0 && n + wrap == la + lb - 1, "{la}x{lb}: no wrap");
+            let (a, b) = (rand(la, &mut next), rand(lb, &mut next));
+            assert_eq!(mul_ntt(&a, &b), a.mul_schoolbook(&b), "{la}x{lb}");
+            let (a, b) = (ones(la), ones(lb));
+            assert_eq!(mul_ntt(&a, &b), a.mul_schoolbook(&b), "ones {la}x{lb}");
+            let a = rand(la, &mut next);
+            assert_eq!(mul_ntt(&a, &a), a.mul_schoolbook(&a), "square {la}");
+        }
+    }
+
     #[test]
     fn ntt_dispatch_matches_reference() {
         // `Nat::mul`/`Nat::square` on shapes `ntt_worthwhile` hands to the NTT
@@ -6103,23 +7195,24 @@ mod tests {
             Nat::from_limbs(&limbs)
         };
         for &(la, lb) in &[
-            (800usize, 800usize),
-            (1300, 1301),
-            (3000, 500),
-            (4000, 2100),
+            (2048usize, 2049usize),
+            (2100, 2100),
+            (4500, 1500),
+            (8000, 600),
         ] {
             assert!(ntt_worthwhile(la, lb, false), "{la}x{lb}");
             let (a, b) = (rand(la, &mut next), rand(lb, &mut next));
             assert_eq!(a.mul(&b), a.mul_karatsuba(&b), "{la}x{lb}");
         }
-        for &l in &[900usize, 1500, 2300] {
+        for &l in &[1800usize, 2048, 2800] {
             assert!(ntt_worthwhile(l, l, true), "square {l}");
             let a = rand(l, &mut next);
             assert_eq!(a.square(), a.square_karatsuba(), "square {l}");
             assert_eq!(a.mul(&a.clone()), a.square_karatsuba(), "self-mul {l}");
         }
-        assert!(!ntt_worthwhile(600, 600, false) && !ntt_worthwhile(400, 9000, false));
-        assert!(!ntt_worthwhile(800, 800, true) && !ntt_worthwhile(1100, 1100, true));
+        assert!(!ntt_worthwhile(1500, 1500, false) && !ntt_worthwhile(400, 9000, false));
+        assert!(!ntt_worthwhile(4000, 500, false) && !ntt_worthwhile(4000, 1000, false));
+        assert!(!ntt_worthwhile(1500, 1500, true) && !ntt_worthwhile(2400, 2400, true));
     }
 
     #[test]
@@ -6191,47 +7284,95 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "measurement only: cargo test -- --ignored --nocapture measure_mul"]
-    fn measure_mul_crossovers() {
+    /// Best-of timing helper for the measurement tests below.
+    fn bench_best(f: &dyn Fn() -> Nat) -> core::time::Duration {
         use std::time::Instant;
-        let mkbig = |limbs: usize| -> Nat {
-            let bytes: Vec<u8> = (0..limbs * 8)
-                .map(|i| (i * 2654435761usize) as u8)
-                .collect();
-            Nat::from_bytes_le(&bytes)
+        let mut best = core::time::Duration::MAX;
+        let _ = f();
+        let start = Instant::now();
+        let mut runs = 0;
+        while runs < 5 || (start.elapsed().as_millis() < 200 && runs < 200) {
+            let t = Instant::now();
+            let r = f();
+            best = best.min(t.elapsed());
+            drop(r);
+            runs += 1;
+        }
+        best
+    }
+
+    /// Deterministic `limbs`-limb operand with the top bit set.
+    fn bench_operand(limbs: usize, seed: usize) -> Nat {
+        let v: Vec<Limb> = (0..limbs)
+            .map(|i| ((i + seed) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1 << 63)
+            .collect();
+        Nat::from_limbs(&v)
+    }
+
+    /// Sizes from the comma-separated environment variable `var`, or `default`.
+    fn bench_sizes(var: &str, default: &[usize]) -> Vec<usize> {
+        std::env::var(var)
+            .ok()
+            .map(|s| s.split(',').map(|x| x.trim().parse().unwrap()).collect())
+            .unwrap_or_else(|| default.to_vec())
+    }
+
+    #[test]
+    #[ignore = "measurement only: cargo test --release -- --ignored --nocapture measure_mul"]
+    fn measure_mul_crossovers() {
+        // Each slice kernel forced at the top level (recursing through the
+        // normal dispatcher), for retuning the Karatsuba/Toom thresholds.
+        // `MUL_SIZES=a,b,c` overrides the size list.
+        type Kernel = fn(&[Limb], &[Limb], &mut [Limb], &mut [Limb]);
+        type SqrKernel = fn(&[Limb], &mut [Limb], &mut [Limb]);
+        let kara: Kernel = |a, b, out, s| {
+            out.fill(0);
+            kara_into(a, b, out, s);
         };
-        let bench = |f: &dyn Fn() -> Nat| {
-            let mut best = core::time::Duration::MAX;
-            let _ = f();
-            for _ in 0..6 {
-                let t = Instant::now();
-                let mut r = f();
-                for _ in 0..7 {
-                    r = f();
-                }
-                let _ = r.limbs.len();
-                best = best.min(t.elapsed() / 8);
-            }
-            best
+        let kara_sqr: SqrKernel = |a, out, s| {
+            out.fill(0);
+            kara_sqr_into(a, out, s);
         };
-        for &sz in &[
-            48usize, 96, 112, 128, 160, 224, 320, 448, 640, 800, 1024, 1600, 2400, 3200, 4000,
-            8000, 16000,
-        ] {
-            let a = mkbig(sz);
-            let b = mkbig(sz + 1);
-            let school = if sz <= 2000 {
-                bench(&|| a.mul_schoolbook(&b))
-            } else {
-                Default::default()
+        let sizes = bench_sizes(
+            "MUL_SIZES",
+            &[
+                16, 24, 32, 48, 64, 96, 128, 160, 200, 256, 320, 400, 512, 640, 800, 1000,
+            ],
+        );
+        for &sz in &sizes {
+            let (a, b) = (bench_operand(sz, 1), bench_operand(sz, 7));
+            // Kernels forced below their dispatch sizes need more scratch
+            // than `toom_scratch_len` budgets.
+            let scratch_len = toom_scratch_len(sz) + 8 * sz + 64;
+            let run = |k: Kernel| {
+                bench_best(&|| {
+                    let mut out = alloc::vec![0; 2 * sz];
+                    let mut s = alloc::vec![0; scratch_len];
+                    k(&a.limbs, &b.limbs, &mut out, &mut s);
+                    Nat::from_limb_vec(out)
+                })
             };
-            let kara = bench(&|| a.mul_karatsuba(&b));
-            let t3 = bench(&|| a.mul_toom3(&b));
-            let t4 = bench(&|| a.mul_toom4(&b));
-            let ntt = bench(&|| mul_ntt(&a, &b));
+            let run_sqr = |k: SqrKernel| {
+                bench_best(&|| {
+                    let mut out = alloc::vec![0; 2 * sz];
+                    let mut s = alloc::vec![0; scratch_len];
+                    k(&a.limbs, &mut out, &mut s);
+                    Nat::from_limb_vec(out)
+                })
+            };
+            let school = run(|a, b, o, _| mul_basecase(a, b, o));
+            let k2 = run(kara);
+            let t3 = run(toom3_into);
+            let t4 = run(toom4_into);
+            let sq = run_sqr(|a, o, _| {
+                o.fill(0);
+                sqr_into(a, o);
+            });
+            let ksq = run_sqr(kara_sqr);
+            let t3s = run_sqr(toom3_sqr_into);
+            let t4s = run_sqr(toom4_sqr_into);
             std::println!(
-                "sz={sz:<6} school={school:>11?} kara={kara:>11?} toom3={t3:>11?} toom4={t4:>11?} ntt={ntt:>11?}"
+                "sz={sz:<5} mul: school={school:>10.3?} kara={k2:>10.3?} toom3={t3:>10.3?} toom4={t4:>10.3?} | sqr: school={sq:>10.3?} kara={ksq:>10.3?} toom3={t3s:>10.3?} toom4={t4s:>10.3?}"
             );
         }
     }
@@ -6239,58 +7380,40 @@ mod tests {
     #[test]
     #[ignore = "measurement only: cargo test --release -- --ignored --nocapture measure_ntt_paths"]
     fn measure_ntt_paths() {
-        // NTT vs Karatsuba/Toom per shape (mul and square), for retuning
-        // `ntt_worthwhile`. `NTT_SIZES=a,b,c` overrides the size list.
-        use std::time::Instant;
-        let mkbig = |limbs: usize, seed: usize| -> Nat {
-            let v: Vec<Limb> = (0..limbs)
-                .map(|i| ((i + seed) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1 << 63)
-                .collect();
-            Nat::from_limbs(&v)
-        };
-        let bench = |f: &dyn Fn() -> Nat| {
-            let mut best = core::time::Duration::MAX;
-            let _ = f();
-            let start = Instant::now();
-            let mut runs = 0;
-            while runs < 3 || (start.elapsed().as_millis() < 300 && runs < 30) {
-                let t = Instant::now();
-                let r = f();
-                best = best.min(t.elapsed());
-                drop(r);
-                runs += 1;
-            }
-            best
-        };
-        let sizes: Vec<usize> = std::env::var("NTT_SIZES")
-            .ok()
-            .map(|s| s.split(',').map(|x| x.trim().parse().unwrap()).collect())
-            .unwrap_or_else(|| {
-                std::vec![
-                    1000, 1400, 2000, 2800, 3500, 4100, 5000, 6000, 8000, 10000, 12000, 16000,
-                    20000, 24000, 32000, 48000, 64000, 100000, 131000, 200000, 262000
-                ]
-            });
+        // NTT vs the Karatsuba/Toom ladder per balanced shape (mul and
+        // square), for retuning `ntt_worthwhile`. `NTT_SIZES=a,b,c`
+        // overrides the size list.
+        let sizes = bench_sizes(
+            "NTT_SIZES",
+            &[
+                400, 500, 600, 700, 800, 900, 1000, 1100, 1300, 1500, 1700, 2000, 2400, 2800, 3500,
+                4100, 5000, 6000, 8000, 12000,
+            ],
+        );
         for &sz in &sizes {
-            let a = mkbig(sz, 1);
-            let b = mkbig(sz + 1, 7);
-            let k = bench(&|| a.mul_karatsuba(&b));
-            let t3 = bench(&|| a.mul_toom3(&b));
-            std::println!("sz={sz:<7} kara={k:>10.3?} toom3={t3:>10.3?}");
-            let m = bench(&|| mul_ntt(&a, &b));
-            let t = if sz <= 70000 {
-                bench(&|| a.mul_toom4(&b))
-            } else {
-                Default::default()
-            };
-            let ms = bench(&|| mul_ntt(&a, &a));
-            let ks = if sz <= 70000 {
-                bench(&|| a.square_karatsuba())
-            } else {
-                Default::default()
-            };
+            let (a, b) = (bench_operand(sz, 1), bench_operand(sz + 1, 7));
+            let (la, lb) = (a.limbs.as_slice(), b.limbs.as_slice());
+            if std::env::var("NTT_WRAP").is_ok() {
+                let t = bench_best(&|| {
+                    let w = mp_wrapped_coeffs(la, lb, sz / 2);
+                    Nat::from_u64(w.len() as u64)
+                });
+                let prods = mp_wrap_products(sz / 2, sz, sz + 1);
+                std::println!(
+                    "wrap sz={sz} {t:?} = {:.2} ns/product",
+                    t.as_nanos() as f64 / prods as f64
+                );
+                continue;
+            }
+            let toom = bench_best(&|| product_with(la, lb, |o, s| mul_slices(la, lb, o, s)));
+            let ntt = bench_best(&|| mul_ntt(&a, &b));
+            let toom_sq = bench_best(&|| product_with(la, la, |o, s| sqr_slices(la, o, s)));
+            let ntt_sq = bench_best(&|| mul_ntt(&a, &a));
+            let plan = mp_plan(sz, sz + 1, false);
             std::println!(
-                "sz={sz:<7} mul: ntt={m:>10.3?} toom4={t:>10.3?} | sqr: ntt={ms:>10.3?} kara={ks:>10.3?}"
+                "sz={sz:<6} plan={plan:?} mul: toom={toom:>10.3?} ntt={ntt:>10.3?} {} | sqr: toom={toom_sq:>10.3?} ntt={ntt_sq:>10.3?} {}",
+                if ntt < toom { "NTT" } else { "toom" },
+                if ntt_sq < toom_sq { "NTT" } else { "toom" },
             );
         }
     }
@@ -6298,56 +7421,28 @@ mod tests {
     #[test]
     #[ignore = "measurement only: cargo test --release -- --ignored --nocapture measure_ntt_unbalanced"]
     fn measure_ntt_unbalanced() {
-        use std::time::Instant;
-        let mkbig = |limbs: usize, seed: usize| -> Nat {
-            let v: Vec<Limb> = (0..limbs)
-                .map(|i| ((i + seed) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1 << 63)
-                .collect();
-            Nat::from_limbs(&v)
-        };
-        let bench = |f: &dyn Fn() -> Nat| {
-            let mut best = core::time::Duration::MAX;
-            let _ = f();
-            let start = Instant::now();
-            let mut runs = 0;
-            while runs < 3 || (start.elapsed().as_millis() < 300 && runs < 30) {
-                let t = Instant::now();
-                let r = f();
-                best = best.min(t.elapsed());
-                drop(r);
-                runs += 1;
+        // NTT vs the Toom ladder on unbalanced shapes. `NTT_SHORT=a,b,c`
+        // and `NTT_RATIOS=a,b,c` override the shorter sizes and ratios.
+        let shorts = bench_sizes(
+            "NTT_SHORT",
+            &[200, 300, 400, 500, 700, 1000, 1500, 2000, 3000],
+        );
+        let ratios = bench_sizes("NTT_RATIOS", &[2, 3, 4, 8, 16, 32]);
+        for &lb in &shorts {
+            for &r in &ratios {
+                let la = lb * r;
+                let (a, b) = (bench_operand(la, 1), bench_operand(lb, 7));
+                let (sa, sb) = (a.limbs.as_slice(), b.limbs.as_slice());
+                let toom = bench_best(&|| product_with(sa, sb, |o, s| mul_slices(sa, sb, o, s)));
+                let ntt = bench_best(&|| mul_ntt(&a, &b));
+                std::println!(
+                    "{la:>7}x{lb:<6} toom={toom:>10.3?} ntt={ntt:>10.3?} {} plan={:?}",
+                    if ntt < toom { "NTT" } else { "toom" },
+                    mp_plan(la, lb, false)
+                );
             }
-            best
-        };
-        for &(la, lb) in &[
-            (1500usize, 200usize),
-            (3000, 200),
-            (8000, 200),
-            (3000, 500),
-            (6000, 500),
-            (20000, 500),
-            (3000, 1000),
-            (6000, 1000),
-            (12000, 1000),
-            (50000, 1000),
-            (6000, 2000),
-            (12000, 2000),
-            (40000, 3000),
-            (100000, 5000),
-            (300000, 20000),
-        ] {
-            let a = mkbig(la, 1);
-            let b = mkbig(lb, 7);
-            let k = bench(&|| a.mul_karatsuba(&b));
-            let t3 = bench(&|| a.mul_toom3(&b));
-            let t4 = bench(&|| a.mul_toom4(&b));
-            let m = bench(&|| mul_ntt(&a, &b));
-            std::println!(
-                "{la:>7}x{lb:<6} kara={k:>10.3?} toom3={t3:>10.3?} toom4={t4:>10.3?} ntt={m:>10.3?}"
-            );
         }
     }
-
     #[test]
     #[ignore = "measurement only: cargo test --release -- --ignored --nocapture measure_rho"]
     fn measure_rho() {

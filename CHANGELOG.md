@@ -29,9 +29,9 @@ onward (pre-`1.0`, minor versions may contain breaking changes).
 
 ### Performance
 
-- *(nat)* `Nat::isqrt` is 1.6–1.9× faster up to a few thousand bits: an
-  `f64`-seeded single-step `u128` base case and fewer temporaries per
-  Karatsuba-square-root level
+- *(nat)* `Nat::isqrt` is 2.1–3.8× faster up to ~12k bits: an `f64`-seeded
+  single-step `u128` base case, and an allocation-free Karatsuba square root
+  on limb slices (one shared scratch buffer) below 96-limb roots
 - *(nat)* Division: Burnikel–Ziegler pads the divisor to a block that halves
   evenly down to the base case instead of the next power of two (12–33% at
   non-power-of-two sizes), and long quotients (and very large operands) use

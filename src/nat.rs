@@ -947,6 +947,199 @@ fn bz_div_3n_2n(a: &Nat, b: &Nat, half: usize) -> (Nat, Nat) {
     (q_int.magnitude(), r_int.magnitude())
 }
 
+/// Largest root size (limbs) handled by the allocation-free slice square
+/// root [`sqrtrem_slice`]; above it the `Nat`-based recursion (whose divisions
+/// and squarings use the sub-quadratic kernels) takes over.
+const SQRT_SLICE_LIMBS: usize = 96;
+
+/// Allocation-free Karatsuba square root (Zimmermann, "Karatsuba Square
+/// Root", INRIA RR-3805) on limb slices.
+///
+/// Preconditions: `a.len() == 2n`, `s.len() == r.len() == n`, `n ≥ 1`, and the
+/// top limb of `a` is `≥ 2^62`. Writes `s = ⌊√a⌋` and the low `n` limbs of
+/// `a − s²` into `r`, returning the remainder's top limb (`0` or `1`, since
+/// the remainder is `≤ 2s`). `scratch` needs `3n + 8` limbs; the recursive call
+/// on the top half reuses it before this level touches it.
+fn sqrtrem_slice(s: &mut [Limb], r: &mut [Limb], a: &[Limb], scratch: &mut [Limb]) -> Limb {
+    let n = s.len();
+    debug_assert!(n >= 1 && a.len() == 2 * n && r.len() == n);
+    debug_assert!(a[2 * n - 1] >> 62 != 0);
+    if n == 1 {
+        let v = ((a[1] as u128) << 64) | a[0] as u128;
+        let x = isqrt_u128(v);
+        let rem = v - x * x; // ≤ 2x < 2^65
+        s[0] = x as Limb;
+        r[0] = rem as Limb;
+        return (rem >> 64) as Limb;
+    }
+    let l = n / 2;
+    let h = n - l;
+    // Top half: s₁ = ⌊√(a div β^(2l))⌋ into s[l..], R₁ into r[l..] (+ c1·β^h).
+    let c1 = {
+        let (_, s_hi) = s.split_at_mut(l);
+        let (_, r_hi) = r.split_at_mut(l);
+        sqrtrem_slice(s_hi, r_hi, &a[2 * l..], scratch)
+    };
+    let (nb, rest) = scratch.split_at_mut(n + 1);
+    let (qq, rest) = rest.split_at_mut(l + 1);
+    let (sq, _) = rest.split_at_mut(2 * l + 2);
+    // N = R₁·β^l + a₁ (n + 1 limbs), divided by s₁ (normalized: top bit set).
+    nb[..l].copy_from_slice(&a[l..2 * l]);
+    nb[l..n].copy_from_slice(&r[l..]);
+    nb[n] = c1;
+    {
+        let s1 = &s[l..];
+        if h == 1 {
+            let d = s1[0];
+            let v = recip_2by1(d);
+            let rem = divrem_1_normalized_in_place(nb, d, 0, v);
+            qq.copy_from_slice(&nb[..l + 1]);
+            nb[0] = rem;
+        } else {
+            // The top h limbs of N are R₁ div β < s₁, as the kernel requires.
+            div_schoolbook_normalized(nb, s1, qq);
+        }
+    }
+    // (q, u) = N divmod 2s₁: halve the quotient, and fold its low bit back
+    // into the remainder as one more s₁.
+    let odd = qq[0] & 1;
+    for i in 0..l {
+        qq[i] = (qq[i] >> 1) | (qq[i + 1] << 63);
+    }
+    qq[l] >>= 1;
+    // u (h limbs + carry `cu`) lives in nb[..h].
+    let mut cu: Limb = 0;
+    if odd == 1 {
+        cu += add_n_in_place(&mut nb[..h], &s[l..]);
+    }
+    // q ≤ β^l; cap q = β^l to β^l − 1, which moves 2s₁ into u.
+    if qq[l] != 0 {
+        qq[l] = 0;
+        for x in qq[..l].iter_mut() {
+            *x = Limb::MAX;
+        }
+        cu += add_n_in_place(&mut nb[..h], &s[l..]);
+        cu += add_n_in_place(&mut nb[..h], &s[l..]);
+    }
+    // s = s₁·β^l + q.
+    s[..l].copy_from_slice(&qq[..l]);
+    // R = u·β^l + a₀ − q², tracked as r (n limbs) plus a signed top `carry`.
+    sq[..2 * l].fill(0);
+    sqr_into(&qq[..l], &mut sq[..2 * l]);
+    r[..l].copy_from_slice(&a[..l]);
+    r[l..].copy_from_slice(&nb[..h]);
+    let mut carry = cu as i64;
+    let mut borrow = 0;
+    for (ri, &qi) in r.iter_mut().zip(&sq[..2 * l]) {
+        let (d, b) = sbb(*ri, qi, borrow);
+        *ri = d;
+        borrow = b;
+    }
+    for ri in r[2 * l..].iter_mut() {
+        let (d, b) = sbb(*ri, 0, borrow);
+        *ri = d;
+        borrow = b;
+    }
+    carry -= borrow as i64;
+    // s one too large: R += 2s − 1 (old s), then s −= 1.
+    while carry < 0 {
+        let c = add_n_in_place(r, s) + add_n_in_place(r, s);
+        carry += c as i64;
+        // R −= 1
+        let mut b = 1;
+        for ri in r.iter_mut() {
+            let (d, bb) = sbb(*ri, 0, b);
+            *ri = d;
+            b = bb;
+            if b == 0 {
+                break;
+            }
+        }
+        carry -= b as i64;
+        // s −= 1 (s ≥ 1 here)
+        for si in s.iter_mut() {
+            let (d, bb) = sbb(*si, 0, 1);
+            *si = d;
+            if bb == 0 {
+                break;
+            }
+        }
+    }
+    // s one too small (only after capping q): while R > 2s, R −= 2s + 1, s += 1.
+    loop {
+        // Compare R (carry, r) with 2s (top bit of s, s << 1).
+        let top2 = (s[n - 1] >> 63) as i64;
+        let ord = match carry.cmp(&top2) {
+            Ordering::Equal => {
+                let mut o = Ordering::Equal;
+                for i in (0..n).rev() {
+                    let twice = (s[i] << 1) | if i > 0 { s[i - 1] >> 63 } else { 0 };
+                    if r[i] != twice {
+                        o = r[i].cmp(&twice);
+                        break;
+                    }
+                }
+                o
+            }
+            o => o,
+        };
+        if ord != Ordering::Greater {
+            break;
+        }
+        // R −= 2s + 1, then s += 1.
+        let b = submul_1(r, s, 2);
+        carry -= b as i64;
+        let mut bb = 1;
+        for ri in r.iter_mut() {
+            let (d, b2) = sbb(*ri, 0, bb);
+            *ri = d;
+            bb = b2;
+            if bb == 0 {
+                break;
+            }
+        }
+        carry -= bb as i64;
+        for si in s.iter_mut() {
+            let (d, c) = adc(*si, 0, 1);
+            *si = d;
+            if c == 0 {
+                break;
+            }
+        }
+    }
+    debug_assert!((0..=1).contains(&carry));
+    carry as Limb
+}
+
+/// `(⌊√a⌋, a − ⌊√a⌋²)` via [`sqrtrem_slice`] for a normalized `a` (top limb
+/// `≥ 2^62`) of at most `2·SQRT_SLICE_LIMBS` limbs. An odd limb count is
+/// handled as `a·β` (root `s'`, `s = s' >> 32`, remainder recovered exactly).
+fn sqrt_rem_small(a: &Nat) -> (Nat, Nat) {
+    let len = a.limbs.len();
+    let odd = len % 2 == 1;
+    let mut buf: Vec<Limb> = Vec::with_capacity(len + 1);
+    if odd {
+        buf.push(0);
+    }
+    buf.extend_from_slice(&a.limbs);
+    let n = buf.len() / 2;
+    let mut s = alloc::vec![0 as Limb; n];
+    let mut r = alloc::vec![0 as Limb; n + 1];
+    let mut scratch = alloc::vec![0 as Limb; 3 * n + 8];
+    let c = sqrtrem_slice(&mut s, &mut r[..n], &buf, &mut scratch);
+    r[n] = c;
+    let s = Nat::from_limb_vec(s);
+    let r = Nat::from_limb_vec(r);
+    if !odd {
+        return (s, r);
+    }
+    // a·β = s'² + r', s' = s·2^32 + t  ⇒  a − s² = (2·s·t·2^32 + t² + r') / β.
+    let t = s.limbs[0] & 0xffff_ffff;
+    let root = s.shr(32);
+    let num = root.mul_u64(t).shl(33).add_u64(t * t).add(&r);
+    (root, num.shr(64))
+}
+
 /// Recursive square root with remainder (Zimmermann's "Karatsuba square root"):
 /// returns `(s, r)` with `s = ⌊√a⌋` and `r = a − s²`.
 ///
@@ -956,6 +1149,9 @@ fn bz_div_3n_2n(a: &Nat, b: &Nat, half: usize) -> (Nat, Nat) {
 /// limbs (+1) and the correction loops run O(1) times.
 fn sqrt_rem(a: &Nat) -> (Nat, Nat) {
     let n = a.limbs.len();
+    if n > 2 && n <= 2 * SQRT_SLICE_LIMBS {
+        return sqrt_rem_small(a);
+    }
     if n <= 2 {
         let v = a.to_u128().expect("<= 2 limbs");
         let s = isqrt_u128(v);
@@ -5135,6 +5331,51 @@ mod tests {
             }
             .unwrap();
             assert!(diff <= Nat::from_u64(4), "recip error {diff} at n={n}");
+        }
+    }
+
+    #[test]
+    fn sqrt_rem_is_exact() {
+        let mut st = 0x0123_4567_89ab_cdefu64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let check = |a: &Nat| {
+            let (s, r) = sqrt_rem(a);
+            assert_eq!(s.square().add(&r), *a, "s² + r = a");
+            assert!(r.cmp_ref(&s.shl(1)) != Ordering::Greater, "r ≤ 2s");
+        };
+        for len in (3..=120).chain([150, 193, 200, 301]) {
+            for k in 0..6 {
+                let mut v: Vec<Limb> = (0..len)
+                    .map(|_| match next() % 5 {
+                        0 => 0,
+                        1 => Limb::MAX,
+                        _ => next(),
+                    })
+                    .collect();
+                v[len - 1] |= 1 << 62;
+                if k == 1 {
+                    v[len - 1] = Limb::MAX;
+                }
+                let a = Nat::from_limb_vec(v);
+                check(&a);
+                // Perfect squares and their neighbours stress both corrections.
+                let s = a.isqrt();
+                let sq = s.square();
+                for x in [
+                    sq.clone(),
+                    sq.add_u64(0).checked_sub_u64(1).unwrap(),
+                    s.add_u64(1).square().checked_sub_u64(1).unwrap(),
+                ] {
+                    if x.limbs.len() == len && x.limbs[len - 1] >> 62 != 0 {
+                        check(&x);
+                    }
+                }
+            }
         }
     }
 
